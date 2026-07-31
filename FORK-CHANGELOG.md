@@ -36,7 +36,7 @@ carjacking provenance note below.
 
 ---
 
-## 2.1.0 — roadside citations & weighted vehicle picks — 2026-07-31
+## 2.0.1 — roadside citations & weighted vehicle picks — 2026-07-31
 
 ### Added — traffic citations as an alternative to arrest
 
