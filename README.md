@@ -74,6 +74,25 @@ RegisterNetEvent('police:server:policeAlert', function(text)
     TriggerEvent('fenix:server:trigger', source, alertData)
 end)
 
+# BUNDLED — um_fenix_bridge
+
+This fork ships an optional companion resource in [`um_fenix_bridge/`](um_fenix_bridge/).
+
+It generalises the section above. Rather than editing each robbery script by
+hand, it listens for the alerts they already fire — `loaf_storerobbery`,
+`loaf_bankrobbery`, `qbx_jewelery`, `ps-dispatch`, and the
+`police:server:policeAlert` catch-all — and applies a configurable wanted level
+per crime type. This script then dispatches AI units off the back of that, so
+robberies draw a response on a server with no player police on duty.
+
+It is **not loaded automatically**: FiveM does not descend into a folder that
+belongs to another resource, so it stays inert until you copy it out next to
+`fenix-police` and `ensure` it. It has no hard dependencies and calls no
+`exports` — every integration is a plain event listener, so anything you don't
+run simply never fires.
+
+See [`um_fenix_bridge/README.md`](um_fenix_bridge/README.md) for details.
+
 # CREDITS
 
 This script was created by me, Fenix, so I could play FiveM QB-Core multiplayer with my wife Rainbowicus. 

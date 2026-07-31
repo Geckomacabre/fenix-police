@@ -41,6 +41,32 @@ carjacking provenance note below.
 Builds on `UPSTATE_PATCHES.md` §11 (ambient presence) and §12 (em_toolkit
 connector). Read those first for the base design.
 
+### Added — um_fenix_bridge bundled as an optional companion
+
+`um_fenix_bridge/` now ships inside this repo. It is a **copy** of the
+standalone resource, not a move — the server still runs its own copy from
+`[standalone]/um_fenix_bridge`, so the two can drift. Sync them when either
+changes.
+
+It is not loaded automatically. FiveM stops descending once a directory is
+identified as a resource, so a nested resource is never discovered — the folder
+is inert until copied out, which is what makes bundling safe here rather than
+something that silently double-loads.
+
+Bundled because it is the piece that makes this script respond to *scripted*
+crime. Upstream's README asks you to hand-edit `qb-policejob` and
+`qb-storerobbery` to fire `fenix:server:trigger`; the bridge instead listens for
+alerts those resources already emit and maps them to wanted levels, so nothing
+needs patching.
+
+Only its `Crime` module is useful on a stock server, and it is the one with no
+dependencies. `ERS` needs `night_ers`; `DynamicEvents` needs the private
+`um_dynamicworld` and is off by default; `Witness` is off by default. Nothing in
+it calls `exports` on another resource — every integration is an event listener,
+so an absent resource never fires rather than erroring.
+
+Licensed GPL-3.0 to match this repo.
+
 ### Added — radar speed enforcement
 
 A new subsystem in `client/ambient.lua`. Ambient officers now read speed and
