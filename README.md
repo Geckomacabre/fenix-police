@@ -54,6 +54,43 @@ Ambient officers read speed and act on it, rather than being set dressing.
   `ApplyWantedLevel` rather than a second parallel one. Caught NPCs get a chase,
   a yield, and a roadside stop, with no wanted system involved.
 
+### Roadside citations
+
+Getting caught speeding used to have one ending: hands up, BUSTED screen, wake
+up at a station with whatever you were driving to abandoned. Now the surrender
+key does something different when you're behind the wheel at a low wanted level.
+
+- Press it while driving and you signal a stop — hazards on, the pursuit stops
+  re-tasking, and the nearest unit pulls in behind you once you've stopped.
+- One officer walks to your **driver's window** (no weapon drawn — a citation at
+  gunpoint is an arrest with extra steps), writes for a few seconds, and hands it
+  over. You keep your car, your position and your route; the fine is the cost.
+- The fine is priced and charged **server-side** from `Config.TicketSystem.fine`.
+  The client reports that a stop completed and at what wanted level, never what
+  it is willing to pay, and the level is clamped before it indexes the amounts.
+- Can't afford it? It goes on record unpaid and you still drive away. Turning
+  "you're broke" into a teleport to a station is the outcome this exists to avoid.
+- Take off again after stopping, fire on police, or escalate past
+  `maxWantedLevel` (1 star by default — a genuine traffic offence) and the stop
+  is off; the pursuit picks straight back up.
+
+The radar trap that clocked you stands its own car down when a stop starts,
+rather than PITting a vehicle that has already pulled over.
+
+### Weighted vehicle selection
+
+`Config.Ambient.vehicles` accepts a `model = weight` map per region as well as
+the original flat array. Weights are how you get one agency dominant in a region
+while another still turns up occasionally — a county sheriff carrying Blaine
+County but appearing in the city now and then, a highway patrol present
+everywhere at a steady rate — without hard-coded region rules.
+
+It ships with **base-game models only**, so it works on any server. Point it at
+add-on liveries and the safety net holds: a model that isn't installed is skipped
+when the pick is *rolled* rather than failing the spawn, so a mixed list degrades
+to whatever that client actually has, and a region that resolves to nothing falls
+through to `vehicleFallback` — stock `police` / `sheriff`.
+
 ### Ambient carjackings
 
 A suspect drags a driver out of a stopped car and speeds off. The getaway speed
@@ -167,9 +204,14 @@ occupied at the moment the script would normally remove it.
 ## Requirements
 
 **QBCore** (or QBX), used for notifications, counting online police, nearby
-vehicle checks, and dying/last-stand detection. In principle it could be removed
-by swapping the vehicle check to the native and dropping notifications and
-last-stand logic.
+vehicle checks, dying/last-stand detection, and charging traffic fines. In
+principle it could be removed by swapping the vehicle check to the native,
+dropping notifications and last-stand logic, and setting
+`Config.TicketSystem.fine.enabled = false`.
+
+No vehicle add-ons are required — ambient units ship as base-game models, and
+[weighted selection](#weighted-vehicle-selection) skips anything a client can't
+spawn if you point it at your own liveries.
 
 ---
 
@@ -257,7 +299,34 @@ Read the comments and change what you want. Ambient settings live under
 `Config.Ambient`; the new keys are documented in
 [`FORK-CHANGELOG.md`](FORK-CHANGELOG.md#config-reference--new-keys).
 
-### 4. Add to `server.cfg`
+### 4. Optional — `config.local/` for server-specific settings
+
+`config.lua` ships portable: base-game vehicle models, stock job names, nothing
+that assumes anything about your server. That is what makes it safe to pull an
+update over, and also the wrong place to put your own add-on liveries — the next
+update overwrites them.
+
+Anything in a `config.local/` directory is loaded **after** `config.lua` and
+`data/ambient_points.lua`, so it overrides both, and the directory is gitignored
+so updates never touch it:
+
+```lua
+-- config.local/vehicles.lua
+Config.Ambient.vehicles = {
+    losSantos   = { ['yourcity_suv'] = 6, ['yourhwp_charger'] = 2 },
+    sandyShores = { ['yoursheriff_suv'] = 6, ['yourhwp_charger'] = 2 },
+}
+```
+
+Assign to the leaf you're changing, not the whole table — `Config.Ambient = {}`
+would drop every other ambient setting with it. Split across as many files as
+you like; they load in filename order. See
+[`config.local.example.lua`](config.local.example.lua) for the full pattern.
+
+The directory is absent from a clean checkout, and a glob that matches nothing
+is a no-op, so this costs nothing if you never use it.
+
+### 5. Add to `server.cfg`
 
 ```cfg
 ensure fenix-police
@@ -276,6 +345,11 @@ exports['fenix-police']:SetWantedLevel(level)     -- 1 to 5
 
 -- Added by this fork: is this player an on-duty police officer?
 exports['fenix-police']:IsPlayerPoliceOfficer()
+
+-- Added by this fork: is this player mid-roadside-stop? True from the moment a
+-- stop is signalled until the citation is done and the wanted level clears.
+-- Client-side. Useful for anything that should hold off during one.
+exports['fenix-police']:IsPlayerAtTrafficStop()
 ```
 
 ### Dynamic wanted levels by location

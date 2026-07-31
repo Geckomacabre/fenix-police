@@ -441,7 +441,40 @@ Config.Ambient = {
     },
 
     -- Vehicles used for ambient units, by region key (see Config.ZoneEnum).
+    --
+    -- Two accepted shapes per region:
+    --   array  { 'police', 'police2' }        picked uniformly
+    --   map    { police = 4, police2 = 1 }    model -> relative weight
+    --
+    -- Base-game models only, deliberately: this ships as stock so it works on any
+    -- server. The map form exists for add-on liveries — weights are how you get
+    -- one agency dominant in a region while another still turns up occasionally,
+    -- without hard-coded region rules. For example, if you ran a highway-patrol
+    -- pack and a sheriff pack:
+    --
+    --   sandyShores = {
+    --       ['yoursheriff_suv'] = 6,   -- the county's own units carry the region
+    --       ['yoursheriff_sedan'] = 4,
+    --       ['yourhwp_charger'] = 2,   -- highway patrol passes through
+    --       ['yourhwp_suv'] = 2,
+    --   },
+    --
+    -- A model that isn't installed is skipped when the pick is rolled rather than
+    -- failing the spawn, so a mixed list degrades to whatever you actually have.
+    -- If a region resolves to nothing installed at all, vehicleFallback below is
+    -- used — which is what makes it safe to point this at packs without checking
+    -- that every client has them.
     vehicles = {
+        losSantos   = { 'police', 'police2', 'police3' },
+        paletoBay   = { 'sheriff', 'sheriff2' },
+        sandyShores = { 'sheriff', 'sheriff2' },
+        countryside = { 'sheriff', 'sheriff2', 'pranger' },
+    },
+
+    -- Used only when nothing in `vehicles` for the region resolves to a model
+    -- this client can spawn. Keep these to base-game models — the whole point is
+    -- that they are always there.
+    vehicleFallback = {
         losSantos   = { 'police', 'police2', 'police3' },
         paletoBay   = { 'sheriff', 'sheriff2' },
         sandyShores = { 'sheriff', 'sheriff2' },
@@ -536,6 +569,102 @@ Config.ArrestSystem = {
         vector4(-449.2, 6012.6, 31.7, 45.0),      -- Paleto Bay Sheriff
         vector4(360.6, -1584.8, 29.3, 320.0),     -- Davis Sheriff
         vector4(-561.8, -131.0, 38.0, 200.0),     -- Rockford Hills PD
+    },
+}
+
+
+-- TRAFFIC TICKET SYSTEM --
+-- The roadside alternative to being taken in, on the same key (default H).
+-- Where you are decides which one you get:
+--
+--   on foot, wanted          hands up, cuffs, BUSTED screen, station
+--   driving, low wanted      hazards on, officer at your window, citation, drive away
+--
+-- This exists because an arrest teleports you to a station, which ends whatever
+-- you were in the middle of — and the offence that most often triggers one is
+-- speeding past a radar trap on a run you were halfway through. A citation costs
+-- money instead of progress, which is the trade a traffic offence should be.
+Config.TicketSystem = {
+    enabled = true,
+
+    -- Highest wanted level still settleable at the roadside. 1 keeps it to what
+    -- a radar trap issues (Config.Ambient.radar.playerWantedLevel) — a genuine
+    -- traffic offence. Raise to 2 if you want it to cover the reckless driving
+    -- that GTA escalates into on its own; above that, an officer writing a
+    -- citation instead of making an arrest stops being believable.
+    maxWantedLevel = 1,
+
+    -- A citation is for driving. Passengers aren't the ones being cited, and on
+    -- foot is the surrender path, so both fall through to the arrest system.
+    driverOnly = true,
+
+    -- Shots fired is not a traffic stop. Once you have fired on police the
+    -- option is gone for the rest of the pursuit.
+    denyAfterShooting = true,
+
+    -- Speed (mph) at or below which your vehicle counts as stopped. Nobody gets
+    -- out of a car until you're under this — the arrest system already learned
+    -- what pulling a ped out of a moving vehicle does to them.
+    stoppedSpeedMph = 3.0,
+
+    -- Having stopped, pull away faster than this and the stop is off: you're
+    -- fleeing, and the pursuit picks straight back up where it left off.
+    fleeSpeedMph = 12.0,
+
+    -- Abandon a stop that never happens — you signalled on a road no unit can
+    -- reach, or the response despawned around you. Seconds.
+    timeoutSeconds = 90,
+
+    -- How close the responding UNIT must be before it stops and sends an officer
+    -- out on foot, and how close that officer must get to your window before
+    -- they start writing.
+    approachDistance = 40.0,
+    windowDistance   = 3.5,
+
+    -- How long the officer spends at the window before handing it over.
+    writeSeconds = 8,
+
+    -- Grace period between the citation and the wanted level clearing. The
+    -- cleanup sweep deletes every spawned unit the moment you stop being wanted,
+    -- so without this the car parked behind you blinks out of existence while
+    -- you're looking at it. This is how long they get to drive off first.
+    dispersalSeconds = 6,
+
+    -- The fine. Computed and charged SERVER-side from these values: the client
+    -- says it was stopped and at what wanted level, never what it is willing to
+    -- pay. Set enabled = false for a warning-only stop that costs nothing.
+    fine = {
+        enabled = true,
+
+        -- Indexed by wanted level at the time of the stop. Levels past the end
+        -- of this list use the last entry, so it only needs to be as long as
+        -- maxWantedLevel.
+        amounts = { 750, 2000, 4000, 6000, 9000 },
+
+        -- Charged here first, then cash if fallbackToCash is on.
+        account = 'bank',
+        fallbackToCash = true,
+
+        -- Can't cover it? The stop still ends and you still drive away — an
+        -- officer doesn't arrest you over an unpaid citation, and turning "you're
+        -- broke" into a teleport to jail is exactly the outcome this avoids.
+        -- Set false to charge whatever you can and treat the rest as written off.
+        allowUnpaid = true,
+
+        -- Reason string on the transaction, for anything reading money logs.
+        reason = 'traffic-citation',
+    },
+
+    -- Player-facing text. %s in `issued` / `unpaid` is the amount.
+    messages = {
+        prompt   = 'Pull over and stop. Wait for the officer.',
+        hint     = 'Stopping for police — press the surrender key again to cancel',
+        writing  = 'The officer is writing your citation...',
+        issued   = 'Citation issued: $%s. You are free to go.',
+        unpaid   = 'Citation issued: $%s — unpaid, on record.',
+        warning  = 'Verbal warning issued. You are free to go.',
+        serious  = 'Too serious for a citation — they want you out of the car.',
+        fled     = 'You pulled away from the stop.',
     },
 }
 

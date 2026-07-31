@@ -943,6 +943,71 @@ AddEventHandler('fenix-police:rearmOfficer', function(pedNetID, loadoutKey)
 end)
 
 
+-- [Upstate Mafia] TRAFFIC CITATIONS --
+--
+-- The money half of Config.TicketSystem. The client reports that a roadside stop
+-- completed and at what wanted level; everything that costs the player anything
+-- is decided here. A client that sends level 99 gets the same fine as one that
+-- sends 1, because the level is clamped to the configured ceiling before it is
+-- used as an index.
+RegisterNetEvent('fenix-police:server:issueTicket')
+AddEventHandler('fenix-police:server:issueTicket', function(level)
+    local src = source
+    local c = Config.TicketSystem
+    if not c or not c.enabled then return end
+
+    local fine = c.fine or {}
+    if not fine.enabled then
+        -- Warning-only server: still answer, so the client shows an outcome
+        -- rather than waiting out its timeout on a reply that never comes.
+        TriggerClientEvent('fenix-police:client:ticketIssued', src, 0, true)
+        return
+    end
+
+    -- Clamp before indexing. Levels past the end of the list use the last entry,
+    -- so `amounts` only has to be as long as maxWantedLevel.
+    local amounts = fine.amounts or { 750 }
+    level = math.floor(tonumber(level) or 1)
+    if level < 1 then level = 1 end
+    if level > (c.maxWantedLevel or 1) then level = c.maxWantedLevel or 1 end
+    local amount = amounts[level] or amounts[#amounts] or 750
+    if amount <= 0 then
+        TriggerClientEvent('fenix-police:client:ticketIssued', src, 0, true)
+        return
+    end
+
+    local Player = QBCore.Functions.GetPlayer(src)
+    if not Player then return end
+
+    local account = fine.account or 'bank'
+    local reason  = fine.reason or 'traffic-citation'
+    local paid    = Player.Functions.RemoveMoney(account, amount, reason)
+
+    if not paid and fine.fallbackToCash ~= false and account ~= 'cash' then
+        paid = Player.Functions.RemoveMoney('cash', amount, reason)
+    end
+
+    if not paid and fine.allowUnpaid == false then
+        -- Take what there is and write the rest off. Deliberately never an
+        -- arrest: turning "you're broke" into a teleport to a station is exactly
+        -- the outcome this whole feature exists to avoid.
+        local held = (Player.PlayerData.money and Player.PlayerData.money[account]) or 0
+        if held > 0 then
+            Player.Functions.RemoveMoney(account, held, reason)
+            amount = held
+            paid = true
+        end
+    end
+
+    if Config.isDebug then
+        print(('[fenix-police] citation for %s: $%d at level %d, paid=%s')
+            :format(GetPlayerName(src) or src, amount, level, tostring(paid)))
+    end
+
+    TriggerClientEvent('fenix-police:client:ticketIssued', src, amount, paid == true)
+end)
+
+
 --Added wanted levels for basic QB robbery etc
 
 --used to get the players near an alert

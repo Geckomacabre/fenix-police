@@ -86,6 +86,16 @@ local playerHasShot = false
 local isSurrendering = false
 local isBeingArrested = false
 
+-- Traffic ticket state. Declared up here rather than in the ticket section
+-- because the chase loop (~1200 lines below, still above that section) has to
+-- read them to know a unit is working a roadside stop instead of a pursuit.
+--   isPullingOver   you have signalled a stop; nobody is at your window yet
+--   isBeingTicketed an officer is at the window writing
+--   ticketWrapUp    citation handed over, units driving off, wanted not yet cleared
+local isPullingOver   = false
+local isBeingTicketed = false
+local ticketWrapUp    = false
+
 
 -- [Upstate Mafia patch] Forward declaration. isPlayerPoliceOfficer is defined
 -- ~2250 lines below as a file-scope local, so every reference above its
@@ -1272,13 +1282,25 @@ end
 
 
 
--- [Upstate Mafia] Forward declaration: the surrender handler is defined ~1200
--- lines below, alongside the rest of the arrest system, but has to be reachable
--- from the chase loop here.
+-- [Upstate Mafia] Forward declarations: the surrender and traffic-stop handlers
+-- are defined ~1200 lines below, alongside the rest of the arrest system, but
+-- have to be reachable from the chase loop here.
 local handleSurrenderApproach
+local handleTicketApproach
 
 -- Function to handle police foot chase and vehicle retrieval
 local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
+    -- [Upstate Mafia] Citation written, everyone standing down. The wanted level
+    -- hasn't cleared yet (that's what triggers the delete sweep), so without this
+    -- the chase loop would re-task the units it just dismissed.
+    if ticketWrapUp then return end
+
+    -- [Upstate Mafia] Roadside stop in progress: this unit is either working it
+    -- or standing down for it, and either way it isn't chasing.
+    if Config.TicketSystem and Config.TicketSystem.enabled and (isPullingOver or isBeingTicketed) then
+        if handleTicketApproach(vehicleData, playerPed, vehNetID) then return end
+    end
+
     -- [Upstate Mafia] Hands up: stop chasing, start arresting. Returning early
     -- leaves every combat and driving task below unassigned for this unit, which
     -- is what stops officers shooting a surrendering player.
@@ -1438,6 +1460,11 @@ local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerH
     -- engaging — which is the shot you want during the arrest cinematic anyway.
     if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then return end
 
+    -- [Upstate Mafia] Same for a roadside stop. Air support shouldn't be there at
+    -- a citation-level wanted level, but nothing guarantees a heli spawned for an
+    -- earlier, more serious phase of the same pursuit has despawned yet.
+    if ticketWrapUp or isPullingOver or isBeingTicketed then return end
+
     local playerCoords = GetEntityCoords(playerPed)
     local heliWantedLevel = GetPlayerWantedLevel(PlayerId())
     local vehicle = NetToVeh(vehNetID)
@@ -1548,6 +1575,7 @@ end
 local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
     -- [Upstate Mafia] Hold fire on a surrendering player, as above.
     if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then return end
+    if ticketWrapUp or isPullingOver or isBeingTicketed then return end
 
     local playerCoords = GetEntityCoords(playerPed)
     local airWantedLevel = GetPlayerWantedLevel(PlayerId())
@@ -2431,11 +2459,24 @@ local HANDS_UP_ANIM = 'handsup_standing_base'
 local KNEEL_DICT    = 'random@arrests@busted'
 local KNEEL_ANIM    = 'idle_a'
 
+-- [Upstate Mafia] Forward declarations. The traffic-ticket path lives in its own
+-- section below triggerArrest, but shares this key mapping — one key for one
+-- intent ("I'm stopping"), with where you are deciding what that means.
+local beginPullOver, cancelPullOver
+
 -- Toggle surrender when player presses H
-RegisterKeyMapping('surrendertopolice', 'Surrender to Police (Hands Up)', 'keyboard', 'H')
+-- [Upstate Mafia] Command name deliberately unchanged — renaming it would drop
+-- every existing player's rebind. Only the label reflects the second outcome.
+RegisterKeyMapping('surrendertopolice', 'Surrender / Pull Over for Police', 'keyboard', 'H')
 RegisterCommand('surrendertopolice', function()
-    if isBeingArrested then return end
-    if not Config.ArrestSystem.enabled then return end
+    if isBeingArrested or isBeingTicketed then return end
+
+    -- [Upstate Mafia] Either system can be turned off independently, so this can
+    -- no longer gate on the arrest system alone — that would leave the key dead
+    -- on a server running tickets only.
+    local arrestEnabled = Config.ArrestSystem and Config.ArrestSystem.enabled
+    local ticketEnabled = Config.TicketSystem and Config.TicketSystem.enabled
+    if not (arrestEnabled or ticketEnabled) then return end
 
     -- Nothing to surrender to without a wanted level.
     if GetPlayerWantedLevel(PlayerId()) < 1 then
@@ -2443,10 +2484,17 @@ RegisterCommand('surrendertopolice', function()
             isSurrendering = false
             ClearPedTasks(PlayerPedId())
         end
+        if isPullingOver then cancelPullOver() end
         return
     end
 
     local playerPed = PlayerPedId()
+
+    if isPullingOver then
+        -- Toggle back off: hazards off, and the pursuit resumes.
+        cancelPullOver()
+        return
+    end
 
     if isSurrendering then
         -- Toggle back off: hands down, carry on.
@@ -2456,11 +2504,18 @@ RegisterCommand('surrendertopolice', function()
     end
 
     -- Hands up on foot only. Surrendering through a windscreen looks absurd and
-    -- leaves the officer walking up to a car they can't reach into.
+    -- leaves the officer walking up to a car they can't reach into — which is
+    -- what the ticket path handles instead, by having them walk to the window.
     if IsPedInAnyVehicle(playerPed, false) then
-        if Config.isDebug then print('[fenix-police] surrender ignored: in a vehicle') end
+        if ticketEnabled then
+            beginPullOver()
+        elseif Config.isDebug then
+            print('[fenix-police] surrender ignored: in a vehicle')
+        end
         return
     end
+
+    if not arrestEnabled then return end
 
     isSurrendering = true
 
@@ -2494,9 +2549,16 @@ RegisterCommand('surrendertopolice', function()
 end, false)
 
 -- Disable controls while surrendering or being arrested (runs every frame)
+--
+-- [Upstate Mafia] isBeingTicketed is held to the same rule, but isPullingOver
+-- deliberately is NOT. Between signalling and the officer reaching your window
+-- you are still driving — you have to be able to brake, steer onto the verge,
+-- and press the key again to call it off. Locking controls there would also kill
+-- the key mapping that cancels it, since a disabled control never fires the
+-- command bound to it.
 Citizen.CreateThread(function()
     while true do
-        if isSurrendering or isBeingArrested then
+        if isSurrendering or isBeingArrested or isBeingTicketed then
             DisableAllControlActions(0)
             EnableControlAction(0, 1, true)   -- Look L/R
             EnableControlAction(0, 2, true)   -- Look U/D
@@ -2785,6 +2847,459 @@ function triggerArrest(arrestingCop)
 end
 
 
+-------------------------------------------------
+-- TRAFFIC TICKET SYSTEM (Upstate Mafia)       --
+-------------------------------------------------
+--
+-- The roadside outcome, on the same key as the surrender above and with the
+-- opposite consequence: an officer walks to your window, writes a citation, and
+-- you drive away from where you stopped instead of waking up at a station with
+-- whatever you were doing abandoned.
+--
+-- Structurally parallel to the arrest path on purpose — exactly ONE officer out
+-- of exactly one stopped car, everyone else holds — because that shape is what
+-- made the arrest system work after the original version emptied every
+-- responding unit the moment you put your hands up.
+
+local MPS_TO_MPH = 2.23694   -- GetEntitySpeed is metres per second
+
+local ticketUnit        = nil    -- vehNetID of the unit working the stop
+local pullOverStopped   = false  -- you have actually come to a stop at least once
+local pullOverStartedAt = 0
+local pendingTicket     = nil    -- the server's reply: { amount, paid }
+
+local function ticketCfg() return Config.TicketSystem or {} end
+local function ticketMsg(key) return (ticketCfg().messages or {})[key] end
+
+local function ticketNotify(msg)
+    if not msg or msg == '' then return end
+    -- QBCore is the only notification path this resource has. If it isn't there,
+    -- fall back to chat rather than swallowing the message — every one of these
+    -- is telling the player why something did or didn't happen.
+    local ok = pcall(function() QBCore.Functions.Notify(msg) end)
+    if not ok then
+        TriggerEvent('chat:addMessage', { args = { '[Police]', msg } })
+    end
+end
+
+--- 12345 -> "12,345". Amounts are read at a glance off a notification.
+local function formatMoney(amount)
+    local s = tostring(math.floor(amount or 0))
+    local out = s:reverse():gsub('(%d%d%d)', '%1,'):reverse()
+    return (out:gsub('^,', ''))
+end
+
+--- Instructional help box, redrawn every frame it's wanted.
+local function drawTicketHint(msg)
+    if not msg or msg == '' then return end
+    BeginTextCommandDisplayHelp('STRING')
+    AddTextComponentSubstringPlayerName(msg)
+    EndTextCommandDisplayHelp(0, false, true, -1)
+end
+
+--- Can this be settled at the roadside right now?
+--- @return boolean ok, string|nil reason
+local function ticketEligible()
+    local c = ticketCfg()
+    if not c.enabled then return false, 'disabled' end
+
+    local playerPed = PlayerPedId()
+    local veh = GetVehiclePedIsIn(playerPed, false)
+    if veh == 0 then return false, 'on foot' end
+    if c.driverOnly ~= false and GetPedInVehicleSeat(veh, -1) ~= playerPed then
+        return false, 'not driving'
+    end
+
+    local level = GetPlayerWantedLevel(PlayerId())
+    if level < 1 then return false, 'not wanted' end
+    if level > (c.maxWantedLevel or 1) then return false, 'too serious' end
+    if c.denyAfterShooting ~= false and playerHasShot then return false, 'shots fired' end
+
+    return true
+end
+
+--- Drop the task markers this system wrote onto a unit, so the chase loop
+--- re-tasks it from scratch. Without this a cancelled stop leaves an officer
+--- standing in the road carrying an 'ApproachWindow' marker that the loop reads
+--- as "already handled" and never touches again.
+local function releaseTicketUnit()
+    if not ticketUnit then return end
+
+    local data = spawnedVehicles[ticketUnit]
+    if data and data.officerTasks then
+        for pedNetID, task in pairs(data.officerTasks) do
+            if task == 'ExitForTicket' or task == 'ApproachWindow' then
+                data.officerTasks[pedNetID] = nil
+                local officer = NetToPed(pedNetID)
+                if officer and officer ~= 0 and DoesEntityExist(officer) then
+                    SetPedKeepTask(officer, false)
+                    ClearPedTasks(officer)
+                end
+            end
+        end
+    end
+
+    local veh = NetToVeh(ticketUnit)
+    if veh and veh ~= 0 and DoesEntityExist(veh) then
+        SetVehicleHasMutedSirens(veh, false)
+    end
+
+    ticketUnit = nil
+end
+
+--- Sirens off, back to an ordinary patrol drive. Used to send the response away
+--- at the end of a stop, before the wanted level clears — the cleanup sweep
+--- deletes every spawned unit the instant you stop being wanted, and a car that
+--- is already driving is far less jarring to lose than one at your bumper.
+local function dismissUnit(vehNetID)
+    local veh = NetToVeh(vehNetID)
+    if not veh or veh == 0 or not DoesEntityExist(veh) then return end
+
+    SetVehicleHasMutedSirens(veh, false)
+    SetSirenKeepOn(veh, false)
+    SetVehicleSiren(veh, false)
+
+    local driver = GetPedInVehicleSeat(veh, -1)
+    if driver and driver ~= 0 and DoesEntityExist(driver) then
+        if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+        ClearPedTasks(driver)
+        SetDriverAbility(driver, 0.9)
+        SetDriverAggressiveness(driver, 0.2)
+        -- 786603: obeys lights, avoids traffic. The same style the ambient system
+        -- uses to end a traffic stop, so both read identically from the kerb.
+        TaskVehicleDriveWander(driver, veh, 16.0, 786603)
+    end
+end
+
+local function dismissAllUnits(exceptNetID)
+    for vehNetID in pairs(spawnedVehicles) do
+        if vehNetID ~= exceptNetID then dismissUnit(vehNetID) end
+    end
+end
+
+--- Officer at the window: write it, hand it over, and put everyone back on the
+--- road. This is the counterpart to triggerArrest, and the whole point of the
+--- feature is what it does NOT do — no fade, no teleport, no lost position.
+local function triggerTicket(officer, copVeh)
+    if isBeingTicketed then return end
+    isBeingTicketed = true
+    isPullingOver   = false
+
+    Citizen.CreateThread(function()
+        local c = ticketCfg()
+        local playerPed = PlayerPedId()
+        local level = GetPlayerWantedLevel(PlayerId())
+        if level < 1 then level = 1 end
+
+        -- Ask the server for the citation. It owns the amount and the charge —
+        -- the client reports that it was stopped, never what it will pay.
+        pendingTicket = nil
+        TriggerServerEvent('fenix-police:server:issueTicket', level)
+
+        if DoesEntityExist(officer) then
+            SetPedKeepTask(officer, true)
+            TaskTurnPedToFaceEntity(officer, playerPed, 1500)
+        end
+        Wait(1200)
+        if DoesEntityExist(officer) then
+            TaskStartScenarioInPlace(officer, 'WORLD_HUMAN_CLIPBOARD', 0, true)
+        end
+
+        -- Writing. Timed on GetNetworkTime for the same reason the busted screen
+        -- is: it is real time and can't be stretched by a local time scale.
+        local t0 = GetNetworkTime()
+        local duration = (c.writeSeconds or 8) * 1000
+        while (GetNetworkTime() - t0) < duration do
+            -- Bailing out of the car mid-citation ends the stop as a stop; the
+            -- wanted level survives and the pursuit picks it up from there.
+            if GetVehiclePedIsIn(PlayerPedId(), false) == 0 then
+                isBeingTicketed = false
+                releaseTicketUnit()
+                if DoesEntityExist(officer) then ClearPedTasks(officer) end
+                return
+            end
+            Wait(100)
+        end
+
+        if DoesEntityExist(officer) then ClearPedTasks(officer) end
+
+        local t = pendingTicket
+        if t and (t.amount or 0) > 0 then
+            local text = t.paid and ticketMsg('issued') or ticketMsg('unpaid')
+            ticketNotify((text or 'Citation issued: $%s'):format(formatMoney(t.amount)))
+        else
+            -- Fines off, or the server declined to charge: still an outcome.
+            ticketNotify(ticketMsg('warning'))
+        end
+
+        -- Hazards off — you're released.
+        local playerVeh = GetVehiclePedIsIn(PlayerPedId(), false)
+        if playerVeh ~= 0 then
+            SetVehicleIndicatorLights(playerVeh, 0, false)
+            SetVehicleIndicatorLights(playerVeh, 1, false)
+        end
+
+        -- Wrap-up: you have your controls back and the wanted level is still on,
+        -- which is what holds the cleanup sweep off while everyone drives away.
+        ticketWrapUp    = true
+        isBeingTicketed = false
+        pullOverStopped = false
+
+        dismissAllUnits(ticketUnit)
+
+        -- The officer who wrote it walks back to their own car first.
+        if DoesEntityExist(officer) and copVeh and DoesEntityExist(copVeh) then
+            ClearPedTasks(officer)
+            TaskEnterVehicle(officer, copVeh, 15000, -1, 1.5, 1, 0)
+            local waited = 0
+            while waited < 12000 do
+                if not DoesEntityExist(officer) then break end
+                if GetVehiclePedIsIn(officer, false) == copVeh then break end
+                Wait(250)
+                waited = waited + 250
+            end
+        end
+
+        local stopUnit = ticketUnit
+        releaseTicketUnit()
+        if stopUnit then dismissUnit(stopUnit) end
+
+        Wait((c.dispersalSeconds or 6) * 1000)
+
+        ClearPlayerWantedLevel(PlayerId())
+        SetPlayerWantedLevel(PlayerId(), 0, false)
+        SetPlayerWantedLevelNow(PlayerId(), false)
+
+        playerVeh = GetVehiclePedIsIn(PlayerPedId(), false)
+        if playerVeh ~= 0 then SetVehicleIsWanted(playerVeh, false) end
+
+        ticketWrapUp = false
+    end)
+end
+
+--- Officers work a roadside stop instead of a pursuit.
+---
+--- Same contract as handleSurrenderApproach: return true and this unit skips its
+--- chase logic entirely for this cycle. The differences are that every unit
+--- holds once a stop is under way (a traffic stop with three cars circling isn't
+--- one), that the officer walks to the driver's window rather than to the ped,
+--- and that nothing here draws a weapon — a citation delivered at gunpoint is an
+--- arrest with extra steps.
+---
+--- Assigns to the forward-declared local near handleChaseBehavior.
+function handleTicketApproach(vehicleData, playerPed, vehNetID)
+    if isBeingTicketed then return true end
+
+    local c = ticketCfg()
+    local playerVeh = GetVehiclePedIsIn(playerPed, false)
+    if playerVeh == 0 then return false end
+
+    local vehicle = NetToVeh(vehNetID)
+    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return false end
+
+    local tasks = spawnedVehicles[vehNetID] and spawnedVehicles[vehNetID].officerTasks
+    if not tasks then return false end
+
+    -- The unit working the stop can be culled out from under us — too far, dead,
+    -- despawned. Drop the claim so another unit picks the stop up instead of
+    -- leaving the player sat at the kerb until the timeout.
+    if ticketUnit and not spawnedVehicles[ticketUnit] then ticketUnit = nil end
+
+    local playerCoords = GetEntityCoords(playerPed)
+    local unitDist = #(playerCoords - GetEntityCoords(vehicle))
+    local approach = c.approachDistance or 40.0
+
+    -- Backup that isn't working the stop. Beyond approachDistance it is returned
+    -- to the chase loop, which is what actually drives it here — hold it too
+    -- early and units spawned for this stop sit at their spawn point forever.
+    -- Inside that range it stops where it is rather than circling and boxing in
+    -- a car that has already pulled over.
+    if ticketUnit and ticketUnit ~= vehNetID then
+        if unitDist > approach then return false end
+        if GetEntitySpeed(vehicle) > 1.0 then
+            local driver = GetPedInVehicleSeat(vehicle, -1)
+            if driver and driver ~= 0 and DoesEntityExist(driver) then
+                if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+                BringVehicleToHalt(vehicle, 8.0, 2, false)
+            end
+        end
+        return true
+    end
+
+    -- One unit works the stop, and once chosen it keeps it — re-electing the
+    -- closest unit every cycle would hand the stop to whichever car rolled a
+    -- metre closer, halfway through the first officer's walk.
+    if not ticketUnit then
+        if unitDist > approach then return false end
+        ticketUnit = vehNetID
+    end
+
+    -- Nobody gets out until both cars are stopped. Pulling a ped out of a moving
+    -- car is what produced the ragdolling officers the arrest path had to fix.
+    if GetEntitySpeed(playerVeh) * MPS_TO_MPH > (c.stoppedSpeedMph or 3.0) then return true end
+
+    if GetEntitySpeed(vehicle) > 1.0 then
+        local driver = GetPedInVehicleSeat(vehicle, -1)
+        if driver and driver ~= 0 and DoesEntityExist(driver) then
+            if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+            BringVehicleToHalt(vehicle, 6.0, 2, false)
+        end
+        return true
+    end
+
+    -- Lights on, wail off: the standing look for a stationary traffic stop, and
+    -- what the ambient `stop` scenes already use.
+    SetVehicleSiren(vehicle, true)
+    SetVehicleHasMutedSirens(vehicle, true)
+
+    local walker, walkerDist = nil, 9999.0
+
+    for pedNetID, _ in pairs(vehicleData.officers) do
+        local officer = NetToPed(pedNetID)
+        if DoesEntityExist(officer) and officer ~= 0 and not IsPedDeadOrDying(officer, true) then
+            if not NetworkHasControlOfEntity(officer) then NetworkRequestControlOfEntity(officer) end
+
+            local seated = IsPedInAnyVehicle(officer, false)
+            local d = #(playerCoords - GetEntityCoords(officer))
+
+            if not seated and d < walkerDist then
+                walker, walkerDist = pedNetID, d
+            end
+
+            if seated and tasks[pedNetID] ~= 'ExitForTicket' and not walker then
+                -- One officer out, from a stopped car, once only.
+                TaskLeaveVehicle(officer, vehicle, 0)
+                tasks[pedNetID] = 'ExitForTicket'
+                break
+            end
+        end
+    end
+
+    if walker then
+        local officer = NetToPed(walker)
+        -- Driver's window, turned toward the car. Same offset the ambient traffic
+        -- stops use, so a scripted stop and an ambient one look the same.
+        local window = GetOffsetFromEntityInWorldCoords(playerVeh, -1.9, -0.6, 0.0)
+
+        if tasks[walker] ~= 'ApproachWindow' then
+            SetPedKeepTask(officer, true)
+            TaskGoStraightToCoord(officer, window.x, window.y, window.z, 1.0, 20000,
+                GetEntityHeading(playerVeh) - 90.0, 0.5)
+            tasks[walker] = 'ApproachWindow'
+        end
+
+        if #(GetEntityCoords(officer) - window) <= (c.windowDistance or 3.5) then
+            triggerTicket(officer, vehicle)
+        end
+    end
+
+    return true
+end
+
+--- Call off a stop in progress. Safe to call when none is running.
+--- Assigns to the forward-declared local in the arrest section above.
+function cancelPullOver(reason)
+    if not isPullingOver then return end
+
+    isPullingOver   = false
+    pullOverStopped = false
+
+    local veh = GetVehiclePedIsIn(PlayerPedId(), false)
+    if veh ~= 0 then
+        SetVehicleIndicatorLights(veh, 0, false)
+        SetVehicleIndicatorLights(veh, 1, false)
+    end
+
+    releaseTicketUnit()
+
+    if reason then ticketNotify(reason) end
+    if Config.isDebug then
+        print(('[fenix-police] roadside stop cancelled (%s)'):format(reason or 'by player'))
+    end
+end
+
+--- Signal that you're pulling over. Assigns to the forward-declared local above.
+function beginPullOver()
+    local c = ticketCfg()
+    local ok, reason = ticketEligible()
+    if not ok then
+        -- The one refusal a player will actually run into is "this is past a
+        -- ticket". Saying nothing there is indistinguishable from a dead keybind.
+        if reason == 'too serious' then ticketNotify(ticketMsg('serious')) end
+        if Config.isDebug then
+            print(('[fenix-police] roadside stop refused: %s'):format(reason))
+        end
+        return
+    end
+
+    isPullingOver     = true
+    pullOverStopped   = false
+    pullOverStartedAt = GetGameTimer()
+    pendingTicket     = nil
+    ticketUnit        = nil
+
+    ticketNotify(ticketMsg('prompt'))
+
+    Citizen.CreateThread(function()
+        while isPullingOver do
+            local veh   = GetVehiclePedIsIn(PlayerPedId(), false)
+            local level = GetPlayerWantedLevel(PlayerId())
+
+            if level < 1 then
+                cancelPullOver()
+            elseif level > (c.maxWantedLevel or 1) then
+                cancelPullOver(ticketMsg('serious'))
+            elseif veh == 0 then
+                cancelPullOver()
+            elseif c.denyAfterShooting ~= false and playerHasShot then
+                cancelPullOver()
+            elseif GetGameTimer() - pullOverStartedAt > (c.timeoutSeconds or 90) * 1000 then
+                cancelPullOver()
+            else
+                local speedMph = GetEntitySpeed(veh) * MPS_TO_MPH
+                if speedMph <= (c.stoppedSpeedMph or 3.0) then
+                    pullOverStopped = true
+                elseif pullOverStopped and speedMph > (c.fleeSpeedMph or 12.0) then
+                    -- Stopped, then took off again. That's not a traffic stop.
+                    cancelPullOver(ticketMsg('fled'))
+                end
+
+                if isPullingOver then
+                    -- Re-applied every pass: the game clears indicators on some
+                    -- vehicles when the engine or lights state changes.
+                    SetVehicleIndicatorLights(veh, 0, true)
+                    SetVehicleIndicatorLights(veh, 1, true)
+                end
+            end
+
+            Wait(200)
+        end
+    end)
+
+    -- The prompt needs a frame-rate thread; the state loop above deliberately
+    -- doesn't run at one.
+    Citizen.CreateThread(function()
+        while isPullingOver or isBeingTicketed do
+            drawTicketHint(isBeingTicketed and ticketMsg('writing') or ticketMsg('hint'))
+            Wait(0)
+        end
+    end)
+end
+
+--- The server has priced and charged the citation.
+RegisterNetEvent('fenix-police:client:ticketIssued', function(amount, paid)
+    pendingTicket = { amount = amount or 0, paid = paid == true }
+end)
+
+--- True from the moment a stop is signalled until the wanted level clears.
+--- Exported for the ambient layer: the radar trap that clocked you is still
+--- carrying its own chase task, and it has to be told to stand down rather than
+--- circling and PITting a car that has already pulled over.
+exports('IsPlayerAtTrafficStop', function()
+    return isPullingOver or isBeingTicketed or ticketWrapUp
+end)
+
+
 -- MAIN THREAD --
 -- Monitor the player's wanted level and maintain police units
 Citizen.CreateThread(function()
@@ -2883,7 +3398,15 @@ Citizen.CreateThread(function()
             else
 
                 wantedTimer = 0
-                maintainPoliceUnits(wantedLevel) -- Checks if we need to spawn more units, or remove excess units.
+                -- [Upstate Mafia] Don't reinforce a response that is standing
+                -- down. From the moment an officer is at your window the wanted
+                -- level is only still on to hold the delete sweep off, and a
+                -- fresh cruiser spawning into a finished stop reads as a bug.
+                -- isPullingOver is deliberately not included: before anyone is at
+                -- the window a stop still needs a unit sent to work it.
+                if not (isBeingTicketed or ticketWrapUp) then
+                    maintainPoliceUnits(wantedLevel) -- Checks if we need to spawn more units, or remove excess units.
+                end
                 checkDeadPeds() -- Check for dead peds
                 handleDeadPeds() -- Handle the deletion of dead peds.
                 handleFarPeds() -- Handle the deletion of far peds. 
@@ -2905,6 +3428,11 @@ Citizen.CreateThread(function()
             playerHasShot = false
             provokedUntil = 0
             isSurrendering = false
+            -- [Upstate Mafia] Roadside stop state follows the same rule: no wanted
+            -- level, nothing to stop for. ticketWrapUp is left alone — it is
+            -- cleared by the stop that set it, immediately after clearing the
+            -- wanted level that got us here.
+            if isPullingOver then cancelPullOver() end
             -- Wanted level just cleared — delete all spawned units.
             --
             -- We run for 3 cycles (wantedTimer < 3) instead of just once so that any
@@ -3211,6 +3739,9 @@ RegisterCommand('fenix:diag', function()
     print(('  playerHasShot      = %s'):format(tostring(playerHasShot)))
     print(('  isSurrendering     = %s'):format(tostring(isSurrendering)))
     print(('  isBeingArrested    = %s'):format(tostring(isBeingArrested)))
+    print(('  isPullingOver      = %s'):format(tostring(isPullingOver)))
+    print(('  isBeingTicketed    = %s'):format(tostring(isBeingTicketed)))
+    print(('  ticketWrapUp       = %s'):format(tostring(ticketWrapUp)))
     print(('  isPoliceOfficer    = %s'):format(tostring(isPlayerPoliceOfficer())))
     print(('  PoliceWantedProt   = %s'):format(tostring(Config.PoliceWantedProtection)))
     print(('  onlyWhenOffline    = %s'):format(tostring(Config.onlyWhenPlayerPoliceOffline)))

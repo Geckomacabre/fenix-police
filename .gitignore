@@ -1,3 +1,9 @@
+# Per-server config overrides. Anything in here is loaded after config.lua and
+# never committed — server-specific model names, coordinates, job names and the
+# like belong in this directory, not in the shipped config.
+# See config.local.example.lua for the pattern.
+config.local/
+
 # Compiled Lua sources
 luac.out
 

@@ -36,6 +36,106 @@ carjacking provenance note below.
 
 ---
 
+## 2.1.0 — roadside citations & weighted vehicle picks — 2026-07-31
+
+### Added — traffic citations as an alternative to arrest
+
+`Config.TicketSystem`, `client/client.lua` (new section below the arrest
+system), `server/server.lua`.
+
+Being caught had exactly one ending: the BUSTED cinematic and a teleport to the
+nearest station. That is the right outcome for a robbery and the wrong one for
+the offence that most often triggers it — speeding past a radar trap halfway
+through a run. The arrest doesn't cost you money, it costs you your position.
+
+The surrender key (default `H`) now does one of two things depending on where
+you are:
+
+| Where | Outcome |
+|---|---|
+| On foot, wanted | Unchanged — hands up, cuffs, BUSTED, station |
+| Driving, wanted ≤ `maxWantedLevel` | Hazards on, officer at your window, citation, drive away |
+
+Sequence: signal → the pursuit stops re-tasking → nearest unit within
+`approachDistance` claims the stop and halts → one officer out of the stopped car
+→ walks to the driver's-window offset (the same one the ambient `stop` scenes
+use) → `WORLD_HUMAN_CLIPBOARD` for `writeSeconds` → citation → everyone drives
+off → wanted level clears `dispersalSeconds` later.
+
+Design points worth keeping if this is ever merged forward:
+
+- **One officer, from a stopped car.** Same contract as
+  `handleSurrenderApproach`, for the same reason: the original arrest code
+  emptied every responding unit at once and had to be disabled.
+- **The claim latches.** Re-electing the closest unit each cycle would hand the
+  stop to whichever car rolled a metre nearer, mid-walk. The claim is dropped
+  only if that unit is culled out from under it.
+- **Units beyond `approachDistance` are returned to the chase loop**, not held.
+  Holding them meant units spawned to work the stop sat at their spawn point
+  forever, because the chase loop is what actually drives them to you.
+- **`ticketWrapUp` keeps the wanted level on** while everyone drives away. The
+  cleanup watchdog deletes every spawned unit the instant you stop being wanted,
+  so clearing it immediately blinked the car at your bumper out of existence.
+  `maintainPoliceUnits` is suppressed during wrap-up for the same reason —
+  spawning a replacement into a finished stop reads as a bug.
+- **Controls are locked only while the citation is being written**, never while
+  you're still driving to a stop. A disabled control never fires the command
+  bound to it, so locking earlier would also kill the key that cancels.
+- **The fine is priced and charged server-side.** The client sends the wanted
+  level and nothing else, and the level is clamped to `maxWantedLevel` before it
+  indexes `fine.amounts`. Insufficient funds is never an arrest.
+- **The ambient trap stands down.** `catchPlayer` leaves its cruiser on a
+  `TaskVehicleChase`, which circles and PITs a car that has already pulled over.
+  `standDownForTrafficStop` in `client/ambient.lua` halts it once, via the new
+  `IsPlayerAtTrafficStop` export.
+
+New export: `exports['fenix-police']:IsPlayerAtTrafficStop()` (client).
+
+### Added — `config.local/` for server-specific settings
+
+`fxmanifest.lua`, `.gitignore`, `config.local.example.lua`.
+
+`config.lua` is both the documentation and the defaults, which means every
+server-specific edit to it — add-on vehicle models, job names, coordinates — is
+lost or conflicts the next time this fork is updated. That is the direct reason
+the pack liveries above were pulled back out of the shipped config: there was
+nowhere else for them to go.
+
+Now there is. `shared_scripts` loads `config.local/*.lua` last, after
+`config.lua` and `data/ambient_points.lua`, so anything in that directory
+overrides both. The directory is gitignored and absent from a clean checkout.
+
+A **directory** rather than a named `config.local.lua` on purpose: a glob that
+matches nothing is a no-op, whereas a literal missing filename in a script list
+is an error at resource start. It also means `config.local.example.lua` can be
+committed as documentation at the repo root without ever being loaded, because
+it sits outside the directory the glob covers.
+
+### Added — weighted vehicle selection for ambient units
+
+`Config.Ambient.vehicles`, `Config.Ambient.vehicleFallback`,
+`client/ambient.lua`.
+
+Ambient units picked uniformly from a flat list per region, which can express
+"these models" but not "mostly this agency, occasionally that one". They now go
+through one function, `regionVehicle`, and `Config.Ambient.vehicles` accepts a
+`model = weight` map as well as the original array (picked uniformly, unchanged
+behaviour — `list[1] ~= nil` tells the shapes apart).
+
+The defaults stay **base-game models only**. This is a config file that ships,
+so server-specific add-on liveries do not belong in it; the weighting exists so
+each server can point it at its own.
+
+Two details make that safe:
+
+- `pickWeighted` filters uninstalled models *inside* the roll rather than after
+  it, so a region weighted mostly toward a pack a given client doesn't have
+  still returns the models it does — no wasted picks, no failed spawns.
+- `vehicleFallback` catches a region where nothing at all resolves, so a client
+  missing every add-on still gets ambient police rather than empty scenes.
+
+---
+
 ## 2.0.0 — ambient enforcement — 2026-07-31
 
 First tagged release of this fork, on top of upstream 1.0.2. The major bump is

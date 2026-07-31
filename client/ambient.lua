@@ -49,6 +49,52 @@ local function pick(list)
     return list[math.random(#list)]
 end
 
+--- Is this model something the client can actually spawn? Add-on vehicle packs
+--- are the reason this exists: the region lists name models from packs a given
+--- server may not run, and a missing pack has to be an entry that's skipped, not
+--- a spawn that fails.
+local function modelInstalled(modelName)
+    return type(modelName) == 'string' and IsModelValid(GetHashKey(modelName))
+end
+
+--- Pick from a model table, skipping anything `valid` rejects.
+---
+--- Two accepted shapes, because the region vehicle lists gained weights and the
+--- old format still has to work. `list[1] ~= nil` tells them apart:
+---   array  { 'police', 'police2' }     picked uniformly
+---   map    { police = 4, sheriff = 1 } picked by relative weight
+---
+--- Filtering happens inside the roll rather than after it, so an uninstalled
+--- model never consumes a pick — a region weighted mostly toward a pack you
+--- don't have still returns the models you do.
+local function pickWeighted(list, valid)
+    if not list then return nil end
+
+    if list[1] ~= nil then
+        local pool = {}
+        for _, model in ipairs(list) do
+            if not valid or valid(model) then pool[#pool + 1] = model end
+        end
+        return pick(pool)
+    end
+
+    local total = 0
+    for model, weight in pairs(list) do
+        if type(weight) == 'number' and weight > 0 and (not valid or valid(model)) then
+            total = total + weight
+        end
+    end
+    if total <= 0 then return nil end
+
+    local roll, acc = math.random() * total, 0
+    for model, weight in pairs(list) do
+        if type(weight) == 'number' and weight > 0 and (not valid or valid(model)) then
+            acc = acc + weight
+            if roll <= acc then return model end
+        end
+    end
+end
+
 --- Region key for the player's current zone, matching Config.ZoneEnum.
 --- Reimplemented here rather than reaching into client.lua, whose zone helpers
 --- are file-locals.
@@ -65,6 +111,18 @@ end
 local function regionList(tbl)
     local key = regionKey()
     return (tbl and (tbl[key] or tbl.losSantos)) or nil
+end
+
+--- Cruiser model for an ambient scene in the player's current region.
+---
+--- Every scene that spawns a police vehicle goes through here, so agency mix is
+--- decided in one place: Config.Ambient.vehicles carries the weights, and this
+--- drops through to Config.Ambient.vehicleFallback (stock police / sheriff) when
+--- none of the weighted models are installed.
+local function regionVehicle()
+    local model = pickWeighted(regionList(cfg().vehicles), modelInstalled)
+    if model then return model end
+    return pick(regionList(cfg().vehicleFallback)) or 'police'
 end
 
 --- Weighted pick over Config.Ambient.weights, skipping kinds weighted 0.
@@ -421,12 +479,12 @@ local function spawnRadar(playerCoords)
         heading = (roadHeading + 180.0) % 360.0
     end
 
-    local veh = createVehicle(pointVehicle or pick(regionList(cfg().vehicles)), x, y, anchor.z + 0.5, heading)
+    local veh = createVehicle(pointVehicle or regionVehicle(), x, y, anchor.z + 0.5, heading)
     if not veh and pointVehicle then
         -- Authored model missing from the server (never streamed, addon removed).
         -- Fall back rather than losing the trap entirely.
         dbg(('radar point vehicle "%s" failed to load, using regional default'):format(pointVehicle))
-        veh = createVehicle(pick(regionList(cfg().vehicles)), x, y, anchor.z + 0.5, heading)
+        veh = createVehicle(regionVehicle(), x, y, anchor.z + 0.5, heading)
     end
     if not veh then return commitScene(scene, false) end
     scene.vehicles[1] = veh
@@ -506,7 +564,7 @@ local function spawnStop(playerCoords)
 
     -- Cruiser 8m behind the civilian car, lights on but silent.
     local behind = GetOffsetFromEntityInWorldCoords(civVeh, 0.0, -8.0, 0.0)
-    local copVeh = createVehicle(pick(regionList(cfg().vehicles)), behind.x, behind.y, behind.z + 0.5, heading)
+    local copVeh = createVehicle(regionVehicle(), behind.x, behind.y, behind.z + 0.5, heading)
     if not copVeh then return commitScene(scene, false) end
     scene.vehicles[2] = copVeh
     SetVehicleEngineOn(copVeh, true, true, false)
@@ -551,7 +609,7 @@ local function spawnPatrol(playerCoords)
     local scene = newScene('patrol', pos, nil)
     scene.expiresAt = GetGameTimer() + (cfg().roamingLifetime or 180) * 1000
 
-    local veh = createVehicle(pick(regionList(cfg().vehicles)), pos.x, pos.y, pos.z + 0.5, heading)
+    local veh = createVehicle(regionVehicle(), pos.x, pos.y, pos.z + 0.5, heading)
     if not veh then return commitScene(scene, false) end
     scene.vehicles[1] = veh
     SetVehicleEngineOn(veh, true, true, false)
@@ -627,7 +685,7 @@ local function spawnPursuit(playerCoords)
     local chaserCount = math.random(1, 2)
     for i = 1, chaserCount do
         local behind = GetOffsetFromEntityInWorldCoords(suspectVeh, (i == 2) and 3.0 or 0.0, -12.0 * i, 0.0)
-        local copVeh = createVehicle(pick(regionList(cfg().vehicles)), behind.x, behind.y, behind.z + 0.5, heading)
+        local copVeh = createVehicle(regionVehicle(), behind.x, behind.y, behind.z + 0.5, heading)
         if copVeh then
             scene.vehicles[#scene.vehicles + 1] = copVeh
             SetVehicleEngineOn(copVeh, true, true, false)
@@ -1223,6 +1281,37 @@ local function advanceStop(scene)
     end
 end
 
+--- A player who has pulled over for a scripted traffic stop is not being chased.
+--- The trap car that clocked them is still carrying the TaskVehicleChase that
+--- catchPlayer gave it, and left alone it circles and PITs a car that has
+--- already stopped — in exactly the scenario the ticket system exists for.
+---
+--- `stoodDown` latches, so this re-tasks the car once rather than every second
+--- for as long as the officer is writing.
+local function standDownForTrafficStop()
+    local ok, stopping = pcall(function()
+        return exports['fenix-police']:IsPlayerAtTrafficStop()
+    end)
+    if not (ok and stopping == true) then return end
+
+    for _, scene in pairs(scenes) do
+        if scene.enforcing and not scene.stoodDown then
+            scene.stoodDown = true
+            local veh = scene.vehicles[1]
+            if veh and DoesEntityExist(veh) then
+                local driver = GetPedInVehicleSeat(veh, -1)
+                if driver and driver ~= 0 and DoesEntityExist(driver) then
+                    ClearPedTasks(driver)
+                    BringVehicleToHalt(veh, 10.0, 3, false)
+                end
+                -- Lights, no wail: it's parked at a stop now, not running one.
+                SetVehicleHasMutedSirens(veh, true)
+            end
+            dbg('enforcing scene stood down for a roadside stop')
+        end
+    end
+end
+
 --- One pass over every armed trap. Kept cheap on purpose: the player check needs
 --- no pool walk at all, and the NPC pool is fetched once per scan (not per
 --- scene) on a slower cadence than the player check.
@@ -1449,6 +1538,11 @@ CreateThread(function()
                 if scene.carjack then advanceCarjack(scene) end
                 if scene.pursuit then advancePursuit(scene) end
             end
+
+            -- An enforcing trap survives the sweep below, so it is the one scene
+            -- that can still be mid-chase when the player pulls over for a
+            -- citation. Stand it down before that sweep returns.
+            standDownForTrafficStop()
 
             -- Stay entirely out of the pursuit system's way — except for a trap
             -- that started this pursuit itself. Wiping the car mid-catch leaves a
