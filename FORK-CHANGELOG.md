@@ -36,7 +36,11 @@ carjacking provenance note below.
 
 ---
 
-## Unreleased — ambient enforcement
+## 2.0.0 — ambient enforcement — 2026-07-31
+
+First tagged release of this fork, on top of upstream 1.0.2. The major bump is
+this fork's own numbering and says nothing about upstream's — it reflects that
+ambient enforcement is a new layer rather than an increment.
 
 Builds on `UPSTATE_PATCHES.md` §11 (ambient presence) and §12 (em_toolkit
 connector). Read those first for the base design.

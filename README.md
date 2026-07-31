@@ -1,119 +1,187 @@
-# Fenix Police Response 1.0.2
+<img src="img/FenixPolice001.jpg" alt="Fenix Police Response" width="800"/>
 
-This mod enables AI police dispatch/wanted levels and replaces the base GTA V police dispatch system with something less punishing and more realistic. It is highly configurable and all configuration and code is thoroughly commented
-to facilitate end-user modification. You could configure this to be even more brutal than base-game if you wanted, or even easier. The idea was to have AI police for a small RP server just for your friends where having a bunch of player police was not possible. 
+# Fenix Police Response 2.0 — Upstate Mafia Fork
 
-<img src="img/FenixPolice001.jpg" alt="Fenix Police 001" width="800"/>
+AI police dispatch and wanted levels for FiveM, replacing the base GTA V police
+system with something less punishing and more deliberate. Every setting is
+configurable and the code is thoroughly commented to make end-user modification
+practical.
 
-**FEATURES:**
-- Config option to only enable AI police if player police are not online. You can configure the number of player police required. And set whether they have to be onDuty to count toward the total. 
-- Custom police loadouts per unit spawned, loadouts are randomized and include a spawnChance weighting to make them more or less likely. 
-- Custom police units per "zone", by default separated into "jurisdictions" (aka regions) Los Santos, Paleto Bay, Sandy Shores, or Countryside. Includes a spawnChance weighting to make each unit more or less likely. 
-  Also a minimum wanted level for them to spawn. By default I have the riot and fbi vehicles weighted much higher so once you hit those wanted levels they spawn far more often, but regular units can still respond too. 
-- Each police unit has customizable peds assigned to them, so you can change the ped models if you wish. 
-- Police helicopters will spawn at higher wanted levels. This is also configurable. By default they respond at 4 wanted stars instead of 3. 
-- Military helicopters and planes can spawn if the player is in a helicopter or a plane themselves.
-- Number of units spawned per wanted level is customizable. Separate settings for ground units, helicopters, and planes (aka air units).
-- Dead police units are removed after a certain time, allowing more to spawn. This timer is customizable. Timers for ground units, helicopters, and air units are separate.
-- Far away police units are removed after a certain time, allowing more to spawn. This timer is customizable. Timers for ground units, helicopters, and air units are separate.
-- Customizable evasion times for each wanted level. 
-- Customizable spawn distances for ground units, helicopters, and air units.
-- Separate police units for each player. This means if two players are wanted together in the same car double the amount of police will spawn. If four wanted players are in a vehicle together you get four times the police response.
-  I may consider changing this some day but I like the difficulty scaling with this. 
-- Police are spawned serverside, then their networkIDs are sent back to the client that requested police so they can be controlled and maintained. They should not migrate to other clients, and the distance culling is high so they can still be controlled from far away. This means units will be properly sycned across clients and you will see police chasing other players. 
-- Stolen police vehicles will not de-spawn if occupied by a player at the time the script tries to clean them up (due to peds being dead, peds being far away, or losing wanted stars). So they wont disappear if you manage to steal one mid chase. However, they will never despawn if this happens. I plan to add logic that removes them once the player abandons them for a certain time/distance in the future. 
-- Players with police jobs can be protected from becoming wanted, option to apply this protection only when on-duty. 
+> **This is a fork.** The original is
+> [FenixPK/fenix-police](https://github.com/FenixPK/fenix-police) by **Fenix**,
+> who wrote everything this is built on. This fork tracks upstream 1.0.2 and adds
+> an ambient enforcement layer on top. Version 2.0 is *this fork's* number and
+> has no relationship to upstream's versioning.
+>
+> Licensed **GPL-3.0**, same as upstream. `FORK-CHANGELOG.md` and
+> `UPSTATE_PATCHES.md` together are the GPL-3 §5(a) statement of changes.
 
-**REQUIREMENTS:**
+---
 
-This mod requires QBCore for: Notifications, counting players with Police jobs online, checking near vehicles (because the native function for this was giving me trouble), and checking if isDying or inLastStand and cancelling wanted levels. 
-In theory, it could be removed if you switch the near vehicle check to the native and remove notifications and last stand logic.
+## Contents
 
+1. [What this fork adds](#what-this-fork-adds)
+2. [Project status](#project-status)
+3. [Features](#features)
+4. [Requirements](#requirements)
+5. [Installation](#installation)
+6. [Exports](#exports)
+7. [Bundled — um_fenix_bridge](#bundled--um_fenix_bridge)
+8. [Optional — posted speed limits](#optional--posted-speed-limits)
+9. [Commands](#commands)
+10. [Credits](#credits)
+11. [Licence](#licence)
 
-**KNOWN ISSUES:**
-- Police vehicles stolen by players will never despawn if they are occupied by a player at the time the script would usually delete the vehicle (when losing wanted level, or if the peds for that vehicle are too far away or dead).
+---
 
+## What this fork adds
 
-# EXPORT
+Upstream spawns police in response to a wanted level. This fork adds police who
+are *already there* — and who react.
 
-Use these export calls
-```lua
-exports['fenix-police']:ApplyWantedLevel(wantedLevelHere) -- wanted level can be 1 to 5, this ADDS the wantedLevelHere value to the existing wanted level!
-exports['fenix-police']:SetWantedLevel(wantedLevelHere) -- wanted level can be 1 to 5, this SETS the players wanted level to the wantedLevelHere value if it is higher than the current wanted level. 
-```
+### Radar speed enforcement
 
-# QBCore default robbery calls
-This script introduces a dynamic wanted level system based on the location where a crime is committed. It works by triggering an event when a robbery alert is sent, allowing you to assign different wanted levels depending on the coordinates.
+Ambient officers read speed and act on it, rather than being set dressing.
 
-Thanks to Tunsworthy for this addition!
+- Aimed radar traps watch a **60 m / 70° cone**, so traffic behind the cruiser
+  drives past untouched. Patrols and foot officers use a plain **45 m radius**.
+- Player detection **walks the path travelled since the last sample** in ~8 m
+  steps rather than checking current position, so there is no speed at which you
+  outrun the check. A 300 m+ jump is treated as a teleport and skipped.
+- Posted limits come from the optional [`speedlimits`](#optional--posted-speed-limits)
+  resource, falling back to a configurable unposted limit.
+- Caught players are handed to this resource's **existing** pursuit stack via
+  `ApplyWantedLevel` rather than a second parallel one. Caught NPCs get a chase,
+  a yield, and a roadside stop, with no wanted system involved.
 
-```lua
-For this to work add the Trigger event to
-    RegisterNetEvent('police:server:policeAlert', function(text)
-    in [qb]\qb-policejob\server\main.lua
-And 
-    RegisterNetEvent('qb-storerobbery:server:callCops', function(type, safe, streetLabel, coords)
-    in [qb]\qb-storerobbery\server\main.lua
-```
-More locations can be added to config.lua
+### Ambient carjackings
 
-Example 
-RegisterNetEvent('police:server:policeAlert', function(text)
-    
-    local src = source
-    local ped = GetPlayerPed(src)
-    local coords = GetEntityCoords(ped)
-    local players = QBCore.Functions.GetQBPlayers()
-    local alertData = { title = Lang:t('info.new_call'), coords = { x = coords.x, y = coords.y, z = coords.z }, description = text }
-    for _, v in pairs(players) do
-        if v and v.PlayerData.job.type == 'leo' and v.PlayerData.job.onduty then
-            TriggerClientEvent('qb-phone:client:addPoliceAlert', v.PlayerData.source, alertData)
-            TriggerClientEvent('police:client:policeAlert', v.PlayerData.source, coords, text)
-        end
-    end
-    TriggerEvent('fenix:server:trigger', source, alertData)
-end)
+A suspect drags a driver out of a stopped car and speeds off. The getaway speed
+is chosen so a radar trap down the road will clock them — a carjacking can
+escalate into a full pursuit through the existing enforcement path, with no
+wiring between the two features.
 
-# BUNDLED — um_fenix_bridge
+### On-duty police are exempt
 
-This fork ships an optional companion resource in [`um_fenix_bridge/`](um_fenix_bridge/).
+Checked *before* a pursuit starts rather than relying on the wanted level being
+blocked mid-chase. Honours both this resource's `Config.PoliceJobsToCheck` and
+`night_ers` shift state.
 
-It generalises the section above. Rather than editing each robbery script by
-hand, it listens for the alerts they already fire — `loaf_storerobbery`,
-`loaf_bankrobbery`, `qbx_jewelery`, `ps-dispatch`, and the
-`police:server:policeAlert` catch-all — and applies a configurable wanted level
-per crime type. This script then dispatches AI units off the back of that, so
-robberies draw a response on a server with no player police on duty.
+### Placement quality
 
-It is **not loaded automatically**: FiveM does not descend into a folder that
-belongs to another resource, so it stays inert until you copy it out next to
-`fenix-police` and `ensure` it. It has no hard dependencies and calls no
-`exports` — every integration is a plain event listener, so anything you don't
-run simply never fires.
+First-fit road-node selection replaced with scored sampling that rejects
+occupied positions, low-traffic nodes (the source of "spawned in the middle of
+nowhere"), anything within 90 m of a live scene, and anything currently visible
+to the player. Static scenes are pushed onto the verge; patrols stay on the
+carriageway because they drive off immediately.
 
-See [`um_fenix_bridge/README.md`](um_fenix_bridge/README.md) for details.
+`radarFallbackToRoadNodes` now defaults **off** — it invented traps at random
+nodes and was the single largest source of "there are cops everywhere".
 
-# CREDITS
+### Officer budget
 
-This script was created by me, Fenix, so I could play FiveM QB-Core multiplayer with my wife Rainbowicus. 
+`maxScenes` alone is a poor cap: two four-officer foot posts is eight officers
+in two scenes. Adds `maxNearbyCops` (6) within 260 m, costing one integer per
+scene and no world scans.
 
-# SUPPORT
+### Hand-placed points are used verbatim
 
-If you find this project helpful, consider supporting me via PayPal
+Three separate mechanisms were relocating authored points before anything
+spawned — road snapping (up to 120 m), a shoulder offset with a 180° heading
+flip, and `GetSafeCoordForPed` (up to 25 m). Points authored through `em_toolkit`
+now carry an `exact` flag and skip all three.
 
-[![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/donate/?hosted_button_id=8UEUW7KYFSF48)
+### Notable fixes
 
-I created this because streaming dispatch.meta and dispatchtuning.ymt is not supported by FiveM so there was no way to 
-allow for AI police and also control how they spawn and behave.
+- **`Config.PoliceWantedProtection` never worked.** Two upstream defects stacked:
+  `isPlayerPoliceOfficer` was declared as a file-scope local ~2250 lines below
+  its use, so the guards resolved a nil *global*; and both guards omitted call
+  parens, so a function reference was always truthy. The first masked the second,
+  meaning wanted levels applied to everyone including on-duty officers.
+- **Traffic stops never ended.** `spawnStop` set no expiry at all, so a stop was
+  permanent — an officer stood with a clipboard until you walked away. Now has a
+  full wind-down: dwell → officer walks back → sirens off → both cars drive away.
+- **Enforcement aborted silently on every catch.** `string.format('%d', x)`
+  raises on Lua 5.3+ for fractional `x`, and speed in mph always is. The throw
+  landed *after* the cooldown was set and *before* the wanted level was applied,
+  so every catch detected the speeder, marked itself as done, and died.
 
-I will keep adding to this mod as I have time and inspiration, I've got some big ideas. 
+Full detail in [`FORK-CHANGELOG.md`](FORK-CHANGELOG.md); the earlier patch series
+this builds on is in [`UPSTATE_PATCHES.md`](UPSTATE_PATCHES.md).
 
-# INSTALL INSTRUCTIONS
+---
 
-**1)** Edit qb-smallresources\client\ignore.lua
-qb-smallresources has a client\ignore.lua that needs changes made to it to prevent it from disabling police services and allows this mod to handle them directly instead:
+## Project status
 
-a) For the following function comment out the block from SetAudioFlag down to the last RemoveVehiclesFromGeneratorsInArea
+Honest assessment, because it affects what you should expect:
+
+- The **upstream base is stable** and has been played extensively.
+- The ambient layer's core — placement, radar detection, player pursuit — has
+  been run and tuned.
+- The **stop wind-down, NPC yield sequence, all-officer enforcement and ambient
+  carjackings are statically verified but were never observed running.** Timings
+  are first guesses: the carjack approach window (25 s), NPC yield delay (15 s)
+  and stop dwell (60 s) will all want tuning against real play.
+
+If ambient feels too sparse, loosen in this order: `radarFallbackToRoadNodes` →
+`minSceneSpacing` → `maxNearbyCops`.
+
+Known limits: NPC detection is position-only rather than path-swept (academic
+below ~80 mph); "any cop" means any officer *this* system spawned, not police
+peds from other resources.
+
+---
+
+## Features
+
+Inherited from upstream, all configurable:
+
+- Optionally enable AI police **only when player police are offline**, with a
+  configurable threshold and an on-duty requirement.
+- **Custom loadouts per unit**, randomised with spawn-chance weighting.
+- **Custom units per jurisdiction** — Los Santos, Paleto Bay, Sandy Shores,
+  Countryside — each with spawn weighting and a minimum wanted level. Riot and
+  FBI units are weighted to appear at high wanted levels while regular units can
+  still respond.
+- Customisable **ped models** per unit.
+- **Helicopters** at higher wanted levels (4 stars by default rather than 3), and
+  military helicopters and planes if the player is airborne.
+- Separate unit counts, despawn timers and spawn distances for **ground, air and
+  helicopter** units.
+- Customisable **evasion times** per wanted level.
+- **Per-player police.** Two wanted players in one car draws double the response;
+  four draws quadruple.
+- Units are **spawned server-side** and their network IDs handed to the
+  requesting client, so they sync properly across clients and you will see police
+  chasing other players.
+- **Stolen police vehicles** won't despawn while a player occupies them, so one
+  taken mid-chase stays yours.
+- **Player police protection** — officers can be exempted from wanted levels,
+  optionally only while on duty. *(Fixed in this fork; see above.)*
+
+**Known issue (upstream):** a police vehicle stolen by a player never despawns if
+occupied at the moment the script would normally remove it.
+
+---
+
+## Requirements
+
+**QBCore** (or QBX), used for notifications, counting online police, nearby
+vehicle checks, and dying/last-stand detection. In principle it could be removed
+by swapping the vehicle check to the native and dropping notifications and
+last-stand logic.
+
+---
+
+## Installation
+
+### 1. Edit `qb-smallresources/client/ignore.lua`
+
+`qb-smallresources` disables the police services this mod needs to control
+directly.
+
+**a)** Comment out the block from `SetAudioFlag` down to the last
+`RemoveVehiclesFromGeneratorsInArea`:
 
 ```lua
 CreateThread(function() -- all these should only need to be called once
@@ -138,9 +206,7 @@ CreateThread(function() -- all these should only need to be called once
 end)
 ```
 
-
-
-b) comment out this entire function, it will be handled by this mod instead
+**b)** Comment out this entire function — this mod handles it instead:
 
 ```lua
 -- CreateThread(function()
@@ -154,15 +220,10 @@ b) comment out this entire function, it will be handled by this mod instead
 -- end)
 ```
 
+### 2. Edit `qb-smallresources/config.lua`
 
-
-
-**2)** Edit qb-smallresources\config.lua
-
-a) By default it disables the hud component for wanted stars in this block
-
-hudComponents = {} will contain a 1 by default, this disables the wanted stars. You can check the referenced doc to see what each integer value corresponds to.
-Mine is below, note that it does not contain a 1. 
+**a)** `hudComponents` contains `1` by default, which hides the wanted stars.
+Remove it — note the example below has no `1`:
 
 ```lua
 Config.Disable = {
@@ -177,7 +238,7 @@ Config.Disable = {
 }
 ```
 
-b) Find the BlacklistedPeds and set them to false so they can spawn
+**b)** Set the blacklisted police peds to `false` so they can spawn:
 
 ```lua
 Config.BlacklistedPeds = {
@@ -190,20 +251,174 @@ Config.BlacklistedPeds = {
 }
 ```
 
+### 3. Review `config.lua`
 
+Read the comments and change what you want. Ambient settings live under
+`Config.Ambient`; the new keys are documented in
+[`FORK-CHANGELOG.md`](FORK-CHANGELOG.md#config-reference--new-keys).
 
-**3)** Review config.lua and read all the comments about all the settings, change what you want.
+### 4. Add to `server.cfg`
 
+```cfg
+ensure fenix-police
+```
 
+---
 
-**4)** Make sure you add "ensure fenix-police" to your server.cfg. 
+## Exports
 
+```lua
+-- ADDS the value to the existing wanted level
+exports['fenix-police']:ApplyWantedLevel(level)   -- 1 to 5
 
+-- SETS the wanted level, if the new value is higher than the current one
+exports['fenix-police']:SetWantedLevel(level)     -- 1 to 5
 
-# More Images
+-- Added by this fork: is this player an on-duty police officer?
+exports['fenix-police']:IsPlayerPoliceOfficer()
+```
 
-<img src="img/FenixPolice002.jpg" alt="Fenix Police 001" width="800"/>
+### Dynamic wanted levels by location
 
-<img src="img/FenixPolice003.jpg" alt="Fenix Police 001" width="800"/>
+Upstream supports assigning different wanted levels based on *where* a crime
+happens, by triggering an event from your robbery scripts. Thanks to
+**Tunsworthy** for this addition.
 
-<img src="img/FenixPolice004.jpg" alt="Fenix Police 001" width="800"/>
+Add the trigger to `police:server:policeAlert` in
+`[qb]/qb-policejob/server/main.lua`, and to
+`qb-storerobbery:server:callCops` in `[qb]/qb-storerobbery/server/main.lua`.
+Locations are defined in `config.lua`.
+
+```lua
+RegisterNetEvent('police:server:policeAlert', function(text)
+    local src = source
+    local ped = GetPlayerPed(src)
+    local coords = GetEntityCoords(ped)
+    local players = QBCore.Functions.GetQBPlayers()
+    local alertData = { title = Lang:t('info.new_call'), coords = { x = coords.x, y = coords.y, z = coords.z }, description = text }
+    for _, v in pairs(players) do
+        if v and v.PlayerData.job.type == 'leo' and v.PlayerData.job.onduty then
+            TriggerClientEvent('qb-phone:client:addPoliceAlert', v.PlayerData.source, alertData)
+            TriggerClientEvent('police:client:policeAlert', v.PlayerData.source, coords, text)
+        end
+    end
+    TriggerEvent('fenix:server:trigger', source, alertData)
+end)
+```
+
+If you would rather not hand-edit those scripts, the bundled bridge below does
+the same job by listening instead.
+
+---
+
+## Bundled — um_fenix_bridge
+
+This fork ships an optional companion resource in
+[`um_fenix_bridge/`](um_fenix_bridge/).
+
+Most robbery scripts alert *player* police and stop there, so on a server with
+nobody on duty a bank job draws no response. The bridge listens for alerts those
+scripts already fire — `loaf_storerobbery`, `loaf_bankrobbery`, `qbx_jewelery`,
+`ps-dispatch`, and the `police:server:policeAlert` catch-all — and applies a
+configurable wanted level per crime type. This resource then dispatches units off
+the back of that, so neither script needs to know about the other, and nothing
+needs patching.
+
+**It is not loaded automatically.** FiveM stops descending once a directory is
+identified as a resource, so a nested resource is never discovered. The folder is
+inert until you copy it out next to `fenix-police` and `ensure` it.
+
+It has no hard dependencies and calls no `exports` on other resources — every
+integration is a plain event listener, so anything you don't run simply never
+fires. See [`um_fenix_bridge/README.md`](um_fenix_bridge/README.md).
+
+---
+
+## Optional — posted speed limits
+
+Radar enforcement works out of the box using a flat unposted limit
+(`unpostedLimitMph`, 80). To enforce **real posted limits per street**, add two
+exports to the [`speedlimits`](https://github.com/Sinatra-/speedlimits) resource
+so the limits stay defined there rather than being copied and drifting:
+
+```lua
+--- @param street string street name, as GetStreetNameFromHashKey returns it
+--- @return number|nil mph
+local function limitForStreet(street)
+    if type(street) ~= 'string' then return nil end
+    return Config.SpeedLimits[street]
+end
+
+exports('getSpeedLimitForStreet', limitForStreet)
+
+--- @return number|nil mph, string|nil street
+exports('getSpeedLimitAtCoords', function(x, y, z)
+    local street = GetStreetNameFromHashKey(GetStreetNameAtCoord(x + 0.0, y + 0.0, z + 0.0))
+    return limitForStreet(street), street
+end)
+```
+
+The call is guarded by a resource-state check and a `pcall`, so if `speedlimits`
+isn't running — or these exports aren't added — enforcement falls back to the
+unposted limit rather than erroring.
+
+Precedence when judging a driver:
+
+1. A trap's authored "enforced speed" from `em_toolkit`
+2. Posted limit + `toleranceMph` (15)
+3. `unpostedLimitMph` (80) where the street has no sign defined
+
+---
+
+## Commands
+
+| Command | Purpose |
+|---|---|
+| `/ambientpolice [on\|off]` | Toggle ambient policing, and list live scenes with distances, arm state, and the speed limit applying where you stand. **The bare form toggles** — pass `on` or `off` explicitly to be sure. |
+| `/ambientpolicereload` | Re-read `em_toolkit` points and clear existing scenes |
+| `/radartrace` | Per-second trace of the enforcement decision: tick state, speed vs allowed, and per-scene distance / reach / visibility |
+
+---
+
+## Credits
+
+- **[Fenix](https://github.com/FenixPK)** — created the original resource, so he
+  could play FiveM QB-Core with his wife Rainbowicus. Everything here is built on
+  that work.
+- **Tunsworthy** — the location-based dynamic wanted level system.
+- **Sinatra** — the `speedlimits` resource (MIT, © 2022), which the optional
+  posted-limit integration reads from.
+- **Upstate Mafia** — this fork's ambient enforcement layer and `um_fenix_bridge`.
+
+Fenix created this because streaming `dispatch.meta` and `dispatchtuning.ymt`
+isn't supported by FiveM, leaving no way to have AI police while controlling how
+they spawn and behave.
+
+### Support the original author
+
+If you find this useful, consider supporting Fenix:
+
+[![Donate](https://www.paypalobjects.com/en_US/i/btn/btn_donateCC_LG.gif)](https://www.paypal.com/donate/?hosted_button_id=8UEUW7KYFSF48)
+
+---
+
+## Licence
+
+**GPL-3.0**, inherited from [FenixPK/fenix-police](https://github.com/FenixPK/fenix-police).
+See [`LICENSE`](LICENSE).
+
+Changes made downstream of upstream are recorded in
+[`FORK-CHANGELOG.md`](FORK-CHANGELOG.md) and [`UPSTATE_PATCHES.md`](UPSTATE_PATCHES.md),
+which together serve as the GPL-3 §5(a) statement of changes.
+
+The `um_fenix_bridge` companion is licensed GPL-3.0 to match.
+
+---
+
+## More images
+
+<img src="img/FenixPolice002.jpg" alt="Fenix Police Response" width="800"/>
+
+<img src="img/FenixPolice003.jpg" alt="Fenix Police Response" width="800"/>
+
+<img src="img/FenixPolice004.jpg" alt="Fenix Police Response" width="800"/>
