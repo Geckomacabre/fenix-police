@@ -6,11 +6,13 @@ description "Police"
 version "1.0"
 
 shared_scripts {
-    'config.lua'
+    'config.lua',
+    'data/ambient_points.lua'
 }
 
 client_scripts {
-    'client/client.lua'
+    'client/client.lua',
+    'client/ambient.lua'
 }
 
 server_scripts {

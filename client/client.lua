@@ -1,6 +1,3 @@
-
-
-
 --TODOs:
 --
 -- Allow adding attachments to Config.loadouts so they have flashlights for eg.
@@ -47,7 +44,10 @@
 -- Get the QBCore object so we can do notifications, check for nearest vehicle using their improved call, and handle isDying and isLastStand situations for the player. 
 QBCore = exports['qb-core']:GetCoreObject()
 
-
+-- [Upstate Mafia] Suppress policet (police transporter) globally on resource start
+Citizen.CreateThread(function()
+    SetVehicleModelIsSuppressed(GetHashKey('policet'), true)
+end)
 
 
 -- TABLES --
@@ -68,16 +68,41 @@ local stuckAttempts = {}  -- Table to keep track of the number of attempts to un
 local stolenVehicles = {} -- Table to store vehicles by netID that the player stole and were not cleaned up, to delete later when the player has abandoned them
 
 local isSpawning = false -- Variable to prevent spawning more units when spawning is already in progress.
+local pendingGroundSpawns = 0 -- Tracks concurrent ground-unit spawn requests in flight.
+local pendingHeliSpawns   = 0 -- Tracks concurrent heli spawn requests in flight.
+local pendingAirSpawns    = 0 -- Tracks concurrent air spawn requests in flight.
+local MAX_CONCURRENT_SPAWNS = 5 -- Allow up to 5 requests to the server at once per unit type.
+
+-- spawnGate: when false, any in-flight spawnPoliceUnitClient / heli / air events that
+-- arrive after handleEndWantedDelete() has run are silently discarded.  The gate is
+-- opened again on the first cycle where the player is wanted again.
+local spawnGate = true
 
 local disableAIPolice = nil -- Toggle to turn AI police response on and off if players are online or not if that config option is used. 
 
+local playerHasShot = false
+
+-- Arrest system state
+local isSurrendering = false
+local isBeingArrested = false
 
 
+-- [Upstate Mafia patch] Forward declaration. isPlayerPoliceOfficer is defined
+-- ~2250 lines below as a file-scope local, so every reference above its
+-- definition resolved to a nil GLOBAL instead. That silently disabled
+-- Config.PoliceWantedProtection in both wanted-level entry points: the guard
+-- read `and isPlayerPoliceOfficer` (nil -> falsy) and always fell through to
+-- applying the level. Declaring it here puts it in scope for them.
+--
+-- Note both call sites also lacked `()`. A function reference is always truthy,
+-- so fixing only the scoping would have flipped the bug the other way and
+-- blocked wanted levels for everyone. Both fixes have to land together.
+local isPlayerPoliceOfficer
 
 -- EXPORTS --
 function ApplyWantedLevel(level)
     Citizen.CreateThread(function()
-        if Config.PoliceWantedProtection and isPlayerPoliceOfficer then
+        if Config.PoliceWantedProtection and isPlayerPoliceOfficer() then
             -- If wanted protection is enabled and the player is a cop we skip doing anything
         else
             -- Apply wanted
@@ -105,9 +130,14 @@ exports('ApplyWantedLevel', ApplyWantedLevel)
 -- For eg. a robery script, chop-shop script, car theft mission etc. might call this to set a wanted level.
 --  exports['fenix-police']:ApplyWantedLevel(wantedLevelHere)
 
+RegisterNetEvent('fenix-police:client:ApplyWantedLevel', function(level)
+    exports['fenix-police']:ApplyWantedLevel(level)
+end)
+
+
 function SetWantedLevel(level)
     Citizen.CreateThread(function()
-        if Config.PoliceWantedProtection and isPlayerPoliceOfficer then
+        if Config.PoliceWantedProtection and isPlayerPoliceOfficer() then
             -- If wanted protection is enabled and the player is a cop we skip doing anything
         else
             -- Apply wanted
@@ -131,6 +161,10 @@ function SetWantedLevel(level)
     end)
 end
 exports('SetWantedLevel', SetWantedLevel)
+
+RegisterNetEvent('fenix-police:client:SetWantedLevel', function(level)
+    exports['fenix-police']:SetWantedLevel(level)
+end)
 -- Use this in other scripts by calling the function like below. 
 -- This allows you to set a wanted level from a script action that the normal GTA V code would not consider.
 -- For eg. a robery script, chop-shop script, car theft mission etc. might call this to set a wanted level.
@@ -167,36 +201,53 @@ end
 
 
 
--- Function to get a safe spawn point on a road near the player
-local function getSafeSpawnPoint(playerCoords, minDistance, maxDistance)
-    local found = false
-    local roadCoords, roadHeading
+-- Function to get a safe spawn point on a road near the player.
+-- Uses a true radial distance instead of independent X/Y offsets, so a
+-- "60m" spawn is actually about 60m away instead of 85m+ diagonally.
+local function getSafeSpawnPoint(playerCoords, minDistance, maxDistance, playerForward)
+    for _ = 1, 30 do
+        local angle
+        if playerForward then
+            -- Prefer behind/sides so units do not pop into view directly ahead.
+            local rearArcOffset = math.random(110, 250)
+            local playerHeading = GetHeadingFromVector_2d(playerForward.x, playerForward.y)
+            angle = math.rad(playerHeading + rearArcOffset)
+        else
+            angle = math.rad(math.random(0, 359))
+        end
 
-    while not found do
-        local offsetX = math.random(minDistance, maxDistance)
-        local offsetY = math.random(minDistance, maxDistance)
-        if math.random(0, 1) == 0 then offsetX = -offsetX end
-        if math.random(0, 1) == 0 then offsetY = -offsetY end
+        local dist = math.random(minDistance, maxDistance)
+        local spawnCoords = vector3(
+            playerCoords.x + math.sin(angle) * dist,
+            playerCoords.y + math.cos(angle) * dist,
+            playerCoords.z
+        )
 
-        local spawnCoords = vector3(playerCoords.x + offsetX, playerCoords.y + offsetY, playerCoords.z)
-        -- Try major roads first nodeType = 0
-        local roadFound, tempRoadCoords, tempRoadHeading = GetClosestVehicleNodeWithHeading(spawnCoords.x, spawnCoords.y, spawnCoords.z, 0, 3.0, 0)
-        
+        local roadFound, roadCoords, roadHeading = GetClosestVehicleNodeWithHeading(spawnCoords.x, spawnCoords.y, spawnCoords.z, 0, 3.0, 0)
         if not roadFound then
-            -- Try any path next nodeType = 1, this approach should prevent cops spawning in fields/racetracks etc. when main roads are available. 
-            -- But still allow for dirt roads, fields, racetracks, parks etc. as a fallback option. 
-            local roadFound, tempRoadCoords, tempRoadHeading = GetClosestVehicleNodeWithHeading(spawnCoords.x, spawnCoords.y, spawnCoords.z, 1, 3.0, 0)
+            -- Try any drivable path as fallback.
+            roadFound, roadCoords, roadHeading = GetClosestVehicleNodeWithHeading(spawnCoords.x, spawnCoords.y, spawnCoords.z, 1, 3.0, 0)
         end
 
         if roadFound then
-            roadCoords = tempRoadCoords
-            roadHeading = tempRoadHeading
-            found = true
-        end
-    end
+            if playerForward then
+                local forwardX = playerForward.x
+                local forwardY = playerForward.y
+                local toSpawnX = roadCoords.x - playerCoords.x
+                local toSpawnY = roadCoords.y - playerCoords.y
+                local length = math.sqrt((toSpawnX * toSpawnX) + (toSpawnY * toSpawnY))
 
-    if found then
-        return roadCoords, roadHeading
+                -- Reject anything that snapped into the player's front half.
+                if length > 0.0 then
+                    local dot = ((toSpawnX / length) * forwardX) + ((toSpawnY / length) * forwardY)
+                    if dot < 0.0 then
+                        return roadCoords, roadHeading
+                    end
+                end
+            else
+                return roadCoords, roadHeading
+            end
+        end
     end
 
     return nil
@@ -383,12 +434,12 @@ function GetVehicleUnstuck(vehicle, isLeft, vehNetID)
         else 
             maxUnstuckAttempts = Config.maxCloseUnstuckAttempts 
 
-            -- If exactly == max we abandon vehicle once, then set 999 so it never tries again and saves CPU cycles. 
+            -- If exactly == max, stop trying to unstick it. Do not make cops abandon
+            -- the vehicle; ground units should behave like vanilla police cars, not
+            -- spawn/convert into foot patrols.
             if stuckAttempts[vehNetID] == maxUnstuckAttempts then
-                -- If we the vehicle is close to the player just get out.
-                GetPedsOutOfVehicle(vehicle)
-                if Config.isDebug then print('Abandoned nearby stuck vehicle') end
-                stuckAttempts[vehNetID] = 999 -- Set special value to prevent checking further, vehicle has been abandoned! 
+                if Config.isDebug then print('Nearby police vehicle stuck too long; stopping unstick attempts') end
+                stuckAttempts[vehNetID] = 999
 
                 return
             elseif stuckAttempts[vehNetID] < maxUnstuckAttempts then
@@ -480,9 +531,23 @@ end
 -- This handles the response from the server after a vehicle and officers are spawned, so they can be tasked and otherwise handled by the client. 
 RegisterNetEvent('spawnPoliceHeliNetResponse')
 AddEventHandler('spawnPoliceHeliNetResponse', function(vehNetID, officers)
+    -- Discard in-flight heli spawns that arrived after handleEndWantedDelete() closed the gate.
+    if not spawnGate then
+        if pendingHeliSpawns > 0 then pendingHeliSpawns = pendingHeliSpawns - 1 end
+        -- Server already created this heli — ask it to clean up.
+        if vehNetID then
+            if officers then
+                for _, pedNetID in ipairs(officers) do
+                    TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                end
+            end
+            TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
+        end
+        return
+    end
 
     local playerPed = PlayerPedId()
-    local playerCoords = GetEntityCoords(playerPed)   
+    local playerCoords = GetEntityCoords(playerPed)
 
 
     if vehNetID and officers then
@@ -522,42 +587,26 @@ AddEventHandler('spawnPoliceHeliNetResponse', function(vehNetID, officers)
             SetHeliBladesFullSpeed(vehicle)
             SetVehicleEngineOn(vehicle, true, true, false)
 
-            NetworkSetNetworkIdDynamic(pedNetID, false) -- Allow the networked ped to be controlled dynamically.
-            SetNetworkIdCanMigrate(pedNetID, false) -- Allow the network ID to be migrated to other clients.
+            NetworkSetNetworkIdDynamic(pedNetID, false)
+            SetNetworkIdCanMigrate(pedNetID, false)
             SetNetworkIdExistsOnAllMachines(pedNetID, true)
-            SetEntityAsMissionEntity(officer, true, true) -- Prevent despawning by game garbage collection
+            SetEntityAsMissionEntity(officer, true, true)
 
-            SetPedAsCop(officer, true)
-
-            if i <= 2 then
-                -- Process pilot and co-pilot. 
-                SetPedCombatAttributes(officer, 52, enabled) -- Can vehicle attack? only works on driver
-                SetPedCombatAttributes(officer, 53, enabled) -- Can use mounted vehicle weapons? only works on driver
-                SetPedCombatAttributes(officer, 85, enabled) -- Prefer air targets to targets on ground       
-                SetPedAccuracy(officer, math.random(20, 30))     
-            else
-                -- Process officers
-                SetPedCombatAttributes(officer, 2, true) -- Allow drive-by shooting.
-                SetPedAccuracy(officer, math.random(10, 20))
-                SetPedFiringPattern(officer, 0x5D60E4E0) -- Set firing pattern to single shot. 
-            end
-
-            -- Set the pilot to pursue the player
+            -- [Upstate Mafia] All combat attributes, weapons, and initial tasks are set
+            -- SERVER-SIDE. Client only tracks for ongoing behavior updates.
             if i == 1 then
-                TaskVehicleDriveToCoord(officer, unit, playerCoords.x, playerCoords.y, playerCoords.z, 60.0, 1, GetEntityModel(unit), 16777248, 70.0, true)
-                SetDriverAbility(officer, 1.0) -- Set driver ability to max.
-                spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'DriveToCoord'
+                spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'HeliChase'
             else
-                spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'None'
+                spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
             end
 
-            -- Adds the spawned ped "officer" to the .officers table by key pedNetID so it can be retrieved by key pedNetID later. 
+            -- Adds the spawned ped "officer" to the .officers table by key pedNetID so it can be retrieved by key pedNetID later.
             spawnedHeliUnits[vehNetID].officers[pedNetID] = officer
         end
 
     end
 
-    isSpawning = false
+    if pendingHeliSpawns > 0 then pendingHeliSpawns = pendingHeliSpawns - 1 end
 
 end)
 
@@ -585,9 +634,22 @@ end
 
 
 
--- This handles the response from the server after a vehicle and officers are spawned, so they can be tasked and otherwise handled by the client. 
+-- This handles the response from the server after a vehicle and officers are spawned, so they can be tasked and otherwise handled by the client.
 RegisterNetEvent('spawnPoliceAirNetResponse')
 AddEventHandler('spawnPoliceAirNetResponse', function(vehNetID, officers)
+    -- Discard in-flight air spawns that arrived after handleEndWantedDelete() closed the gate.
+    if not spawnGate then
+        if pendingAirSpawns > 0 then pendingAirSpawns = pendingAirSpawns - 1 end
+        if vehNetID then
+            if officers then
+                for _, pedNetID in ipairs(officers) do
+                    TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                end
+            end
+            TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
+        end
+        return
+    end
 
     local playerPed = PlayerPedId()
     local playerCoords = GetEntityCoords(playerPed)   
@@ -630,45 +692,27 @@ AddEventHandler('spawnPoliceAirNetResponse', function(vehNetID, officers)
             --if Config.isDebug then print('CLIENT NetToPed for netID ' ..pedNetID .. ' returned entityID ' .. officer)  end
             --if Config.isDebug then print('CLIENT PedToNet for entityID ' ..officer.. ' returned NetID = ' .. PedToNet(officer))  end
 
-            NetworkSetNetworkIdDynamic(pedNetID, false) -- Allow the networked ped to be controlled dynamically.
-            SetNetworkIdCanMigrate(pedNetID, false) -- Allow the network ID to be migrated to other clients.
+            NetworkSetNetworkIdDynamic(pedNetID, false)
+            SetNetworkIdCanMigrate(pedNetID, false)
             SetNetworkIdExistsOnAllMachines(pedNetID, true)
-            SetEntityAsMissionEntity(officer, true, true) -- Prevent despawning by game garbage collection
-
-            SetPedAsCop(officer, true)
-
-            SetPedCombatAttributes(officer, 52, enabled) -- Can vehicle attack? only works on driver
-            SetPedCombatAttributes(officer, 53, enabled) -- Can use mounted vehicle weapons? only works on driver
-            SetPedCombatAttributes(officer, 85, enabled) -- Prefer air targets to targets on ground
-            SetPedCombatAttributes(officer, 86, enabled) -- Allow dogfighting         
-            SetPedAccuracy(officer, math.random(20, 30))
-
-             -- Give the plane weapons
-            GiveWeaponToPed(officer, `VEHICLE_WEAPON_SPACE_ROCKET`, 50, false, true)
-
-            -- Set the plane to fire weapons at the player vehicle
-            SetCurrentPedVehicleWeapon(officer, `VEHICLE_WEAPON_SPACE_ROCKET`)
+            SetEntityAsMissionEntity(officer, true, true)
 
             ControlLandingGear(vehicle, 3) -- Retract the gear
-            
 
-            -- Set the pilot to pursue the player
+            -- [Upstate Mafia] All combat attributes, weapons, and tasks set SERVER-SIDE.
             if i == 1 then
-                --TaskVehicleDriveToCoord(officer, unit, playerCoords.x, playerCoords.y, playerCoords.z, 100.0, 1, GetEntityModel(unit), 16777248, 70.0, true)
-                TaskPlaneChase(officer, playerPed, 20, 20, 150)
-                SetDriverAbility(officer, 1.0) -- Set driver ability to max.
-                spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'DriveToCoord'
+                spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'PlaneChase'
             else
-                spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'None'
+                spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
             end
 
-            -- Adds the spawned ped "officer" to the .officers table by key pedNetID so it can be retrieved by key pedNetID later. 
+            -- Adds the spawned ped "officer" to the .officers table by key pedNetID so it can be retrieved by key pedNetID later.
             spawnedAirUnits[vehNetID].officers[pedNetID] = officer
         end
 
     end
 
-    isSpawning = false
+    if pendingAirSpawns > 0 then pendingAirSpawns = pendingAirSpawns - 1 end
 
 end)
 
@@ -679,26 +723,28 @@ end)
 
 -- This function will tell the server to spawn a police unit, and the server will pass back the Network ID of the vehicle + officers spawned so the client can handle them. 
 local function spawnPoliceUnitNet(wantedLevel)
-    --if Config.isDebug then print('Spawning Net Unit') end
+    print(('[FENIX-SPAWN] spawnPoliceUnitNet called, wantedLevel=%d'):format(wantedLevel))
     local playerPed = PlayerPedId()
     local playerCoords = GetEntityCoords(playerPed)
     local zoneCode = getPlayerZoneCode() -- Zone for determining spawnlists
     local zone = Config.zones[zoneCode]
     local regionCode = nil
-    if zone then 
+    if zone then
         regionCode = getZoneKey(zone.location)
     else
-        if Config.isDebug then print('ERROR: region enum not found for zoneCode = '.. zoneCode) end
+        print(('[FENIX-SPAWN] WARNING: no zone for code=%s, defaulting losSantos'):format(tostring(zoneCode)))
         regionCode = 'losSantos'
     end
-    
+    print(('[FENIX-SPAWN] zone=%s region=%s'):format(tostring(zoneCode), tostring(regionCode)))
 
     -- Get a safe spawn point
-    local spawnPoint, spawnHeading = getSafeSpawnPoint(playerCoords, Config.minPoliceSpawnDistance, Config.maxPoliceSpawnDistance) 
+    local spawnPoint, spawnHeading = getSafeSpawnPoint(playerCoords, Config.minPoliceSpawnDistance, Config.maxPoliceSpawnDistance, GetEntityForwardVector(playerPed))
     if not spawnPoint then
-        if Config.isDebug then print('No safe spawn point found') end
+        print('[FENIX-SPAWN] ERROR: no safe spawn point found!')
+        if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
         return
     end
+    print(('[FENIX-SPAWN] sending server event, spawnPoint=%.1f,%.1f,%.1f'):format(spawnPoint.x, spawnPoint.y, spawnPoint.z))
 
     TriggerServerEvent('spawnPoliceUnitNet', wantedLevel, playerCoords, regionCode, spawnPoint, spawnHeading)
 
@@ -707,12 +753,328 @@ end
 
 
 
+local function requestModelLoaded(modelHash)
+    RequestModel(modelHash)
+    local waitCount = 0
+    while not HasModelLoaded(modelHash) and waitCount < 100 do
+        Wait(10)
+        waitCount = waitCount + 1
+    end
+    return HasModelLoaded(modelHash)
+end
+
+local function pickLoadoutWeapon(items)
+    local totalWeight = 0
+    for _, item in ipairs(items) do totalWeight = totalWeight + item.weight end
+    if totalWeight <= 0 then return nil end
+
+    local roll = math.random() * totalWeight
+    local currentWeight = 0
+    for _, item in ipairs(items) do
+        currentWeight = currentWeight + item.weight
+        if roll <= currentWeight then return item.name end
+    end
+end
+
+local function giveClientPedLoadout(ped, loadout)
+    if not DoesEntityExist(ped) or not loadout then return end
+
+    local primaryWeapon = pickLoadoutWeapon(loadout.primaryWeapons)
+    if primaryWeapon then
+        GiveWeaponToPed(ped, GetHashKey(primaryWeapon), 999, false, true)
+        SetCurrentPedWeapon(ped, GetHashKey(primaryWeapon), true)
+    end
+
+    if loadout.secondaryWeapons and #loadout.secondaryWeapons > 0 and math.random() < loadout.secondaryChance then
+        local secondaryWeapon = pickLoadoutWeapon(loadout.secondaryWeapons)
+        if secondaryWeapon then
+            GiveWeaponToPed(ped, GetHashKey(secondaryWeapon), 999, false, false)
+        end
+    end
+
+    if math.random() < loadout.armorChance then
+        SetPedArmour(ped, loadout.armorValue)
+    end
+end
+
+-- ============================================================================
+-- OFFICER COMBAT PROFILE
+-- Scales accuracy, rate of fire and willingness to open fire with the wanted
+-- level so low-level chases stay pursuits instead of instant firefights.
+-- See Config.Combat.
+-- ============================================================================
+
+-- Timestamp (GetGameTimer) until which every officer is treated as fully
+-- hostile because the player shot or damaged one of them.
+local provokedUntil = 0
+
+-- Cached hash of the runtime-created pursuit-only relationship group.
+local passiveGroupHash = nil
+
+local function combatEnabled()
+    return Config.Combat ~= nil and Config.Combat.enabled ~= false
+end
+
+local function isProvoked()
+    return provokedUntil > 0 and GetGameTimer() < provokedUntil
+end
+
+local function provokePolice()
+    local duration = Config.Combat and Config.Combat.provokedDuration or 30000
+    if duration <= 0 then return end
+    provokedUntil = GetGameTimer() + duration
+end
+
+-- Reads a per-wanted-level value out of a Config.Combat table.
+local function levelValue(tbl, wantedLevel, default)
+    if type(tbl) ~= 'table' then return default end
+    local value = tbl[wantedLevel]
+    if value == nil then return default end
+    return value
+end
+
+-- Officers in pursuit-only mode need a relationship group that will not make
+-- them start a fight on their own. COP is not safe for this: the game rewires
+-- COP/PLAYER dynamically off the wanted level. A group we own is deterministic.
+local function ensurePassiveGroup()
+    if passiveGroupHash then return passiveGroupHash end
+    local groupName = Config.Combat and Config.Combat.relationshipPassive or 'FENIX_PURSUIT'
+    AddRelationshipGroup(groupName)
+    -- The group hash is the joaat of its name, so GetHashKey is equivalent to the
+    -- out-param AddRelationshipGroup fills and avoids depending on its return shape.
+    passiveGroupHash = GetHashKey(groupName)
+    -- 1 = Respect. Officers pursue but will not open fire unprovoked.
+    SetRelationshipBetweenGroups(1, passiveGroupHash, GetHashKey('PLAYER'))
+    SetRelationshipBetweenGroups(1, GetHashKey('PLAYER'), passiveGroupHash)
+    return passiveGroupHash
+end
+
+-- Rolls whether this officer is one of the ones willing to shoot at this wanted
+-- level. Rolled once per officer and stored, so units don't flip every cycle.
+local function rollEngage(wantedLevel)
+    if not combatEnabled() then return true end
+    return math.random() < levelValue(Config.Combat.engageChance, wantedLevel, 1.0)
+end
+
+-- Applies the wanted-level-scaled combat profile to one officer.
+-- `engages` is that officer's stored open-fire roll. `role` is 'air' for
+-- helicopter and aircraft crews, which use their own firing pattern.
+-- Returns true if the officer should be given a combat task this cycle.
+local function applyOfficerCombatProfile(officer, wantedLevel, engages, role)
+    if not DoesEntityExist(officer) or officer == 0 then return false end
+
+    if not combatEnabled() then
+        -- Legacy always-hostile behaviour.
+        SetPedAccuracy(officer, math.random(25, 50))
+        SetPedRelationshipGroupHash(officer, GetHashKey('HATES_PLAYER'))
+        SetPedFiringPattern(officer, GetHashKey('FIRING_PATTERN_FULL_AUTO'))
+        SetPedCombatAttributes(officer, 2, true)
+        SetPedCombatAttributes(officer, 46, true)
+        return true
+    end
+
+    local cfg = Config.Combat
+    local provoked = isProvoked()
+    local hostile = provoked or engages == true or wantedLevel >= (cfg.hostileFromLevel or 4)
+
+    local accuracy = levelValue(cfg.accuracy, wantedLevel, nil)
+    if accuracy then
+        SetPedAccuracy(officer, math.random(accuracy[1], accuracy[2]))
+    end
+
+    SetPedShootRate(officer, levelValue(cfg.shootRate, wantedLevel, 100))
+    SetPedCombatAbility(officer, levelValue(cfg.combatAbility, wantedLevel, 1))
+    SetPedCombatRange(officer, levelValue(cfg.combatRange, wantedLevel, 1))
+
+    -- Full auto only once things are serious. Burst fire keeps early chases
+    -- survivable. Air crews get the base game's mounted-weapon pattern instead.
+    local pattern
+    if role == 'air' then
+        pattern = cfg.firingPatternHeli or 'FIRING_PATTERN_BURST_FIRE_HELI'
+    elseif provoked or wantedLevel >= (cfg.fullAutoFromLevel or 5) then
+        pattern = cfg.firingPatternAuto or 'FIRING_PATTERN_FULL_AUTO'
+    else
+        pattern = cfg.firingPatternBurst or 'FIRING_PATTERN_BURST_FIRE'
+    end
+    SetPedFiringPattern(officer, GetHashKey(pattern))
+
+    -- 24 off: the base game clears this attribute on every ped it gives an
+    -- explicit SetPedShootRate to, so it doesn't fight the rate we just set.
+    SetPedCombatAttributes(officer, 24, false)
+
+    -- 2 = CanDoDrivebys. Held back until the shootout tiers.
+    SetPedCombatAttributes(officer, 2, provoked or wantedLevel >= (cfg.drivebyFromLevel or 4))
+    -- 46 = AlwaysFight. Off below the hostile threshold so officers only return
+    -- fire when engaged instead of opening up the moment they see the player.
+    SetPedCombatAttributes(officer, 46, hostile)
+
+    if hostile then
+        SetPedRelationshipGroupHash(officer, GetHashKey(cfg.relationshipHostile or 'HATES_PLAYER'))
+    else
+        SetPedRelationshipGroupHash(officer, ensurePassiveGroup())
+    end
+
+    return hostile
+end
+
+-- Escalates every unit if the player has damaged this officer since last check.
+local function checkOfficerProvocation(officer, playerPed)
+    if not combatEnabled() then return end
+    if HasEntityBeenDamagedByEntity(officer, playerPed, true) then
+        provokePolice()
+        ClearEntityLastDamageEntity(officer)
+    end
+end
+
+RegisterNetEvent('fenix-police:spawnPoliceUnitClient')
+AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedModels, spawnPoint, spawnHeading)
+    -- Discard in-flight spawns that arrived after handleEndWantedDelete() cleared the gate.
+    -- This prevents the race condition where a server response arrives after cleanup and
+    -- re-populates spawnedVehicles with cops that will never be cleaned up.
+    if not spawnGate then
+        if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
+        return
+    end
+    local playerPed = PlayerPedId()
+    local vehicleHash = GetHashKey(vehicleInfo.model)
+
+    if not requestModelLoaded(vehicleHash) then
+        print(('[FENIX-SPAWN] failed to load vehicle model %s'):format(tostring(vehicleInfo.model)))
+        if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
+        return
+    end
+
+    local vehicle = CreateVehicle(vehicleHash, spawnPoint.x, spawnPoint.y, spawnPoint.z, spawnHeading or 0.0, true, true)
+    if not DoesEntityExist(vehicle) then
+        print(('[FENIX-SPAWN] failed to create vehicle %s client-side'):format(tostring(vehicleInfo.model)))
+        if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
+        return
+    end
+
+    SetEntityAsMissionEntity(vehicle, true, true)
+    SetVehicleDoorsLocked(vehicle, 1)
+    SetVehicleOnGroundProperly(vehicle)
+    SetVehicleSiren(vehicle, true)
+    SetSirenKeepOn(vehicle, true)
+
+    local vehNetID = VehToNet(vehicle)
+    NetworkSetNetworkIdDynamic(vehNetID, false)
+    SetNetworkIdCanMigrate(vehNetID, false)
+    SetNetworkIdExistsOnAllMachines(vehNetID, true)
+
+    local officers = {}
+    -- pedNetID -> bool: whether this officer rolled "willing to open fire" for the
+    -- wanted level they spawned at. Kept for the officer's lifetime.
+    local engageFlags = {}
+    local spawnWantedLevel = GetPlayerWantedLevel(PlayerId())
+    local pedCount = vehicleInfo.numPeds or #pedModels
+    local maxSeats = GetVehicleModelNumberOfSeats(vehicleHash)
+    if maxSeats and maxSeats > 0 then
+        pedCount = math.min(pedCount, maxSeats)
+    end
+
+    for seatIndex = -1, pedCount - 2 do
+        local modelName = pedModels[((seatIndex + 2 - 1) % #pedModels) + 1]
+        local pedHash = GetHashKey(modelName)
+        if requestModelLoaded(pedHash) then
+            -- Create ped on foot first so loadout is applied before seating.
+            -- GiveWeaponToPed does not reliably persist when called on an already-seated ped.
+            local officer = CreatePed(4, pedHash, spawnPoint.x, spawnPoint.y, spawnPoint.z, spawnHeading or 0.0, true, true)
+            local pedWait = 0
+            while (not DoesEntityExist(officer) or officer == 0) and pedWait < 30 do
+                Wait(10)
+                pedWait = pedWait + 1
+            end
+            if DoesEntityExist(officer) and officer ~= 0 then
+                SetEntityAsMissionEntity(officer, true, true)
+                SetPedCombatAttributes(officer, 0, true)
+                SetPedCombatAttributes(officer, 1, true)
+                SetPedCombatAttributes(officer, 3, false)
+                SetPedCombatAttributes(officer, 5, true)
+                SetPedFleeAttributes(officer, 0, false)
+                -- Drive-bys (2), always-fight (46), accuracy, shoot rate, firing
+                -- pattern and relationship group are all set by wanted level.
+                local officerEngages = rollEngage(spawnWantedLevel)
+                applyOfficerCombatProfile(officer, spawnWantedLevel, officerEngages)
+                -- Give loadout while on foot (pre-seat pass).
+                giveClientPedLoadout(officer, Config.loadouts[vehicleInfo.loadout])
+                -- Now seat the ped
+                SetPedIntoVehicle(officer, vehicle, seatIndex)
+                Wait(100)
+                if GetPedInVehicleSeat(vehicle, seatIndex) == officer then
+                    -- Client-side re-give (belt)
+                    giveClientPedLoadout(officer, Config.loadouts[vehicleInfo.loadout])
+                    local pedNetID = PedToNet(officer)
+                    NetworkSetNetworkIdDynamic(pedNetID, false)
+                    SetNetworkIdCanMigrate(pedNetID, false)
+                    SetNetworkIdExistsOnAllMachines(pedNetID, true)
+                    -- Server-side arm (suspenders): GiveWeaponToPed on client-created
+                    -- networked peds is silently discarded by FiveM's sync layer in some
+                    -- configurations.  The server is always authoritative, so arming from
+                    -- the server-side is the only reliable guarantee.
+                    TriggerServerEvent('fenix-police:rearmOfficer', pedNetID, vehicleInfo.loadout)
+                    engageFlags[pedNetID] = officerEngages
+                    table.insert(officers, pedNetID)
+                else
+                    DeleteEntity(officer)
+                end
+            end
+            SetModelAsNoLongerNeeded(pedHash)
+        end
+    end
+
+    local driver = GetPedInVehicleSeat(vehicle, -1)
+    if not DoesEntityExist(driver) or driver == 0 then
+        print(('[FENIX-SPAWN] deleting driverless client police vehicle %s'):format(tostring(vehicleInfo.model)))
+        for _, pedNetID in ipairs(officers) do
+            local ped = NetToPed(pedNetID)
+            if DoesEntityExist(ped) then DeleteEntity(ped) end
+        end
+        DeleteEntity(vehicle)
+        if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
+        return
+    end
+
+    spawnedVehicles[vehNetID] = { vehicle = vehicle, officers = {}, officerTasks = {}, officerEngage = engageFlags, clientOwned = true, loadout = vehicleInfo.loadout }
+
+    for i, pedNetID in ipairs(officers) do
+        spawnedVehicles[vehNetID].officers[pedNetID] = NetToPed(pedNetID)
+        spawnedVehicles[vehNetID].officerTasks[pedNetID] = i == 1 and 'VehicleChase' or 'Standby'
+    end
+
+    TaskVehicleDriveToCoord(driver, vehicle, GetEntityCoords(playerPed).x, GetEntityCoords(playerPed).y, GetEntityCoords(playerPed).z, 42.0, 1, GetEntityModel(vehicle), 6, 2.0, true)
+    SetDriveTaskDrivingStyle(driver, 6)
+    SetDriverAbility(driver, 1.0)
+    SetDriverAggressiveness(driver, 1.0)
+
+    -- Only passengers who rolled hostile for this wanted level get a combat task.
+    -- The rest ride along; handleChaseBehavior promotes them if the level rises
+    -- or the player provokes the unit.
+    for i = 2, #officers do
+        local pedNetID = officers[i]
+        local officer = NetToPed(pedNetID)
+        if DoesEntityExist(officer) then
+            local hostile = applyOfficerCombatProfile(officer, spawnWantedLevel, engageFlags[pedNetID])
+            if hostile then
+                TaskCombatPed(officer, playerPed, 0, 16)
+                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'CombatPed'
+            end
+        end
+    end
+
+    MonitorVehicle(vehNetID)
+    SetModelAsNoLongerNeeded(vehicleHash)
+    if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
+end)
+
+
 -- This handles the response from the server after a vehicle and officers are spawned, so they can be tasked and otherwise handled by the client. 
 RegisterNetEvent('spawnPoliceUnitNetResponse')
 AddEventHandler('spawnPoliceUnitNetResponse', function(vehNetID, officers)
+    print(('[FENIX-SPAWN] got server response: vehNetID=%s officers=%s'):format(tostring(vehNetID), tostring(officers and #officers or 'nil')))
 
     local playerPed = PlayerPedId()
-    local playerCoords = GetEntityCoords(playerPed)   
+    local playerCoords = GetEntityCoords(playerPed)
 
 
     if vehNetID and officers then
@@ -729,10 +1091,10 @@ AddEventHandler('spawnPoliceUnitNetResponse', function(vehNetID, officers)
         --if Config.isDebug then print('CLIENT NetToVeh for netID ' ..vehNetID .. ' returned entityID ' .. vehicle)  end
         --if Config.isDebug then print('CLIENT VehToNet for entityID ' ..vehicle.. ' returned NetID = ' .. VehToNet(vehicle))  end
 
-        NetworkSetNetworkIdDynamic(vehNetID, false)  -- Allow the networked vehicle to be controlled dynamically.
-        SetNetworkIdCanMigrate(vehNetID, false) -- Allow the network ID to be migrated to other clients.
+        NetworkSetNetworkIdDynamic(vehNetID, false)
+        SetNetworkIdCanMigrate(vehNetID, false)
         SetNetworkIdExistsOnAllMachines(vehNetID, true)
-        SetEntityAsMissionEntity(vehicle, true, true) -- Prevent despawning by game garbage collection
+        SetEntityAsMissionEntity(vehicle, true, true)
 
         spawnedVehicles[vehNetID] = {vehicle = vehicle, officers = {}, officerTasks = {} }
 
@@ -746,44 +1108,36 @@ AddEventHandler('spawnPoliceUnitNetResponse', function(vehNetID, officers)
                 Wait(Config.netWaitTime)
                 waitCount = waitCount + 1
             end
-            --if Config.isDebug then print('CLIENT NetToPed for netID ' ..pedNetID .. ' returned entityID ' .. officer)  end
-            --if Config.isDebug then print('CLIENT PedToNet for entityID ' ..officer.. ' returned NetID = ' .. PedToNet(officer))  end
 
-            NetworkSetNetworkIdDynamic(pedNetID, false) -- Allow the networked ped to be controlled dynamically.
-            SetNetworkIdCanMigrate(pedNetID, false) -- Allow the network ID to be migrated to other clients.
+            if not officer or officer == 0 then
+                print(('[FENIX] WARNING: officer entity never resolved for pedNetID=%s'):format(tostring(pedNetID)))
+            end
+
+            NetworkSetNetworkIdDynamic(pedNetID, false)
+            SetNetworkIdCanMigrate(pedNetID, false)
             SetNetworkIdExistsOnAllMachines(pedNetID, true)
-            SetEntityAsMissionEntity(officer, true, true) -- Prevent despawning by game garbage collection
+            SetEntityAsMissionEntity(officer, true, true)
 
-            SetPedAsCop(officer, true)
-            SetPedCombatAttributes(officer, 2, true) -- Able to driveby
-            SetPedCombatAttributes(officer, 22, true) -- Drag injured peds to safety
-            SetPedAccuracy(officer, math.random(10, 30))
-            SetPedFiringPattern(officer, 0xD6FF6D61) -- Set firing pattern to a more controlled burst. 
-            SetPedGetOutUpsideDownVehicle(officer, true) 
-
-            -- Set the driver to pursue the player
+            -- [Upstate Mafia] Combat attributes + weapons + initial tasks are all set
+            -- SERVER-SIDE now (server owns the entity). The client only tracks the entity
+            -- for ongoing chase behavior updates (re-tasking when tasks complete).
+            -- Set initial task status to match what the server assigned.
             if i == 1 then
-                TaskVehicleDriveToCoord(officer, vehicle, playerCoords.x, playerCoords.y, playerCoords.z, 30.0, 1, GetEntityModel(vehicle), 787004, 5.0, true)
-                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'DriveToCoord'
-                SetDriverAbility(officer, 100.0) -- Set driver ability to max.
-                SetDriverAggressiveness(officer, 0.5)
-                SetSirenKeepOn(vehicle, true)
+                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
             else
-                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'None'
+                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'CombatPed'
             end
             
             -- Adds the spawned ped "officer" to the .officers table by key pedNetID so it can be retrieved by key pedNetID later. 
             spawnedVehicles[vehNetID].officers[pedNetID] = officer
         end
 
-        -- Will check if vehicle is stuck and try to free it. 
-        MonitorVehicle(vehNetID) 
+        -- Will check if vehicle is stuck and try to free it.
+        MonitorVehicle(vehNetID)
 
     end
 
-    
-
-    isSpawning = false
+    if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
 
 end)
 
@@ -832,10 +1186,9 @@ local function maintainPoliceUnits(wantedLevel)
 
         --if Config.isDebug then print('currentUnits = ' ..currentUnits.. ' and maxUnits = ' ..maxUnits .. ' and isSpawning = ' .. tostring(isSpawning)) end
 
-        -- Spawn additional units if needed
-        while currentUnits < maxUnits and isSpawning == false do
-            -- Set isSpawning = true so we don't keep requesting the server to spawn units while still waiting for a response from the last request!
-            isSpawning = true
+        -- Spawn additional units if needed, allowing up to MAX_CONCURRENT_SPAWNS requests in flight at once.
+        while currentUnits < maxUnits and pendingGroundSpawns < MAX_CONCURRENT_SPAWNS do
+            pendingGroundSpawns = pendingGroundSpawns + 1
             spawnPoliceUnitNet(wantedLevel)
             currentUnits = currentUnits + 1
         end
@@ -868,9 +1221,8 @@ local function maintainPoliceUnits(wantedLevel)
 
         --if Config.isDebug then print('currentHeliUnits = ' ..currentHeliUnits.. ' and maxHeliUnits = ' ..maxHeliUnits .. ' and isSpawning = ' .. tostring(isSpawning)) end
         -- Spawn additional units if needed
-        while currentHeliUnits < maxHeliUnits and isSpawning == false do
-            -- Set isSpawning = true so we don't keep requesting the server to spawn units while still waiting for a response from the last request!
-            isSpawning = true
+        while currentHeliUnits < maxHeliUnits and pendingHeliSpawns < MAX_CONCURRENT_SPAWNS do
+            pendingHeliSpawns = pendingHeliSpawns + 1
             spawnHeliUnitNet(wantedLevel, heliSpawnTable)
             currentHeliUnits = currentHeliUnits + 1
         end
@@ -905,9 +1257,8 @@ local function maintainPoliceUnits(wantedLevel)
 
         --if Config.isDebug then print('currentAirUnits = ' ..currentAirUnits.. ' and maxAirUnits = ' ..maxAirUnits .. ' and isSpawning = ' .. tostring(isSpawning)) end
         -- Spawn additional units if needed
-        while currentAirUnits < maxAirUnits and isSpawning == false do
-            -- Set isSpawning = true so we don't keep requesting the server to spawn units while still waiting for a response from the last request!
-            isSpawning = true
+        while currentAirUnits < maxAirUnits and pendingAirSpawns < MAX_CONCURRENT_SPAWNS do
+            pendingAirSpawns = pendingAirSpawns + 1
             spawnAirUnitNet(wantedLevel, airSpawnTable)
             currentAirUnits = currentAirUnits + 1
         end
@@ -921,10 +1272,23 @@ end
 
 
 
+-- [Upstate Mafia] Forward declaration: the surrender handler is defined ~1200
+-- lines below, alongside the rest of the arrest system, but has to be reachable
+-- from the chase loop here.
+local handleSurrenderApproach
+
 -- Function to handle police foot chase and vehicle retrieval
-local function handleChaseBehavior(vehicleData, playerPed, vehNetID)
+local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
+    -- [Upstate Mafia] Hands up: stop chasing, start arresting. Returning early
+    -- leaves every combat and driving task below unassigned for this unit, which
+    -- is what stops officers shooting a surrendering player.
+    if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then
+        if handleSurrenderApproach(vehicleData, playerPed, vehNetID) then return end
+    end
+
     local playerCoords = GetEntityCoords(playerPed)
-    local vehicle = NetToVeh(vehNetID) 
+    local wantedLevel = GetPlayerWantedLevel(PlayerId())
+    local vehicle = NetToVeh(vehNetID)
         
     -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
     local waitCount = 0
@@ -936,12 +1300,12 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID)
 
     if (not vehicle or vehicle == 0) then
         if Config.isDebug then print('HandleChase vehicle ID ' .. vehNetID .. ' NetToVeh still nil or 0, gave up ') end
+        return
     end
 
     for pedNetID, officerData in pairs(vehicleData.officers) do
-        local officer = NetToPed(pedNetID) 
+        local officer = NetToPed(pedNetID)
 
-        -- I've found that one call isn't enough, and it can take multiple NetToPed calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
         local waitCount = 0
         while (not officer or officer == 0) and waitCount < Config.controlWaitCount do
             officer = NetToPed(pedNetID)
@@ -955,7 +1319,17 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID)
             local officerCoords = GetEntityCoords(officer)
             local distance = Vdist(playerCoords.x, playerCoords.y, playerCoords.z, officerCoords.x, officerCoords.y, officerCoords.z)
 
-            --Equivalent to checkDeadPeds but for farPeds, done here to leverage distance check
+            -- Re-apply the wanted-level combat profile every cycle: GTA's combat AI
+            -- resets accuracy/attributes on task changes, and the wanted level (or
+            -- provocation state) can have moved since this officer spawned.
+            checkOfficerProvocation(officer, playerPed)
+            vehicleData.officerEngage = vehicleData.officerEngage or {}
+            if vehicleData.officerEngage[pedNetID] == nil then
+                vehicleData.officerEngage[pedNetID] = rollEngage(wantedLevel)
+            end
+            local officerHostile = applyOfficerCombatProfile(officer, wantedLevel, vehicleData.officerEngage[pedNetID])
+
+            -- Far-ped tracking for cleanup
             if distance > Config.officerTooFarDistance then
                 if farOfficers[pedNetID] then
                     farOfficers[pedNetID].timer = farOfficers[pedNetID].timer + 1
@@ -966,59 +1340,88 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID)
                 farOfficers[pedNetID] = nil
             end
 
-            if IsPedInAnyVehicle(playerPed, false) then
-                -- Player is in a vehicle
-                if IsPedInAnyVehicle(officer, false) then
-                    if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then 
-                        local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'VehicleChase' then  
-                            TaskVehicleChase(officer, playerPed)
-                            SetTaskVehicleChaseBehaviorFlag(officer, 8, true) -- Turn on boxing and PIT behavior
-                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
-                        end
-                    else
-                        local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'CombatPed' then  
-                            TaskCombatPed(officer, playerPed, 0, 16)
-                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'CombatPed'
-                        end    
-                    end
-                else
-                    local nearbyVehicle = QBCore.Functions.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100, false)
-                    if nearbyVehicle then
-                        local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID] -- Only call task once to avoid interrupting peds repeatedly
-                        if taskStatus ~= 'EnterVehicle' then  
-                            TaskEnterVehicle(officer, nearbyVehicle, 20000, -1, 1.5, 8, 0)
-                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'EnterVehicle'
-                        end
-                    end
-                end
-            else
-                -- Player is on foot
-                if distance > Config.footChaseDistance then
-                    if IsPedInAnyVehicle(officer, false) then
-                        if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then 
-                            local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
-                            if taskStatus ~= 'VehicleChase' then  
-                                TaskVehicleChase(officer, playerPed)
-                                SetTaskVehicleChaseBehaviorFlag(officer, 8, true) -- Turn on boxing and PIT behavior
-                                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
-                            end
+            if IsPedInAnyVehicle(officer, false) then
+                if vehicleData.clientOwned then
+                    local polVehicle = GetVehiclePedIsIn(officer, false)
+                    -- Re-enforce stay-in-vehicle each cycle so combat AI doesn't override it
+                    SetPedCombatAttributes(officer, 3, false)
+                    if GetPedInVehicleSeat(polVehicle, -1) == officer then
+                        -- Driver: re-issue chase task every cycle
+                        if distance > 45.0 then
+                            TaskVehicleDriveToCoord(officer, polVehicle, playerCoords.x, playerCoords.y, playerCoords.z, 42.0, 1, GetEntityModel(polVehicle), 6, 2.0, true)
+                            SetDriveTaskDrivingStyle(officer, 6)
                         else
-                            local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
-                            if taskStatus ~= 'CombatPed' then  
+                            TaskVehicleChase(officer, playerPed)
+                            SetTaskVehicleChaseBehaviorFlag(officer, 8, true)
+                        end
+                        SetDriverAbility(officer, 1.0)
+                        SetDriverAggressiveness(officer, 1.0)
+                        spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                    else
+                        -- Passenger: only issue tasks on transition (task caching prevents
+                        -- re-issuing every second which causes GTA AI to reconsider exiting)
+                        local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
+                        if officerHostile then
+                            if taskStatus ~= 'CombatPed' then
                                 TaskCombatPed(officer, playerPed, 0, 16)
                                 spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'CombatPed'
-                            end    
+                            end
+                        elseif taskStatus ~= 'Standby' then
+                            -- De-escalated (wanted level dropped or provocation expired):
+                            -- drop the combat task so they ride along instead of shooting.
+                            ClearPedTasks(officer)
+                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'Standby'
                         end
                     end
+                    -- Weapon persistence check (runs every cycle for client-owned peds).
+                    -- Use server-side rearm: client GiveWeaponToPed on networked peds is
+                    -- silently discarded by FiveM sync in some configurations.
+                    local bestWeapon = GetBestPedWeapon(officer, false)
+                    if bestWeapon == GetHashKey('weapon_unarmed') or bestWeapon == 0 then
+                        local loadoutKey = vehicleData.loadout
+                        TriggerServerEvent('fenix-police:rearmOfficer', pedNetID, loadoutKey)
+                    end
                 else
-                    local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
-                    if taskStatus ~= 'CombatPed' then  
-                        TaskGoToEntity(officer, playerPed, -1, 5.0, 2.0, 1073741824, 0)
-                        TaskCombatPed(officer, playerPed, 0, 16)
-                        spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'CombatPed'
-                    end      
+                    -- Non-clientOwned: server owns and handles tasks — just track state
+                    spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                end
+            else
+                -- ---- ON FOOT (police car exists but ped exited, or car destroyed) ----
+                local polVehicle = NetToVeh(vehNetID)
+
+                if DoesEntityExist(polVehicle) and polVehicle ~= 0 then
+                    -- Car still exists — teleport back in and re-arm
+                    if vehicleData.clientOwned then
+                        local seat = -1
+                        if GetPedInVehicleSeat(polVehicle, -1) ~= 0 then
+                            seat = 0
+                            local seats = GetVehicleModelNumberOfSeats(GetEntityModel(polVehicle))
+                            for candidateSeat = 0, seats - 2 do
+                                if GetPedInVehicleSeat(polVehicle, candidateSeat) == 0 then
+                                    seat = candidateSeat
+                                    break
+                                end
+                            end
+                        end
+                        SetPedIntoVehicle(officer, polVehicle, seat)
+                        -- Re-apply loadout in case weapons were lost during the exit
+                        local loadoutKey = vehicleData.loadout
+                        if loadoutKey and Config.loadouts[loadoutKey] then
+                            giveClientPedLoadout(officer, Config.loadouts[loadoutKey])
+                        end
+                    end
+                    TriggerServerEvent('fenix-police:unlockOfficerVehicle', vehNetID)
+                    -- Reset task state so the driver/passenger tasks are re-issued next cycle
+                    spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                else
+                    -- Car gone — fight on foot
+                    TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                    spawnedVehicles[vehNetID].officers[pedNetID] = nil
+                    spawnedVehicles[vehNetID].officerTasks[pedNetID] = nil
+                    if not next(spawnedVehicles[vehNetID].officers) then
+                        TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
+                        spawnedVehicles[vehNetID] = nil
+                    end
                 end
             end
         end
@@ -1029,9 +1432,15 @@ end
 
 
 -- Function to handle heli chase
-local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID)
+local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
+    -- [Upstate Mafia] Hold fire on a surrendering player. Returning early leaves
+    -- the heli on its existing task, so it keeps circling overhead rather than
+    -- engaging — which is the shot you want during the arrest cinematic anyway.
+    if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then return end
+
     local playerCoords = GetEntityCoords(playerPed)
-    local vehicle = NetToVeh(vehNetID) 
+    local heliWantedLevel = GetPlayerWantedLevel(PlayerId())
+    local vehicle = NetToVeh(vehNetID)
         
     -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
     local waitCount = 0
@@ -1062,6 +1471,16 @@ local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID)
             local officerCoords = GetEntityCoords(officer)
             local distance = Vdist(playerCoords.x, playerCoords.y, playerCoords.z, officerCoords.x, officerCoords.y, officerCoords.z)
 
+            -- Wanted-level combat profile. Below the hostile threshold the crew
+            -- shadow the player with the spotlight instead of shooting.
+            checkOfficerProvocation(officer, playerPed)
+            vehicleData.officerEngage = vehicleData.officerEngage or {}
+            if vehicleData.officerEngage[pedNetID] == nil then
+                vehicleData.officerEngage[pedNetID] = rollEngage(heliWantedLevel)
+            end
+            local officerHostile = applyOfficerCombatProfile(officer, heliWantedLevel, vehicleData.officerEngage[pedNetID], 'air')
+            SetPedCombatAttributes(officer, 3, false) -- never bail out of the heli
+
             --Equivalent to checkDeadPeds but for farPeds, done here to leverage distance check
             if distance > Config.heliTooFarDistance then
                 if farHeliPeds[pedNetID] then
@@ -1072,58 +1491,52 @@ local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID)
             else
                 farHeliPeds[pedNetID] = nil
             end
-
-            if IsPedInAnyVehicle(playerPed, false) then
-                -- Player is in a vehicle
-                if IsPedInAnyVehicle(officer, false) then
-                    if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then 
-
-                        local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'VehicleChase' then  
-                            --TaskVehicleChase(officer, playerPed)
-                            TaskHeliChase(officer, playerPed, 0, 0, 120)
-                            spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
-                        end
-                    else
-                        local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'CombatPed' then  
+            
+            -- [Upstate Mafia patch] Heli always pursues aggressively — no playerHasShot gate
+            if IsPedInAnyVehicle(officer, false) then
+                if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then
+                    -- Pilot — chase
+                    local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
+                    if taskStatus ~= 'HeliChase' then
+                        TaskHeliChase(officer, playerPed, 0, 0, 120)
+                        spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'HeliChase'
+                    end
+                else
+                    -- Crew — shoot only once hostile for this wanted level
+                    local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
+                    if officerHostile then
+                        if taskStatus ~= 'CombatPed' then
                             TaskCombatPed(officer, playerPed, 0, 16)
                             spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
-                        end    
-                    end
-
-                else
-                    local nearbyVehicle = QBCore.Functions.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100, false)
-                    if nearbyVehicle then
-                        -- If pilots are somehow out of their helicopter alive and player is fleeing steal a car
-                        local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'EnterVehicle' then
-                            TaskEnterVehicle(officer, nearbyVehicle, 20000, -1, 1.5, 8, 0)
-                            spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'EnterVehicle'
                         end
+                    elseif taskStatus ~= 'Standby' then
+                        ClearPedTasks(officer)
+                        spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'Standby'
                     end
+                end
+                -- Weapon persistence check for server-owned heli peds.
+                -- Server owns these entities so ask the server to re-arm rather than calling
+                -- GiveWeaponToPed directly (client-side calls on server-owned entities fail silently).
+                if GetBestPedWeapon(officer, false) == GetHashKey('weapon_unarmed') or GetBestPedWeapon(officer, false) == 0 then
+                    TriggerServerEvent('fenix-police:rearmOfficer', pedNetID, 'airPatrol')
                 end
             else
-
-                if IsPedInAnyVehicle(officer, false) then
-                    if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then 
-                        local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'VehicleChase' then  
-                            --TaskVehicleChase(officer, playerPed)
-                            TaskHeliChase(officer, playerPed, 0, 0, 120)
-                            spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
-                        end
-                    else
-                        local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'CombatPed' then  
-                            TaskCombatPed(officer, playerPed, 0, 16)
-                            spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
-                        end    
+                -- Officer somehow on foot — fight or commandeer a vehicle
+                local nearbyVehicle = QBCore.Functions.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100, false)
+                if nearbyVehicle then
+                    local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
+                    if taskStatus ~= 'EnterVehicle' then
+                        TaskEnterVehicle(officer, nearbyVehicle, 20000, -1, 1.5, 8, 0)
+                        spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'EnterVehicle'
+                    end
+                else
+                    local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
+                    if taskStatus ~= 'CombatPed' then
+                        TaskCombatPed(officer, playerPed, 0, 16)
+                        spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
                     end
                 end
-
             end
-
         end
     end
 end
@@ -1132,9 +1545,13 @@ end
 
 
 -- Function to handle air chase
-local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID)
+local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
+    -- [Upstate Mafia] Hold fire on a surrendering player, as above.
+    if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then return end
+
     local playerCoords = GetEntityCoords(playerPed)
-    local vehicle = NetToVeh(vehNetID) 
+    local airWantedLevel = GetPlayerWantedLevel(PlayerId())
+    local vehicle = NetToVeh(vehNetID)
         
     -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
     local waitCount = 0
@@ -1165,6 +1582,16 @@ local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID)
             local officerCoords = GetEntityCoords(officer)
             local distance = Vdist(playerCoords.x, playerCoords.y, playerCoords.z, officerCoords.x, officerCoords.y, officerCoords.z)
 
+            -- Wanted-level combat profile (air units only spawn at 4-5, so this is
+            -- mostly an accuracy/rate-of-fire cap rather than a hold-fire gate).
+            checkOfficerProvocation(officer, playerPed)
+            vehicleData.officerEngage = vehicleData.officerEngage or {}
+            if vehicleData.officerEngage[pedNetID] == nil then
+                vehicleData.officerEngage[pedNetID] = rollEngage(airWantedLevel)
+            end
+            local officerHostile = applyOfficerCombatProfile(officer, airWantedLevel, vehicleData.officerEngage[pedNetID], 'air')
+            SetPedCombatAttributes(officer, 3, false) -- never bail out of the aircraft
+
             --Equivalent to checkDeadPeds but for farPeds, done here to leverage distance check
             if distance > Config.planeTooFarDistance then
                 if farAirPeds[pedNetID] then
@@ -1176,58 +1603,53 @@ local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID)
                 farAirPeds[pedNetID] = nil
             end
 
-            if IsPedInAnyVehicle(playerPed, false) then
-                local playerVeh = GetVehiclePedIsIn(playerPed, false)
-                -- Player is in a vehicle
-                if IsPedInAnyVehicle(officer, false) then
-                    if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then 
+            -- [Upstate Mafia patch] Air units always pursue aggressively — no playerHasShot gate
+            if IsPedInAnyVehicle(officer, false) then
+                if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then
+                    -- Pilot
+                    if IsPedInAnyVehicle(playerPed, false) then
+                        local playerVeh = GetVehiclePedIsIn(playerPed, false)
                         local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'VehicleChase' then  
-                            --TaskVehicleChase(officer, playerPed)
-                            --TaskPlaneChase(officer, playerPed, 0, 0, 80)
-                            -- Assign the attack mission to the pilot
+                        if taskStatus ~= 'VehicleChase' then
                             TaskVehicleMission(officer, vehicle, playerVeh, 6, 1000.0, 1073741824, 1, 0.0, true)
-
                             spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
                         end
                     else
                         local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'CombatPed' then  
-                            TaskCombatPed(officer, playerPed, 0, 16)
-                            spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
-                        end   
+                        if taskStatus ~= 'PlaneChase' then
+                            TaskPlaneChase(officer, playerPed, 20, 20, 150)
+                            spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'PlaneChase'
+                        end
                     end
                 else
-                    local nearbyVehicle = QBCore.Functions.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100, false)
-                    if nearbyVehicle then
-                        local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'EnterVehicle' then
-                            -- If pilots are somehow out of their helicopter and player is fleeing steal a car
-                            TaskEnterVehicle(officer, nearbyVehicle, 20000, -1, 1.5, 8, 0)
-                            spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'EnterVehicle'
-                        end
-                    end
-                end
-                
-            else
-
-                if IsPedInAnyVehicle(officer, false) then
-                    if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then 
-                        local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'VehicleChase' then  
-                            --TaskVehicleChase(officer, playerPed)
-                            TaskPlaneChase(officer, playerPed, 20, 20, 150)
-                            spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
-                        end
-                    else
-                        local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
-                        if taskStatus ~= 'CombatPed' then  
+                    -- Crew — shoot only once hostile for this wanted level
+                    local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
+                    if officerHostile then
+                        if taskStatus ~= 'CombatPed' then
                             TaskCombatPed(officer, playerPed, 0, 16)
                             spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
-                        end    
+                        end
+                    elseif taskStatus ~= 'Standby' then
+                        ClearPedTasks(officer)
+                        spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'Standby'
                     end
                 end
-
+            else
+                -- On foot somehow — commandeer a vehicle or fight
+                local nearbyVehicle = QBCore.Functions.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100, false)
+                if nearbyVehicle then
+                    local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
+                    if taskStatus ~= 'EnterVehicle' then
+                        TaskEnterVehicle(officer, nearbyVehicle, 20000, -1, 1.5, 8, 0)
+                        spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'EnterVehicle'
+                    end
+                else
+                    local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
+                    if taskStatus ~= 'CombatPed' then
+                        TaskCombatPed(officer, playerPed, 0, 16)
+                        spawnedAirUnits[vehNetID].officerTasks[pedNetID] = 'CombatPed'
+                    end
+                end
             end
         end
     end
@@ -1715,77 +2137,140 @@ end
 -- This function handles deleting the police units when you have lost your wanted level and the timer has expired. 
 -- The above function + this function attempts to have the police drive off, then when far enough away delete them. 
 local function handleEndWantedDelete()
+    -- Collect keys BEFORE iterating so that nilling entries mid-loop (which Lua's
+    -- pairs iterator can silently skip) doesn't leave orphan units behind.
 
-    -- If wanted level is 0, remove all police units
-    -- Remove Ground Units
-    for vehNetID, vehicleData in pairs(spawnedVehicles) do
-
-        -- We should be able to tell the server to delete the NetID whether it exists locally for us or not and trust that it will be removed and remove it from the table now
-        for pedNetID, officerData in pairs(vehicleData.officers) do
-            TriggerServerEvent('deleteSpawnedPed', pedNetID)
-            spawnedVehicles[vehNetID].officers[pedNetID] = nil
-            if Config.isDebug then print('Cleaned up police officer ') end
-        end
-
-        -- Only remove the vehicle if all officers were removed this cycle!
-        if not next(vehicleData.officers) then
-            -- If no officers left tells server to delete vehicle. Server will check if there is a ped in the driver seat first.
-            -- If they are, the server will not delete the vehicle but send back a response to the client to add to stolenVehicles table instead.
+    -- Ground units
+    local groundKeys = {}
+    for k in pairs(spawnedVehicles) do table.insert(groundKeys, k) end
+    for _, vehNetID in ipairs(groundKeys) do
+        local vehicleData = spawnedVehicles[vehNetID]
+        if vehicleData then
+            local pedKeys = {}
+            for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
+            for _, pedNetID in ipairs(pedKeys) do
+                local ped = NetToPed(pedNetID)
+                if DoesEntityExist(ped) then
+                    DeleteEntity(ped)
+                end
+                TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                if Config.isDebug then print('Cleaned up police officer ' .. pedNetID) end
+            end
+            local vehicle = NetToVeh(vehNetID)
+            if DoesEntityExist(vehicle) then
+                DeleteEntity(vehicle)
+            end
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
-            if Config.isDebug then print('Cleaned up police vehicle ') end
-            spawnedVehicles[vehNetID] = nil 
+            if Config.isDebug then print('Cleaned up police vehicle ' .. vehNetID) end
+            spawnedVehicles[vehNetID] = nil
         end
-
     end
 
-
-    -- Remove Helicopter Units
-    for vehNetID, vehicleData in pairs(spawnedHeliUnits) do
-
-
-        -- We should be able to tell the server to delete the NetID whether it exists locally for us or not and trust that it will be removed and remove it from the table now
-        for pedNetID, officerData in pairs(vehicleData.officers) do
-            TriggerServerEvent('deleteSpawnedPed', pedNetID)
-            spawnedHeliUnits[vehNetID].officers[pedNetID] = nil
-            if Config.isDebug then print('Cleaned up heli officer ') end
-        end
-
-        -- Only remove the vehicle if all officers were removed this cycle!
-        if not next(vehicleData.officers) then
-            -- If no officers left tells server to delete vehicle. Server will check if there is a ped in the driver seat first.
-            -- If they are, the server will not delete the vehicle but send back a response to the client to add to stolenVehicles table instead.
+    -- Heli units
+    local heliKeys = {}
+    for k in pairs(spawnedHeliUnits) do table.insert(heliKeys, k) end
+    for _, vehNetID in ipairs(heliKeys) do
+        local vehicleData = spawnedHeliUnits[vehNetID]
+        if vehicleData then
+            local pedKeys = {}
+            for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
+            for _, pedNetID in ipairs(pedKeys) do
+                local ped = NetToPed(pedNetID)
+                if DoesEntityExist(ped) then
+                    DeleteEntity(ped)
+                end
+                TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                if Config.isDebug then print('Cleaned up heli officer ' .. pedNetID) end
+            end
+            local vehicle = NetToVeh(vehNetID)
+            if DoesEntityExist(vehicle) then
+                DeleteEntity(vehicle)
+            end
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
-            if Config.isDebug then print('Cleaned up heli unit ') end
+            if Config.isDebug then print('Cleaned up heli unit ' .. vehNetID) end
             spawnedHeliUnits[vehNetID] = nil
         end
-
     end
 
-    -- Remove Air Units
-    for vehNetID, vehicleData in pairs(spawnedAirUnits) do
-
-         -- We should be able to tell the server to delete the NetID whether it exists locally for us or not and trust that it will be removed and remove it from the table now
-         for pedNetID, officerData in pairs(vehicleData.officers) do
-            TriggerServerEvent('deleteSpawnedPed', pedNetID)
-            if Config.isDebug then print('Cleaned up air officer ') end
-            spawnedAirUnits[vehNetID].officers[pedNetID] = nil
-        end
-
-        -- Only remove the vehicle if all officers were removed this cycle!
-        if not next(vehicleData.officers) then
-            -- If no officers left tells server to delete vehicle. Server will check if there is a ped in the driver seat first.
-            -- If they are, the server will not delete the vehicle but send back a response to the client to add to stolenVehicles table instead.
+    -- Air units
+    local airKeys = {}
+    for k in pairs(spawnedAirUnits) do table.insert(airKeys, k) end
+    for _, vehNetID in ipairs(airKeys) do
+        local vehicleData = spawnedAirUnits[vehNetID]
+        if vehicleData then
+            local pedKeys = {}
+            for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
+            for _, pedNetID in ipairs(pedKeys) do
+                local ped = NetToPed(pedNetID)
+                if DoesEntityExist(ped) then
+                    DeleteEntity(ped)
+                end
+                TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                if Config.isDebug then print('Cleaned up air officer ' .. pedNetID) end
+            end
+            local vehicle = NetToVeh(vehNetID)
+            if DoesEntityExist(vehicle) then
+                DeleteEntity(vehicle)
+            end
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
-            if Config.isDebug then print('Cleaned up air unit ') end
+            if Config.isDebug then print('Cleaned up air unit ' .. vehNetID) end
             spawnedAirUnits[vehNetID] = nil
         end
-
     end
+
+    -- Reset pending spawn counters so the next chase starts clean
+    pendingGroundSpawns = 0
+    pendingHeliSpawns   = 0
+    pendingAirSpawns    = 0
+
+    -- Close the spawn gate so any in-flight server responses that arrive AFTER this
+    -- cleanup are discarded rather than re-populating the tracking tables with cops
+    -- that will never be cleaned up again.
+    spawnGate = false
 
     if Config.isDebug then print('All Units Cleaned Up') end
 end
 
+RegisterNetEvent('fenix-police:cleanupAllPolice')
+AddEventHandler('fenix-police:cleanupAllPolice', function()
+    handleEndWantedDelete()
+end)
 
+-- ============================================================================
+-- Independent cleanup watchdog thread
+-- Watches the wanted level independently of the main loop.  When the wanted
+-- level drops to 0, it hammers handleEndWantedDelete() five times over five
+-- seconds regardless of wantedTimer state, pcall health, or in-flight spawns.
+-- This is completely separate from the main loop so nothing in that loop's
+-- error handling or timing can prevent cleanup from firing.
+-- ============================================================================
+CreateThread(function()
+    local prevWanted = false
+    while true do
+        Wait(500)
+        local plyPed = PlayerPedId()
+        if not plyPed or plyPed == 0 then goto cleanupWatchdogContinue end
+
+        local wanted = GetPlayerWantedLevel(PlayerId()) > 0
+
+        if prevWanted and not wanted then
+            -- Wanted level just dropped — run cleanup five times over five seconds.
+            -- Five passes ensures in-flight server-side spawn responses that arrive
+            -- up to ~4 seconds after cleanup still get caught and deleted.
+            for i = 1, 5 do
+                local ok, err = pcall(handleEndWantedDelete)
+                if not ok then
+                    print('^1[FENIX-CLEANUP] watchdog error pass ' .. i .. ': ' .. tostring(err) .. '^7')
+                end
+                if i < 5 then Wait(1000) end
+            end
+            print('[FENIX-CLEANUP] watchdog finished 5-pass cleanup')
+        end
+
+        prevWanted = wanted
+        ::cleanupWatchdogContinue::
+    end
+end)
 
 
 -- ENABLE DISPATCH FEATURES --
@@ -1811,10 +2296,15 @@ local function UpdateDispatchServices()
             SetCreateRandomCopsOnScenarios(false) 
             
             DistantCopCarSirens(false)
-        
-            SetMaxWantedLevel(0) -- Disable wanted level
 
-            -- This removes vehicles from generating at PDs when police are online. 
+            -- [Upstate Mafia patch] Original was SetMaxWantedLevel(0) which prevented
+            -- ANY wanted level from rising when player cops are online — meaning
+            -- killing peds did nothing, no map indicator, no ps-dispatch alerts.
+            -- We keep wanted level enabled (so stars/HUD/dispatch work) but fenix
+            -- still skips its AI-dispatch spawning because disableAIPolice=true.
+            SetMaxWantedLevel(5)
+
+            -- This removes vehicles from generating at PDs when police are online.
             if Config.RemoveVehicleGenerators == true then
                 RemoveVehiclesFromGeneratorsInArea(335.2616 - 300.0, -1432.455 - 300.0, 46.51 - 300.0, 335.2616 + 300.0, -1432.455 + 300.0, 346.51)
                 RemoveVehiclesFromGeneratorsInArea(441.8465 - 500.0, -987.99 - 500.0, 30.68 -500.0, 441.8465 + 500.0, -987.99 + 500.0, 30.68 + 500.0)
@@ -1832,19 +2322,35 @@ local function UpdateDispatchServices()
             if Config.isDebug then print('Fenix Police Response: Enabled') end
 
             SetAudioFlag('PoliceScannerDisabled', false)
-            SetCreateRandomCops(true)
-            SetCreateRandomCopsNotOnScenarios(true)
-            SetCreateRandomCopsOnScenarios(true)
-            DistantCopCarSirens(false) --I keep this off for personal preference, I found sometimes they got stuck on and it was annoying.
-        
+            -- Keep native random cops OFF — fenix-police handles its own spawning.
+            -- Native ambient cops follow traffic laws and show flashing search-mode blips,
+            -- which conflicts with the script's pursuit system.
+            SetCreateRandomCops(false)
+            SetCreateRandomCopsNotOnScenarios(false)
+            SetCreateRandomCopsOnScenarios(false)
+            DistantCopCarSirens(false)
+
             SetMaxWantedLevel(5) -- Uses max 5 star wanted level
         end
 
-        -- Always enable the dispatch services, as they are only meant for non-police things like Ambulance/Fire as this mod handles police separately. 
+        -- Always enable the dispatch services, as they are only meant for non-police things like Ambulance/Fire as this mod handles police separately.
         for i = 1, 15 do
             local toggle = Config.AIResponse.dispatchServices[i]
             EnableDispatchService(i, toggle)
         end
+
+        -- [Upstate Mafia] Suppress policet (police transporter) from spawning anywhere
+        SetVehicleModelIsSuppressed(GetHashKey('policet'), true)
+        SetCreateRandomCops(false)
+        SetCreateRandomCopsNotOnScenarios(false)
+        SetCreateRandomCopsOnScenarios(false)
+        EnableDispatchService(1, false)
+        EnableDispatchService(4, false)
+        EnableDispatchService(6, false)
+        EnableDispatchService(7, false)
+        EnableDispatchService(8, false)
+        EnableDispatchService(9, false)
+        EnableDispatchService(10, false)
 
 
         -- Always update evasion times for when this mod handles police.
@@ -1879,12 +2385,15 @@ RegisterNetEvent('fenix-police:updateCopsOnline', function(polCount)
 end)
 
 -- checks if a player is one of the police jobs configured and returns true if they are.
-local function isPlayerPoliceOfficer()
+-- [Upstate Mafia patch] Assigns to the forward-declared local near the top of
+-- this file (was `local function`, which made it invisible to everything above).
+function isPlayerPoliceOfficer()
 
     local playerData = QBCore.Functions.GetPlayerData()
     local isPolice = false
 
-    
+    if not playerData or not playerData.job then return false end
+
     for _, job in ipairs(Config.PoliceJobsToCheck) do
         if playerData.job.name == job.jobName then
             -- Check if configured to only count on-duty players?
@@ -1904,22 +2413,428 @@ local function isPlayerPoliceOfficer()
 
 end
 
+-- [Upstate Mafia] Exposed so client/ambient.lua (a separate file, and therefore
+-- outside this file's locals) can skip enforcement against on-duty officers
+-- before it starts a pursuit, rather than relying on the wanted level being
+-- blocked after the chase has already begun.
+exports('IsPlayerPoliceOfficer', function() return isPlayerPoliceOfficer() end)
+
 
     
+
+-------------------------------------------------
+-- SURRENDER & ARREST SYSTEM (Upstate Mafia)   --
+-------------------------------------------------
+
+local HANDS_UP_DICT = 'random@mugging3'
+local HANDS_UP_ANIM = 'handsup_standing_base'
+local KNEEL_DICT    = 'random@arrests@busted'
+local KNEEL_ANIM    = 'idle_a'
+
+-- Toggle surrender when player presses H
+RegisterKeyMapping('surrendertopolice', 'Surrender to Police (Hands Up)', 'keyboard', 'H')
+RegisterCommand('surrendertopolice', function()
+    if isBeingArrested then return end
+    if not Config.ArrestSystem.enabled then return end
+
+    -- Nothing to surrender to without a wanted level.
+    if GetPlayerWantedLevel(PlayerId()) < 1 then
+        if isSurrendering then
+            isSurrendering = false
+            ClearPedTasks(PlayerPedId())
+        end
+        return
+    end
+
+    local playerPed = PlayerPedId()
+
+    if isSurrendering then
+        -- Toggle back off: hands down, carry on.
+        isSurrendering = false
+        ClearPedTasks(playerPed)
+        return
+    end
+
+    -- Hands up on foot only. Surrendering through a windscreen looks absurd and
+    -- leaves the officer walking up to a car they can't reach into.
+    if IsPedInAnyVehicle(playerPed, false) then
+        if Config.isDebug then print('[fenix-police] surrender ignored: in a vehicle') end
+        return
+    end
+
+    isSurrendering = true
+
+    CreateThread(function()
+        RequestAnimDict(HANDS_UP_DICT)
+        local waited = 0
+        while not HasAnimDictLoaded(HANDS_UP_DICT) and waited < 200 do
+            Wait(10)
+            waited = waited + 1
+        end
+        if not isSurrendering then return end
+
+        ClearPedTasks(playerPed)
+        -- Flag 49 = upper-body only + looping, so the player can still be turned
+        -- and doesn't slide out of the pose.
+        TaskPlayAnim(playerPed, HANDS_UP_DICT, HANDS_UP_ANIM, 8.0, -8.0, -1, 49, 0, false, false, false)
+
+        -- Hold the pose until arrested, cancelled, or the wanted level clears.
+        while isSurrendering and not isBeingArrested do
+            if GetPlayerWantedLevel(PlayerId()) < 1 then
+                isSurrendering = false
+                ClearPedTasks(PlayerPedId())
+                break
+            end
+            if not IsEntityPlayingAnim(PlayerPedId(), HANDS_UP_DICT, HANDS_UP_ANIM, 3) then
+                TaskPlayAnim(PlayerPedId(), HANDS_UP_DICT, HANDS_UP_ANIM, 8.0, -8.0, -1, 49, 0, false, false, false)
+            end
+            Wait(250)
+        end
+    end)
+end, false)
+
+-- Disable controls while surrendering or being arrested (runs every frame)
+Citizen.CreateThread(function()
+    while true do
+        if isSurrendering or isBeingArrested then
+            DisableAllControlActions(0)
+            EnableControlAction(0, 1, true)   -- Look L/R
+            EnableControlAction(0, 2, true)   -- Look U/D
+            EnableControlAction(0, 245, true) -- Chat / T
+            EnableControlAction(0, 249, true) -- N (push to talk)
+            Wait(0)
+        else
+            Wait(500)
+        end
+    end
+end)
+
+-- Find the nearest police station from Config
+local function getNearestStation(coords)
+    local best = Config.ArrestSystem.stations[1]
+    local bestDist = 999999.0
+    for _, s in ipairs(Config.ArrestSystem.stations) do
+        local d = #(coords - vector3(s.x, s.y, s.z))
+        if d < bestDist then bestDist = d; best = s end
+    end
+    return best
+end
+
+--- Officers respond to a surrendering player instead of shooting.
+---
+--- Rewritten after the original was disabled. That version told EVERY officer in
+--- EVERY responding unit to leave their vehicle the moment you surrendered,
+--- which emptied the entire pursuit and broke the vehicle-driven chase loop it
+--- shares this file with.
+---
+--- This version exits exactly ONE officer, and only once their car has actually
+--- stopped. Everyone else stays seated and simply holds fire. The pursuit loop
+--- is left intact, so if you cancel the surrender it just carries on.
+---
+--- @return boolean handled  true if this unit is participating in the surrender
+--- Assigns to the forward-declared local near handleChaseBehavior.
+function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
+    if isBeingArrested then return true end
+
+    local playerCoords = GetEntityCoords(playerPed)
+    local vehicle = NetToVeh(vehNetID)
+    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return false end
+
+    local tasks = spawnedVehicles[vehNetID] and spawnedVehicles[vehNetID].officerTasks
+    if not tasks then return false end
+
+    -- Only the unit that is genuinely closest supplies the arresting officer.
+    -- Everything else holds, which is what keeps the rest of the pursuit seated.
+    local unitDist = #(playerCoords - GetEntityCoords(vehicle))
+    local isArrestingUnit = unitDist <= (Config.ArrestSystem.approachDistance or 35.0)
+
+    -- Bring this unit to a stop first. Pulling a ped out of a moving car is what
+    -- produced the ragdolling officers that got this feature switched off.
+    if isArrestingUnit and GetEntitySpeed(vehicle) > 1.0 then
+        local driver = GetPedInVehicleSeat(vehicle, -1)
+        if driver and driver ~= 0 and DoesEntityExist(driver) then
+            if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+            BringVehicleToHalt(vehicle, 6.0, 2, false)
+        end
+        return true
+    end
+
+    local arrester, arresterDist = nil, 9999.0
+
+    for pedNetID, _ in pairs(vehicleData.officers) do
+        local officer = NetToPed(pedNetID)
+        if DoesEntityExist(officer) and officer ~= 0 and not IsPedDeadOrDying(officer, true) then
+            if not NetworkHasControlOfEntity(officer) then NetworkRequestControlOfEntity(officer) end
+
+            local seated = IsPedInAnyVehicle(officer, false)
+            local d = #(playerCoords - GetEntityCoords(officer))
+
+            if isArrestingUnit and not seated and d < arresterDist then
+                arrester, arresterDist = pedNetID, d
+            end
+
+            if isArrestingUnit and seated and tasks[pedNetID] ~= 'ExitForArrest' and not arrester then
+                -- One officer out, from a stopped car, once only.
+                TaskLeaveVehicle(officer, vehicle, 0)
+                tasks[pedNetID] = 'ExitForArrest'
+                break
+            end
+        end
+    end
+
+    if arrester then
+        local officer = NetToPed(arrester)
+        if tasks[arrester] ~= 'ApproachArrest' then
+            GiveWeaponToPed(officer, GetHashKey('WEAPON_PISTOL'), 999, false, true)
+            SetCurrentPedWeapon(officer, GetHashKey('WEAPON_PISTOL'), true)
+            TaskGoToEntity(officer, playerPed, -1, 1.0, 1.5, 1073741824, 0)
+            tasks[arrester] = 'ApproachArrest'
+        end
+
+        if arresterDist <= (Config.ArrestSystem.arrestDistance or 2.0) then
+            triggerArrest(officer)
+        end
+    end
+
+    return isArrestingUnit
+end
+
+-- Helis hover overhead during surrender (stop shooting, keep circling)
+--- Superseded and never called. Air units now hold fire via an early return in
+--- handleHeliChaseBehavior / handleAirChaseBehavior, which leaves them on their
+--- existing circling task instead of re-tasking them mid-surrender. Kept only so
+--- the diff against upstream stays legible.
+local function handleHeliSurrenderHover(vehicleData, playerPed, vehNetID)
+    do return end
+    for pedNetID, _ in pairs(vehicleData.officers) do
+        local officer = NetToPed(pedNetID)
+        if not DoesEntityExist(officer) or officer == 0 or IsPedDeadOrDying(officer, true) then
+            goto nextCrew
+        end
+
+        local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
+
+        if IsPedInAnyVehicle(officer, false) then
+            if GetPedInVehicleSeat(GetVehiclePedIsIn(officer, false), -1) == officer then
+                -- Pilot: circle at low altitude
+                if taskStatus ~= 'SurrenderHover' then
+                    TaskHeliChase(officer, playerPed, 0, 0, 50)
+                    spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'SurrenderHover'
+                end
+            else
+                -- Crew: just aim, don't shoot
+                if taskStatus ~= 'AimCover' then
+                    TaskAimGunAtEntity(officer, playerPed, -1, false)
+                    spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'AimCover'
+                end
+            end
+        end
+        ::nextCrew::
+    end
+end
+
+-- ============================
+-- BUSTED SCREEN & ARREST FLOW
+-- ============================
+
+function triggerArrest(arrestingCop)
+    if isBeingArrested then return end
+    isBeingArrested = true
+    isSurrendering  = false
+
+    Citizen.CreateThread(function()
+        local playerPed    = PlayerPedId()
+        local arrestCoords = GetEntityCoords(playerPed)
+
+        -- Freeze player and play kneel animation
+        FreezeEntityPosition(playerPed, true)
+        RequestAnimDict(KNEEL_DICT)
+        while not HasAnimDictLoaded(KNEEL_DICT) do Wait(10) end
+        ClearPedTasks(playerPed)
+        TaskPlayAnim(playerPed, KNEEL_DICT, KNEEL_ANIM, 8.0, -8.0, -1, 33, 0, false, false, false)
+
+        -- Make the arresting cop face the player
+        if DoesEntityExist(arrestingCop) and not IsPedDeadOrDying(arrestingCop, true) then
+            TaskTurnPedToFaceEntity(arrestingCop, playerPed, 2000)
+        end
+
+        Wait(800)
+
+        -- ---- BUSTED CINEMATIC ----
+
+        -- 1. Load scaleform
+        local sf = RequestScaleformMovie('MP_BIG_MESSAGE_FREEMODE')
+        while not HasScaleformMovieLoaded(sf) do Wait(0) end
+
+        BeginScaleformMovieMethod(sf, 'SHOW_SHARD_WASTED_MP_MESSAGE')
+        BeginTextCommandScaleformString('STRING')
+        AddTextComponentSubstringPlayerName('~r~BUSTED')
+        EndTextCommandScaleformString()
+        BeginTextCommandScaleformString('STRING')
+        AddTextComponentSubstringPlayerName(Config.ArrestSystem.bustedSubtitle or '')
+        EndTextCommandScaleformString()
+        EndScaleformMovieMethod()
+
+        -- 2. Screen effect + sound
+        StartScreenEffect('DeathFailOut', 0, false)
+        PlaySoundFrontend(-1, 'ScreenFlash', 'MissionFailedSounds', true)
+        SetTimeScale(0.15)
+
+        -- 3. Cinematic camera — slowly pull back and rise
+        local heading  = GetEntityHeading(playerPed)
+        local rad      = math.rad(heading + 160.0)
+        local startDist, endDist = 2.0, 6.0
+        local startZ,   endZ    = 0.8, 3.0
+
+        local cam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
+        local startPos = arrestCoords + vector3(math.sin(rad) * startDist, math.cos(rad) * startDist, startZ)
+        SetCamCoord(cam, startPos.x, startPos.y, startPos.z)
+        PointCamAtCoord(cam, arrestCoords.x, arrestCoords.y, arrestCoords.z + 0.4)
+        SetCamActive(cam, true)
+        RenderScriptCams(true, true, 800, true, true)
+
+        -- 4. Draw loop — render scaleform and animate camera
+        --
+        -- [Upstate Mafia patch] Timed off GetNetworkTime(), NOT GetGameTimer().
+        -- SetTimeScale(0.15) above slows game time to 15%, and GetGameTimer
+        -- advances with it — so a 6000ms window took ~40 SECONDS of real time,
+        -- and the cinematic appeared to hang. GetNetworkTime is real time and is
+        -- unaffected by the local time scale.
+        local t0       = GetNetworkTime()
+        local duration = math.min(Config.ArrestSystem.bustedDuration or 6000,
+                                  (Config.ArrestSystem.bustedMaxDuration or 30000))
+        local skippable = Config.ArrestSystem.bustedSkippable ~= false
+        local skipped  = false
+
+        while (GetNetworkTime() - t0) < duration and not skipped do
+            local progress = (GetNetworkTime() - t0) / duration
+            -- Ease-out for smooth decel
+            local ease = 1.0 - (1.0 - progress) * (1.0 - progress)
+
+            if skippable then
+                -- Controls are disabled below, so this has to read the DISABLED
+                -- state. 201 = INPUT_FRONTEND_ACCEPT (Enter), 22 = jump (Space).
+                if IsDisabledControlJustPressed(0, 201) or IsDisabledControlJustPressed(0, 22) then
+                    skipped = true
+                end
+
+                SetTextFont(4)
+                SetTextScale(0.42, 0.42)
+                SetTextColour(255, 255, 255, 180)
+                SetTextCentre(true)
+                SetTextEntry('STRING')
+                AddTextComponentString('Press ~b~SPACE~w~ to skip')
+                DrawText(0.5, 0.88)
+            end
+
+            local curDist = startDist + (endDist - startDist) * ease
+            local curZ    = startZ   + (endZ   - startZ)   * ease
+            -- Slow rotate (15 degrees over the full duration)
+            local curRad  = rad + math.rad(15.0 * ease)
+            local camPos  = arrestCoords + vector3(math.sin(curRad) * curDist, math.cos(curRad) * curDist, curZ)
+
+            SetCamCoord(cam, camPos.x, camPos.y, camPos.z)
+            PointCamAtCoord(cam, arrestCoords.x, arrestCoords.y, arrestCoords.z + 0.3)
+            DrawScaleformMovieFullscreen(sf, 255, 255, 255, 255, 0)
+            DisableAllControlActions(0)
+            Wait(0)
+        end
+
+        -- 5. Restore time before fade (so fade isn't in slow-mo)
+        SetTimeScale(1.0)
+        StopScreenEffect('DeathFailOut')
+
+        -- 6. Fade to black
+        DoScreenFadeOut(1500)
+        while not IsScreenFadedOut() do Wait(50) end
+
+        -- 7. Cleanup camera & scaleform
+        SetCamActive(cam, false)
+        RenderScriptCams(false, false, 0, true, true)
+        DestroyCam(cam, false)
+        SetScaleformMovieAsNoLongerNeeded(sf)
+
+        -- 8. Clear wanted & teleport to nearest station
+        ClearPlayerWantedLevel(PlayerId())
+        SetPlayerWantedLevel(PlayerId(), 0, false)
+        SetPlayerWantedLevelNow(PlayerId(), false)
+
+        local station
+        if (Config.ArrestSystem.releaseAt or 'nearest') == 'random' then
+            station = Config.ArrestSystem.stations[math.random(#Config.ArrestSystem.stations)]
+        else
+            station = getNearestStation(arrestCoords)
+        end
+
+        ClearPedTasks(playerPed)
+        FreezeEntityPosition(playerPed, false)
+        SetEntityCoords(playerPed, station.x, station.y, station.z, false, false, false, false)
+        SetEntityHeading(playerPed, station.w)
+
+        -- 9. Clean up all spawned units (same as end-of-wanted)
+        handleEndWantedDelete()
+
+        Wait(2000)
+
+        -- 10. Fade back in at the station
+        DoScreenFadeIn(2000)
+        while not IsScreenFadedIn() do Wait(50) end
+
+        isBeingArrested = false
+    end)
+end
+
 
 -- MAIN THREAD --
 -- Monitor the player's wanted level and maintain police units
 Citizen.CreateThread(function()
     local wantedTimer = 0
+    local lastReportedWantedState = nil
 
     -- Create a thread that continuously loops
     while true do
 
         Citizen.Wait(Config.scriptFrequency)
+
+        local ok, err = pcall(function()
+
         local playerPed = PlayerPedId()
+        if not playerPed or playerPed == 0 then return end  -- ped not ready yet
+
         local wantedLevel = GetPlayerWantedLevel(PlayerId())
-        
+        local isWantedNow = wantedLevel > 0
+        if lastReportedWantedState ~= isWantedNow then
+            TriggerServerEvent('fenix-police:updateWantedStatus', isWantedNow)
+            lastReportedWantedState = isWantedNow
+        else
+            TriggerServerEvent('fenix-police:updateWantedStatus', isWantedNow)
+        end
+        SetCreateRandomCops(false)
+        SetCreateRandomCopsNotOnScenarios(false)
+        SetCreateRandomCopsOnScenarios(false)
+        EnableDispatchService(1, false)
+        EnableDispatchService(4, false)
+        EnableDispatchService(6, false)
+        EnableDispatchService(7, false)
+        EnableDispatchService(8, false)
+        EnableDispatchService(9, false)
+        EnableDispatchService(10, false)
+
+        -- Keep policet suppressed every cycle — the game can reset this suppression flag.
+        SetVehicleModelIsSuppressed(GetHashKey('policet'), true)
+
         if wantedLevel > 0 then
+            print(('[FENIX-LOOP] wanted=%d disableAI=%s pendingGround=%d'):format(wantedLevel, tostring(disableAIPolice), pendingGroundSpawns))
+            -- Open spawn gate so new spawns are accepted for this chase.
+            spawnGate = true
+
+            -- Check if the player is shooting and set the flag
+            if IsPedShooting(playerPed) then
+                playerHasShot = true
+                -- Escalate every unit to full hostility for Config.Combat.provokedDuration.
+                -- This is what lets a low wanted level stay a pursuit until you start it.
+                provokePolice()
+            end
 
             -- If police are protected we should check if player is a cop and prevent being wanted
             if Config.PoliceWantedProtection then
@@ -1929,10 +2844,17 @@ Citizen.CreateThread(function()
                     ClearPlayerWantedLevel(PlayerId())
                 end
             end
-
             
-
-            if QBCore.Functions.GetPlayerData().metadata['isdead'] or QBCore.Functions.GetPlayerData().metadata['inlaststand'] then
+            -- [Upstate Mafia patch] Framework-agnostic incapacitation check.
+            -- Original line read metadata['isdead'] / ['inlaststand'] from qb-ambulancejob.
+            -- wasabi_ambulance doesn't set those keys, so dead players never cleared their wanted level.
+            -- Native checks work regardless of EMS resource. Metadata kept as fallback for qbx_ambulancejob users.
+            local _pd = QBCore and QBCore.Functions and QBCore.Functions.GetPlayerData and QBCore.Functions.GetPlayerData()
+            local _md = _pd and _pd.metadata or nil
+            local _incapacitated = IsEntityDead(playerPed)
+                or IsPedFatallyInjured(playerPed)
+                or (_md and (_md['isdead'] or _md['inlaststand'] or _md['dead']))
+            if _incapacitated then
 
                 local vehicle = GetVehiclePedIsIn(playerPed, false)
 
@@ -1967,32 +2889,37 @@ Citizen.CreateThread(function()
                 handleFarPeds() -- Handle the deletion of far peds. 
 
                 for vehNetID, vehicleData in pairs(spawnedVehicles) do
-                    handleChaseBehavior(vehicleData, playerPed, vehNetID) -- Handles starting foot pursuits, or getting back into vehicles
+                    handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
                 end
 
                 for vehNetID, vehicleData in pairs(spawnedHeliUnits) do
-                    handleHeliChaseBehavior(vehicleData, playerPed, vehNetID) -- Handles starting foot pursuits, or getting back into vehicles
+                    handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
                 end
 
                 for vehNetID, vehicleData in pairs(spawnedAirUnits) do
-                    handleAirChaseBehavior(vehicleData, playerPed, vehNetID) -- Handles starting foot pursuits, or getting back into vehicles
+                    handleAirChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
                 end
 
             end
         else
-
-            -- Player is no longer wanted we should set the officers to cruise and then delete them after a time
-            if wantedTimer == 0 then
-                -- Do this only once
-                handleEndWantedTasks()
+            playerHasShot = false
+            provokedUntil = 0
+            isSurrendering = false
+            -- Wanted level just cleared — delete all spawned units.
+            --
+            -- We run for 3 cycles (wantedTimer < 3) instead of just once so that any
+            -- in-flight server responses that arrive late still get cleaned up.  The
+            -- spawnGate flag (closed by handleEndWantedDelete) prevents those late
+            -- responses from re-populating the tracking tables between cleanup cycles.
+            if wantedTimer < 3 then
+                handleEndWantedDelete()
             end
+            wantedTimer = wantedTimer + 1
+        end
 
-            if wantedTimer == (Config.endWantedCleanupTimer / Config.scriptFrequencyModulus) then          
-                handleEndWantedDelete()       
-                wantedTimer = wantedTimer + 1    
-            else
-                wantedTimer = wantedTimer + 1
-            end
+        end) -- end pcall
+        if not ok then
+            print('^1[FENIX-ERROR] Main loop error: ' .. tostring(err) .. '^7')
         end
     end
 end)
@@ -2096,6 +3023,7 @@ CreateThread(function ()
         end
     end
 end)
+
 
 
 
@@ -2251,10 +3179,44 @@ end)
 
 -- -- _SET_WANTED_LEVEL_HIDDEN_EVASION_TIME
 -- SetWantedLevelHiddenEvasionTime(
--- 	player --[[ Player ]], 
--- 	wantedLevel --[[ integer ]], 
+-- 	player --[[ Player ]],
+-- 	wantedLevel --[[ integer ]],
 -- 	lossTime --[[ integer ]]
 -- )
+
+-- ============================================================================
+-- /fenix:diag - diagnostic dump of all key state variables
+-- ============================================================================
+RegisterCommand('fenix:diag', function()
+    local groundCount = 0
+    for _ in pairs(spawnedVehicles) do groundCount = groundCount + 1 end
+    local heliCount = 0
+    for _ in pairs(spawnedHeliUnits) do heliCount = heliCount + 1 end
+    local airCount = 0
+    for _ in pairs(spawnedAirUnits) do airCount = airCount + 1 end
+
+    local wl = GetPlayerWantedLevel(PlayerId())
+    local maxWl = GetMaxWantedLevel()
+
+    print('====== FENIX DIAG ======')
+    print(('  wantedLevel        = %d'):format(wl))
+    print(('  maxWantedLevel     = %d'):format(maxWl))
+    print(('  disableAIPolice    = %s'):format(tostring(disableAIPolice)))
+    print(('  pendingGroundSpawns= %d'):format(pendingGroundSpawns))
+    print(('  pendingHeliSpawns  = %d'):format(pendingHeliSpawns))
+    print(('  pendingAirSpawns   = %d'):format(pendingAirSpawns))
+    print(('  groundUnits        = %d'):format(groundCount))
+    print(('  heliUnits          = %d'):format(heliCount))
+    print(('  airUnits           = %d'):format(airCount))
+    print(('  playerHasShot      = %s'):format(tostring(playerHasShot)))
+    print(('  isSurrendering     = %s'):format(tostring(isSurrendering)))
+    print(('  isBeingArrested    = %s'):format(tostring(isBeingArrested)))
+    print(('  isPoliceOfficer    = %s'):format(tostring(isPlayerPoliceOfficer())))
+    print(('  PoliceWantedProt   = %s'):format(tostring(Config.PoliceWantedProtection)))
+    print(('  onlyWhenOffline    = %s'):format(tostring(Config.onlyWhenPlayerPoliceOffline)))
+    print(('  scriptFrequency    = %d'):format(Config.scriptFrequency))
+    print('========================')
+end, false)
 
 
 -- -- GIVE_WEAPON_TO_PED
@@ -2265,6 +3227,3 @@ end)
 -- 	isHidden --[[ boolean ]], 
 -- 	bForceInHand --[[ boolean ]]
 -- )
-
-
-
