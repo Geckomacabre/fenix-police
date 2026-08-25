@@ -212,55 +212,35 @@ end
 
 
 -- Function to get a safe spawn point on a road near the player.
--- Uses a true radial distance instead of independent X/Y offsets, so a
--- "60m" spawn is actually about 60m away instead of 85m+ diagonally.
+--
+-- The placement itself lives in client/roads.lua, which resolves the sample
+-- point to a real road and returns a lane centre with a legal heading rather
+-- than the raw vehicle node -- see that file's header for why the raw node is
+-- wrong. This function is the pursuit system's view of it: rear-arc bias so
+-- units do not appear in front of the player, and the configured spawn band.
+--
+-- Returns coords, heading -- or nil, which callers must handle. Failing to find
+-- a spot is a normal outcome now: it is what happens when the player is airside,
+-- offshore or somewhere with no real road in range, and spawning anyway is the
+-- behaviour being removed.
 local function getSafeSpawnPoint(playerCoords, minDistance, maxDistance, playerForward)
-    for _ = 1, 30 do
-        local angle
-        if playerForward then
-            -- Prefer behind/sides so units do not pop into view directly ahead.
-            local rearArcOffset = math.random(110, 250)
-            local playerHeading = GetHeadingFromVector_2d(playerForward.x, playerForward.y)
-            angle = math.rad(playerHeading + rearArcOffset)
-        else
-            angle = math.rad(math.random(0, 359))
-        end
+    local pos, heading = FenixRoads.findSpawnPoint(playerCoords, {
+        minDistance  = minDistance,
+        maxDistance  = maxDistance,
+        behindVector = playerForward,
+        towards      = playerCoords,
+    })
 
-        local dist = math.random(minDistance, maxDistance)
-        local spawnCoords = vector3(
-            playerCoords.x + math.sin(angle) * dist,
-            playerCoords.y + math.cos(angle) * dist,
-            playerCoords.z
-        )
+    if pos then return pos, heading end
 
-        local roadFound, roadCoords, roadHeading = GetClosestVehicleNodeWithHeading(spawnCoords.x, spawnCoords.y, spawnCoords.z, 0, 3.0, 0)
-        if not roadFound then
-            -- Try any drivable path as fallback.
-            roadFound, roadCoords, roadHeading = GetClosestVehicleNodeWithHeading(spawnCoords.x, spawnCoords.y, spawnCoords.z, 1, 3.0, 0)
-        end
-
-        if roadFound then
-            if playerForward then
-                local forwardX = playerForward.x
-                local forwardY = playerForward.y
-                local toSpawnX = roadCoords.x - playerCoords.x
-                local toSpawnY = roadCoords.y - playerCoords.y
-                local length = math.sqrt((toSpawnX * toSpawnX) + (toSpawnY * toSpawnY))
-
-                -- Reject anything that snapped into the player's front half.
-                if length > 0.0 then
-                    local dot = ((toSpawnX / length) * forwardX) + ((toSpawnY / length) * forwardY)
-                    if dot < 0.0 then
-                        return roadCoords, roadHeading
-                    end
-                end
-            else
-                return roadCoords, roadHeading
-            end
-        end
-    end
-
-    return nil
+    -- Widening the band once covers the common near-miss: the player is on a
+    -- long rural road where the only qualifying tarmac is just past maxDistance.
+    return FenixRoads.findSpawnPoint(playerCoords, {
+        minDistance  = minDistance,
+        maxDistance  = maxDistance * 1.75,
+        behindVector = playerForward,
+        towards      = playerCoords,
+    })
 end
 
 
@@ -750,7 +730,13 @@ local function spawnPoliceUnitNet(wantedLevel)
     -- Get a safe spawn point
     local spawnPoint, spawnHeading = getSafeSpawnPoint(playerCoords, Config.minPoliceSpawnDistance, Config.maxPoliceSpawnDistance, GetEntityForwardVector(playerPed))
     if not spawnPoint then
-        print('[FENIX-SPAWN] ERROR: no safe spawn point found!')
+        -- Not an error. There is genuinely nowhere legal to put a car when the
+        -- player is on a runway, out at sea or deep in the hills, and the whole
+        -- point of the road checks is that we skip the dispatch instead of
+        -- inventing a spot. The next spawn tick tries again.
+        if Config.isDebug or (Config.Roads and Config.Roads.debug) then
+            print('[FENIX-SPAWN] no legal road spawn point in range, skipping this unit')
+        end
         if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
         return
     end
@@ -937,7 +923,7 @@ local function checkOfficerProvocation(officer, playerPed)
 end
 
 RegisterNetEvent('fenix-police:spawnPoliceUnitClient')
-AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedModels, spawnPoint, spawnHeading)
+AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedModels, spawnPoint, spawnHeading, spawnTicket)
     -- Discard in-flight spawns that arrived after handleEndWantedDelete() cleared the gate.
     -- This prevents the race condition where a server response arrives after cleanup and
     -- re-populates spawnedVehicles with cops that will never be cleaned up.
@@ -1044,6 +1030,12 @@ AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedM
         if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
         return
     end
+
+    -- Tell the server what we actually created, quoting the ticket it issued
+    -- with the authorisation. Until this lands the server has no record of these
+    -- entities, and every later request to delete, unlock or re-arm one is
+    -- judged on model alone -- see server/guard.lua.
+    TriggerServerEvent('fenix-police:registerSpawnedUnit', spawnTicket, vehNetID, officers)
 
     spawnedVehicles[vehNetID] = { vehicle = vehicle, officers = {}, officerTasks = {}, officerEngage = engageFlags, clientOwned = true, loadout = vehicleInfo.loadout }
 
@@ -1282,6 +1274,63 @@ end
 
 
 
+-- Driving-style bitfields, named because "6" and "262571" appear in enough
+-- places to be worth reading.
+--   PURSUIT  4 (avoid vehicles) + 2 (stop before peds). No traffic-light bit, so
+--            units run reds, and no wrong-way bit, so they stay on their side.
+--   SEARCH   the normal-driving field: obey lights, keep to the road. A unit
+--            sweeping for a suspect it cannot see is not running reds to do it.
+local DRIVING_STYLE_PURSUIT = 6
+local DRIVING_STYLE_SEARCH  = 262571
+
+--- Random float in [range[1], range[2]], falling back to the given bounds when
+--- no range is configured.
+local function randRange(range, fallbackLo, fallbackHi)
+    local lo = (range and range[1]) or fallbackLo
+    local hi = (range and range[2]) or fallbackHi
+    if hi < lo then hi = lo end
+    return lo + (math.random() * (hi - lo))
+end
+
+--- Per-officer driving profile, rolled once and kept for that officer's lifetime.
+---
+--- Every driver used to be handed SetDriverAbility(1.0) and
+--- SetDriverAggressiveness(1.0), re-applied every cycle. Maximum skill and
+--- maximum aggression on everyone meant every unit in every pursuit drove
+--- identically: all ramming, all cornering the same, none of them ever making a
+--- mistake. Rolling a profile per officer -- the way rollEngage already rolls
+--- willingness to open fire -- makes the response a group of individuals, and
+--- gives the wanted level somewhere to show up in the driving rather than only
+--- in the shooting.
+local function officerDrivingProfile(vehicleData, pedNetID, wantedLevel, vehicle)
+    vehicleData.officerDriving = vehicleData.officerDriving or {}
+    local existing = vehicleData.officerDriving[pedNetID]
+    if existing then return existing end
+
+    local c = Config.Driving or {}
+
+    -- Commanded speed follows the car. A riot van and an interceptor were both
+    -- told 42 m/s; the van never reached it and spent the pursuit driving like
+    -- it was late for something.
+    local speed = c.speed or 42.0
+    if c.matchVehicleSpeed ~= false and vehicle and vehicle ~= 0 then
+        local top = GetVehicleEstimatedMaxSpeed(vehicle)
+        if top and top > 5.0 then
+            speed = math.min(speed, top * (c.speedFraction or 0.92))
+        end
+    end
+
+    local profile = {
+        ability     = randRange(levelValue(c.ability, wantedLevel, nil), 0.6, 1.0),
+        aggression  = randRange(levelValue(c.aggression, wantedLevel, nil), 0.4, 1.0),
+        speed       = speed * randRange(c.speedVariance, 0.9, 1.05),
+        searchSpeed = c.searchSpeed or 16.0,
+    }
+
+    vehicleData.officerDriving[pedNetID] = profile
+    return profile
+end
+
 -- [Upstate Mafia] Forward declarations: the surrender and traffic-stop handlers
 -- are defined ~1200 lines below, alongside the rest of the arrest system, but
 -- have to be reachable from the chase loop here.
@@ -1341,6 +1390,13 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
             local officerCoords = GetEntityCoords(officer)
             local distance = Vdist(playerCoords.x, playerCoords.y, playerCoords.z, officerCoords.x, officerCoords.y, officerCoords.z)
 
+            -- This officer is now a pair of eyes for the pursuit: they get an AI
+            -- blip with a view cone, and whether they can see the player feeds
+            -- the contact state every unit's tasking reads. Refreshing every
+            -- cycle is also how a deleted officer leaves the set -- pursuit.lua
+            -- prunes anything that stops being refreshed.
+            FenixPursuit.noteObserver(officer, 'ground')
+
             -- Re-apply the wanted-level combat profile every cycle: GTA's combat AI
             -- resets accuracy/attributes on task changes, and the wanted level (or
             -- provocation state) can have moved since this officer spawned.
@@ -1363,27 +1419,69 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
             end
 
             if IsPedInAnyVehicle(officer, false) then
+                -- Back in the car: forget how long they spent getting there.
+                if vehicleData.officerReboard then vehicleData.officerReboard[pedNetID] = nil end
+
                 if vehicleData.clientOwned then
                     local polVehicle = GetVehiclePedIsIn(officer, false)
                     -- Re-enforce stay-in-vehicle each cycle so combat AI doesn't override it
                     SetPedCombatAttributes(officer, 3, false)
                     if GetPedInVehicleSeat(polVehicle, -1) == officer then
-                        -- Driver: re-issue chase task every cycle
-                        if distance > 45.0 then
-                            TaskVehicleDriveToCoord(officer, polVehicle, playerCoords.x, playerCoords.y, playerCoords.z, 42.0, 1, GetEntityModel(polVehicle), 6, 2.0, true)
-                            SetDriveTaskDrivingStyle(officer, 6)
+                        -- Driver. WHERE they drive is now a question for
+                        -- client/pursuit.lua rather than a straight read of the
+                        -- player's coordinates: units get the player's real
+                        -- position only while somebody can actually see them.
+                        local profile = officerDrivingProfile(vehicleData, pedNetID, wantedLevel, polVehicle)
+                        local target, inContact = FenixPursuit.targetCoords(playerCoords)
+                        local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
+
+                        if FenixPursuit.isSearching() then
+                            -- Contact lost. TaskVehicleChase is not an option
+                            -- here: it tracks the player ENTITY, which is
+                            -- precisely the omniscience being removed. Drive to
+                            -- the last known position, then sweep out from it.
+                            --
+                            -- Issued on transition only. A wander task re-issued
+                            -- every second never gets anywhere, because each
+                            -- re-issue picks a fresh direction.
+                            local sweepRadius = math.max(25.0, FenixPursuit.searchRadius() * 0.5)
+                            if #(GetEntityCoords(polVehicle) - target) < sweepRadius then
+                                if taskStatus ~= 'Sweep' then
+                                    ClearPedTasks(officer)
+                                    TaskVehicleDriveWander(officer, polVehicle, profile.searchSpeed, DRIVING_STYLE_SEARCH)
+                                    spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'Sweep'
+                                end
+                            elseif taskStatus ~= 'ToLastKnown' then
+                                TaskVehicleDriveToCoord(officer, polVehicle, target.x, target.y, target.z, profile.speed, 1, GetEntityModel(polVehicle), DRIVING_STYLE_PURSUIT, 8.0, true)
+                                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'ToLastKnown'
+                            end
+                        elseif distance > 45.0 or not inContact then
+                            TaskVehicleDriveToCoord(officer, polVehicle, target.x, target.y, target.z, profile.speed, 1, GetEntityModel(polVehicle), DRIVING_STYLE_PURSUIT, 2.0, true)
+                            SetDriveTaskDrivingStyle(officer, DRIVING_STYLE_PURSUIT)
+                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
                         else
                             TaskVehicleChase(officer, playerPed)
                             SetTaskVehicleChaseBehaviorFlag(officer, 8, true)
+                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
                         end
-                        SetDriverAbility(officer, 1.0)
-                        SetDriverAggressiveness(officer, 1.0)
-                        spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+
+                        SetDriverAbility(officer, profile.ability)
+                        SetDriverAggressiveness(officer, profile.aggression)
+
+                        -- Lights stay on throughout; the wail is what stops. A
+                        -- unit that has lost the suspect wants to hear the
+                        -- street, not announce itself to it.
+                        SetVehicleHasMutedSirens(polVehicle, not FenixPursuit.sirenWanted())
                     else
                         -- Passenger: only issue tasks on transition (task caching prevents
                         -- re-issuing every second which causes GTA AI to reconsider exiting)
                         local taskStatus = spawnedVehicles[vehNetID].officerTasks[pedNetID]
-                        if officerHostile then
+                        -- Nobody shoots at a suspect nobody can see. Without the
+                        -- contact test a passenger keeps firing through walls at
+                        -- the player's live position all the way through a
+                        -- search, which gives the hiding place away and reads as
+                        -- the aimbot it is.
+                        if officerHostile and FenixPursuit.hasContact() then
                             if taskStatus ~= 'CombatPed' then
                                 TaskCombatPed(officer, playerPed, 0, 16)
                                 spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'CombatPed'
@@ -1425,7 +1523,35 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                                 end
                             end
                         end
-                        SetPedIntoVehicle(officer, polVehicle, seat)
+
+                        -- Walk back and get in, rather than teleporting. The
+                        -- original SetPedIntoVehicle ran every cycle, so an
+                        -- officer who got out -- or was dragged out -- snapped
+                        -- into the seat in front of you. TaskEnterVehicle plays
+                        -- the whole thing: turn, walk over, open the door.
+                        --
+                        -- The warp is kept as a last resort, because something
+                        -- genuinely does get officers stuck (ragdolled under the
+                        -- car, wedged in scenery, holding a task that will not
+                        -- clear) and a pursuit unit standing in the road forever
+                        -- is a worse outcome than one visible teleport.
+                        local driveCfg = Config.Driving or {}
+                        vehicleData.officerReboard = vehicleData.officerReboard or {}
+                        local waited = (vehicleData.officerReboard[pedNetID] or 0) + 1
+                        vehicleData.officerReboard[pedNetID] = waited
+
+                        local strandedDistance = #(GetEntityCoords(officer) - GetEntityCoords(polVehicle))
+
+                        if waited > (driveCfg.reboardPatience or 12)
+                            or strandedDistance > (driveCfg.reboardGiveUpDistance or 45.0) then
+                            SetPedIntoVehicle(officer, polVehicle, seat)
+                            vehicleData.officerReboard[pedNetID] = nil
+                        elseif spawnedVehicles[vehNetID].officerTasks[pedNetID] ~= 'Reboarding' then
+                            ClearPedTasks(officer)
+                            TaskEnterVehicle(officer, polVehicle, 20000, seat, 2.0, 1, 0)
+                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'Reboarding'
+                        end
+
                         -- Re-apply loadout in case weapons were lost during the exit
                         local loadoutKey = vehicleData.loadout
                         if loadoutKey and Config.loadouts[loadoutKey] then
@@ -1433,8 +1559,13 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                         end
                     end
                     TriggerServerEvent('fenix-police:unlockOfficerVehicle', vehNetID)
-                    -- Reset task state so the driver/passenger tasks are re-issued next cycle
-                    spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                    -- Only reset the marker if the re-board logic above didn't
+                    -- set one. Overwriting 'Reboarding' here would make its
+                    -- transition test true every cycle, re-issuing the enter
+                    -- task forever and leaving the officer walking on the spot.
+                    if spawnedVehicles[vehNetID].officerTasks[pedNetID] ~= 'Reboarding' then
+                        spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                    end
                 else
                     -- Car gone — fight on foot
                     TriggerServerEvent('deleteSpawnedPed', pedNetID)
@@ -1455,6 +1586,16 @@ end
 
 -- Function to handle heli chase
 local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
+    -- Air crews are the pursuit's best eyes and register as such: pursuit.lua
+    -- gives them a longer sight range and no forward cone, because a helicopter
+    -- carries a spotter whose entire job is looking down. A heli overhead is
+    -- what stops you breaking contact by turning a corner.
+    for pedNetID in pairs(vehicleData.officers or {}) do
+        local eyes = NetToPed(pedNetID)
+        if eyes and eyes ~= 0 and DoesEntityExist(eyes) then
+            FenixPursuit.noteObserver(eyes, 'heli')
+        end
+    end
     -- [Upstate Mafia] Hold fire on a surrendering player. Returning early leaves
     -- the heli on its existing task, so it keeps circling overhead rather than
     -- engaging — which is the shot you want during the arrest cinematic anyway.
@@ -1573,6 +1714,12 @@ end
 
 -- Function to handle air chase
 local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
+    for pedNetID in pairs(vehicleData.officers or {}) do
+        local eyes = NetToPed(pedNetID)
+        if eyes and eyes ~= 0 and DoesEntityExist(eyes) then
+            FenixPursuit.noteObserver(eyes, 'air')
+        end
+    end
     -- [Upstate Mafia] Hold fire on a surrendering player, as above.
     if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then return end
     if ticketWrapUp or isPullingOver or isBeingTicketed then return end
@@ -3305,6 +3452,10 @@ end)
 Citizen.CreateThread(function()
     local wantedTimer = 0
     local lastReportedWantedState = nil
+    -- Whether this pursuit has already been called in on the radio. Also doubles
+    -- as "a pursuit is running", which is what tells us to tear the contact
+    -- state down exactly once when it ends rather than every idle cycle.
+    local pursuitAnnounced = false
 
     -- Create a thread that continuously loops
     while true do
@@ -3398,6 +3549,16 @@ Citizen.CreateThread(function()
             else
 
                 wantedTimer = 0
+
+                -- Opening radio call, once per pursuit. Placed after the
+                -- police-protection and incapacitation checks above, so a cop
+                -- who is exempt and a player who is already down never generate
+                -- a call for a response that will not exist.
+                if not pursuitAnnounced then
+                    pursuitAnnounced = true
+                    FenixPursuit.callItIn(wantedLevel)
+                end
+
                 -- [Upstate Mafia] Don't reinforce a response that is standing
                 -- down. From the moment an officer is at your window the wanted
                 -- level is only still on to hold the delete sweep off, and a
@@ -3428,6 +3589,16 @@ Citizen.CreateThread(function()
             playerHasShot = false
             provokedUntil = 0
             isSurrendering = false
+
+            -- Pursuit over: drop the AI blips and forget the last known
+            -- position, so the next one starts from no knowledge instead of
+            -- inheriting where this one left off. Guarded so it runs once rather
+            -- than every cycle we spend not wanted.
+            if pursuitAnnounced then
+                pursuitAnnounced = false
+                FenixPursuit.reset()
+                FenixTactics.clearAll()
+            end
             -- [Upstate Mafia] Roadside stop state follows the same rule: no wanted
             -- level, nothing to stop for. ticketWrapUp is left alone — it is
             -- cleared by the stop that set it, immediately after clearing the

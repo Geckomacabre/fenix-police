@@ -184,10 +184,17 @@ end)
 -- Server event to delete a vehicle or officer entity from the network ID.
 RegisterServerEvent('deleteSpawnedEntity')
 AddEventHandler('deleteSpawnedEntity', function(entityNetID)
-    local entity = NetworkGetEntityFromNetworkId(entityNetID)
-    if DoesEntityExist(entity) then
-        DeleteEntity(entity)
-    end
+    local src = source
+    if not FenixGuard.allow(src, 'delete') then return end
+
+    -- Was: resolve the net ID and delete whatever came back. Network IDs are
+    -- small integers, so that was "delete any entity on the server, by counting".
+    -- See server/guard.lua.
+    local entity = FenixGuard.resolve(src, entityNetID, 'any', 'deleteSpawnedEntity')
+    if not entity then return end
+
+    FenixGuard.release(entityNetID)
+    DeleteEntity(entity)
 end)
 
 
@@ -196,8 +203,12 @@ end)
 -- Server event to delete a ped by network ID
 RegisterServerEvent('deleteSpawnedPed')
 AddEventHandler('deleteSpawnedPed', function(pedNetID)
-    local entity = NetworkGetEntityFromNetworkId(pedNetID)
-    if DoesEntityExist(entity) then
+    local src = source
+    if not FenixGuard.allow(src, 'delete') then return end
+
+    local entity = FenixGuard.resolve(src, pedNetID, 'ped', 'deleteSpawnedPed')
+    if entity then
+        FenixGuard.release(pedNetID)
         DeleteEntity(entity)
     end
     for vehNetID, unit in pairs(activeGroundUnits) do
@@ -223,26 +234,25 @@ end)
 RegisterServerEvent('deleteSpawnedVehicle')
 AddEventHandler('deleteSpawnedVehicle', function(vehNetID)
     local src = source
+    if not FenixGuard.allow(src, 'delete') then return end
+
     removeActiveGroundUnit(vehNetID)
-    local entity = NetworkGetEntityFromNetworkId(vehNetID)
-    if DoesEntityExist(entity) then
 
-        local vehicleHasPlayer = false
+    -- The occupied-vehicle check that used to live here is now layer 1 of
+    -- FenixGuard.resolve, and applies to every handler rather than just this
+    -- one. A refusal here therefore means either "a player is in it" (the
+    -- stolen-cruiser case this event already cared about) or one of the checks
+    -- it never had. The client is told the same thing in both cases, because
+    -- from its side the outcome is identical: this vehicle is not ours to
+    -- remove, stop tracking it.
+    local entity = FenixGuard.resolve(src, vehNetID, 'vehicle', 'deleteSpawnedVehicle')
+    if not entity then
+        TriggerClientEvent('deleteSpawnedVehicleResponseStolen', src, vehNetID)
+        return
+    end
 
-        for _, playerId in ipairs(GetPlayers()) do
-            local ped = GetPlayerPed(playerId)
-            if GetVehiclePedIsIn(ped, false) == entity then
-                vehicleHasPlayer = true
-                break
-            end
-        end
-        -- Only prevent deletion if the vehicle is occupied by a PLAYER. 
-        if vehicleHasPlayer then
-            TriggerClientEvent('deleteSpawnedVehicleResponseStolen', src, vehNetID)
-        else
-            DeleteEntity(entity)
-        end 
-    end   
+    FenixGuard.release(vehNetID)
+    DeleteEntity(entity)
 end)
 
 
@@ -507,6 +517,8 @@ end
 RegisterNetEvent('spawnPoliceUnitNet')
 AddEventHandler('spawnPoliceUnitNet', function(wantedLevel, playerCoords, regionCode, spawnPoint, spawnHeading)
     local src = source
+    if not FenixGuard.allow(src, 'spawn') then return end
+
     local seatIndex = -1
 
     -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
@@ -533,7 +545,14 @@ AddEventHandler('spawnPoliceUnitNet', function(wantedLevel, playerCoords, region
         -- server-side ped creation can leave valid police vehicles with no driver.
         -- The client can create the vehicle and its crew atomically, verify the
         -- driver seat, and start pursuit without an ownership race.
-        TriggerClientEvent('fenix-police:spawnPoliceUnitClient', src, selectedEntry.vehicle, selectedEntry.peds, spawnPoint, spawnHeading)
+        -- Ground units are created client-side, so the server cannot record
+        -- them at creation the way it does for helicopters and planes. Instead it
+        -- issues a single-use ticket with the authorisation; the client quotes it
+        -- back with the entities it made, and only then are those entities
+        -- recorded as belonging to this player. A client can therefore only ever
+        -- register entities the server just told it to create.
+        local ticket = FenixGuard.issueTicket(src)
+        TriggerClientEvent('fenix-police:spawnPoliceUnitClient', src, selectedEntry.vehicle, selectedEntry.peds, spawnPoint, spawnHeading, ticket)
         return
         -- Dead code below this point (old server-side vehicle/ped spawn loop,
         -- superseded by the client-side delegation above) was left in place
@@ -555,6 +574,8 @@ end)
 RegisterNetEvent('spawnPoliceHeliNet')
 AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnPoint, spawnTable)
     local src = source
+    if not FenixGuard.allow(src, 'spawn') then return end
+
     local seatIndex = -1
     
     -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
@@ -759,6 +780,16 @@ AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnP
         end
     end
 
+
+    -- Helicopters and planes are created here, on the server, so ownership is
+    -- recorded directly at the point of creation -- no ticket round-trip is
+    -- needed and there is nothing for a client to assert. This is what the
+    -- ground path has to reconstruct with FenixGuard.issueTicket.
+    if vehNetID then FenixGuard.claim(src, vehNetID, 'vehicle') end
+    for _, pedNetID in ipairs(officers or {}) do
+        FenixGuard.claim(src, pedNetID, 'ped')
+    end
+
     -- Return the netIDs to the client
     TriggerClientEvent('spawnPoliceHeliNetResponse', src, vehNetID, officers)
 end)
@@ -770,6 +801,8 @@ end)
 RegisterNetEvent('spawnPoliceAirNet')
 AddEventHandler('spawnPoliceAirNet', function(wantedLevel, playerCoords, spawnPoint, spawnTable)
     local src = source
+    if not FenixGuard.allow(src, 'spawn') then return end
+
     local seatIndex = -1
 
     -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
@@ -908,6 +941,16 @@ AddEventHandler('spawnPoliceAirNet', function(wantedLevel, playerCoords, spawnPo
 
     end
 
+
+    -- Helicopters and planes are created here, on the server, so ownership is
+    -- recorded directly at the point of creation -- no ticket round-trip is
+    -- needed and there is nothing for a client to assert. This is what the
+    -- ground path has to reconstruct with FenixGuard.issueTicket.
+    if vehNetID then FenixGuard.claim(src, vehNetID, 'vehicle') end
+    for _, pedNetID in ipairs(officers or {}) do
+        FenixGuard.claim(src, pedNetID, 'ped')
+    end
+
     -- Return the netIDs to the client
     TriggerClientEvent('spawnPoliceAirNetResponse', src, vehNetID, officers)
 end)
@@ -918,11 +961,16 @@ end)
 -- unlocked state here (triggered by the client each cycle during re-entry) fights that.
 RegisterNetEvent('fenix-police:unlockOfficerVehicle')
 AddEventHandler('fenix-police:unlockOfficerVehicle', function(vehNetID)
-    local vehicle = NetworkGetEntityFromNetworkId(vehNetID)
-    if vehicle and DoesEntityExist(vehicle) then
-        SetVehicleDoorsLocked(vehicle, 1)
-        Entity(vehicle).state:set('doorslockstate', 1, true)
-    end
+    local src = source
+    if not FenixGuard.allow(src, 'unlock') then return end
+
+    -- Was: unlock any vehicle on the server by network id. On a QBCore server
+    -- that is a theft primitive.
+    local vehicle = FenixGuard.resolve(src, vehNetID, 'vehicle', 'unlockOfficerVehicle')
+    if not vehicle then return end
+
+    SetVehicleDoorsLocked(vehicle, 1)
+    Entity(vehicle).state:set('doorslockstate', 1, true)
 end)
 
 
@@ -931,9 +979,17 @@ end)
 -- loadoutKey is optional — falls back to a pistol if not provided or not found.
 RegisterNetEvent('fenix-police:rearmOfficer')
 AddEventHandler('fenix-police:rearmOfficer', function(pedNetID, loadoutKey)
-    local officer = NetworkGetEntityFromNetworkId(pedNetID)
-    if not officer or not DoesEntityExist(officer) then return end
-    local loadout = loadoutKey and Config.loadouts[loadoutKey]
+    local src = source
+    if not FenixGuard.allow(src, 'rearm') then return end
+
+    -- Was: give a weapon to any ped by network id, a player's included. Free
+    -- guns for anybody who can send an event.
+    local officer = FenixGuard.resolve(src, pedNetID, 'ped', 'rearmOfficer')
+    if not officer then return end
+
+    -- The loadout key indexes a config table, so an unknown key has to fall
+    -- through to the default rather than being used as-is.
+    local loadout = (type(loadoutKey) == 'string') and Config.loadouts[loadoutKey] or nil
     if loadout then
         givePedLoadout(officer, loadout)
     else
@@ -1069,30 +1125,64 @@ end
 
 --Uesed to receive alerts from qbpolice trigger fuction
 --Needs to be added to QB-Police police:server:policeAlert
+-- Applies a wanted level to everyone standing near a reported crime.
+--
+-- [Upstate Mafia] Hardened. As written this took coordinates straight from the
+-- client and handed a wanted level to every player within 10m of them, so any
+-- client could pick a victim anywhere on the map and star them repeatedly -- a
+-- wanted-level cannon aimed by whoever sent the event. It also printed five
+-- lines to the server console per call, unconditionally, which is a console
+-- flood on its own.
+--
+-- The fix is to stop trusting the location: a player reporting a crime is
+-- reporting one they are AT. Coordinates further than
+-- Config.Security.maxAlertDistance from the caller are refused. Calls that did
+-- not come from a player (another resource triggering this server-side, where
+-- source is 0) skip that check, because there is no caller to measure against
+-- and server-side callers are already trusted.
 RegisterNetEvent('fenix:server:trigger')
-AddEventHandler('fenix:server:trigger', function(pdata,alertData)
-    
-    if alertData.coords then
-        local wantedlevel = GetWantedLevelFromCoords({x = alertData.coords.x, y = alertData.coords.y, z = alertData.coords.z })
-    
-        if wantedlevel then
-            print("Wanted Level for this location is " .. wantedlevel)
-        else
-            print("No wanted level for this locaiton found.. setting to 1")
-            wantedlevel = 0
-        end 
+AddEventHandler('fenix:server:trigger', function(pdata, alertData)
+    local src = source
 
-        print("getting nearbyplayers")
-        local nearbyPlayers = GetPlayersInRadius({ x = alertData.coords.x, y = alertData.coords.y, z = alertData.coords.z }, 10.0)
-        print("Nearby players: " .. json.encode(nearbyPlayers))   
+    if type(alertData) ~= 'table' or type(alertData.coords) ~= 'table' then return end
 
-        for _, playerId in ipairs(nearbyPlayers) do
-            print("Player nearby: " .. tostring(playerId))
-        
-            -- You can get more info about the player
-            local ped = GetPlayerPed(playerId)
-            print("Player " .. playerId .. " triggered police, applying wanted level: " .. wantedlevel)
-            TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
+    local x = tonumber(alertData.coords.x)
+    local y = tonumber(alertData.coords.y)
+    local z = tonumber(alertData.coords.z)
+    if not x or not y or not z then return end
+
+    if src and src ~= 0 then
+        if not FenixGuard.allow(src, 'alert') then return end
+
+        local maxDistance = (Config.Security or {}).maxAlertDistance or 100.0
+        if maxDistance > 0 then
+            local ped = GetPlayerPed(src)
+            if not ped or ped == 0 then return end
+
+            local here = GetEntityCoords(ped)
+            local dx, dy, dz = here.x - x, here.y - y, here.z - z
+            if math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) > maxDistance then
+                FenixGuard.refuse(src, 'crime alert',
+                    'reported coordinates are not where the caller is')
+                return
+            end
         end
-    end  
+    end
+
+    local coords = { x = x, y = y, z = z }
+    local wantedlevel = GetWantedLevelFromCoords(coords) or 0
+
+    -- Was unconditional. Five console lines per call is a flood vector by
+    -- itself, and none of it is useful outside debugging.
+    if Config.isDebug then
+        print(('[fenix-police] crime alert at %.1f, %.1f, %.1f -> wanted %d')
+            :format(x, y, z, wantedlevel))
+    end
+
+    for _, playerId in ipairs(GetPlayersInRadius(coords, 10.0)) do
+        if Config.isDebug then
+            print(('[fenix-police]   applying wanted %d to %s'):format(wantedlevel, tostring(playerId)))
+        end
+        TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
+    end
 end)

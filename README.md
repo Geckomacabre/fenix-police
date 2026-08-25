@@ -115,6 +115,119 @@ carriageway because they drive off immediately.
 `radarFallbackToRoadNodes` now defaults **off** — it invented traps at random
 nodes and was the single largest source of "there are cops everywhere".
 
+### Lane-correct placement and airside no-go zones
+
+Both spawners now go through `client/roads.lua`, which resolves a candidate
+point to a real road with `GET_CLOSEST_ROAD` and reads the lane count in each
+direction — the one thing the vehicle-node natives don't report, and the reason
+units used to appear facing oncoming traffic. A vehicle node is the *centre line*
+of a road, not a lane, and the heading it reports is only one of the road's two
+legal directions of travel. Placing a car on that data straddles the paint and
+points the wrong way roughly half the time.
+
+With the lane counts in hand, placement computes an actual lane centre and picks
+a direction the road permits, so a one-way street can no longer be entered
+backwards no matter where the player is. Facing the player is scored as a
+preference, never enforced — enforcing it is what produced the wrong-way spawns
+in the first place.
+
+`Config.Roads.exclusionZones` keeps units off LSIA and Fort Zancudo airside. It
+does two separate jobs: candidate points inside a zone are rejected, and
+`SET_ROADS_IN_AREA` switches the AI road network off there, which is what stops a
+pursuit that started on a normal street from routing down the active runway.
+Spawn rejection alone cannot do that. Backing it up everywhere else, a candidate
+on a surface the game gives no street name to — runway, apron, car park aisle,
+dirt scrape — is rejected outright, which needs no coordinates to maintain.
+
+The shipped zones are hand-measured boxes. Draw them with `/fenixroads` and check
+a spot with `/fenixroads here` before trusting them, and trim them in
+`config.local/` so an update doesn't overwrite your work.
+
+### Server-side entity security
+
+Every mutating net event took a network ID straight off the wire and acted on
+whatever it resolved to — delete any entity, unlock any vehicle, arm any ped
+including a player's. Network IDs are small integers, so none of that needed
+guessing, only counting. `server/guard.lua` gates all of them behind three
+layers:
+
+1. **A player's ped, or a vehicle a player is in, is always refused.** Absolute
+   and not configurable. It's also what keeps a stolen cruiser safe: the model
+   says "police", so layer 2 would wave it through.
+2. **The model must be one this resource is configured to spawn**, built at boot
+   from `Config.vehiclesByRegion` and the heli/plane tables. This is the layer
+   doing the real work — a player's Sultan is not in the set — and it depends on
+   nothing the client says.
+3. **Entities are recorded against the player they were spawned for.**
+   Helicopters and planes are created server-side so ownership is recorded
+   directly; ground units are created client-side, so the server issues a
+   single-use ticket with each authorisation and accepts one registration
+   quoting it back.
+
+Plus per-event rate limits, which these events had none of.
+
+`Config.Security.strictOwnership` ships **off**: with layers 1 and 2 in place the
+worst an unowned entity permits is one player interfering with another's units,
+and turning it on before you've confirmed registration works converts every gap
+into a police car that never despawns. Run `fenixguard` in the server console
+during a pursuit — once it shows entities being owned, turn it on.
+
+### The police only know what they can see
+
+The chase loop re-tasked every driver to the player's live coordinates once a
+second, so officers were omniscient: you could be in a garage, behind a hill or
+three streets away in an alley and every unit still drove straight at you.
+`Config.evasionTimes` decided when the *stars* came off, but nothing decided what
+the units knew, so hiding was a countdown you sat through rather than a thing you
+did.
+
+`client/pursuit.lua` adds the missing state machine — **contact**, **searching**,
+**re-acquired** — built from line of sight, a facing cone, and a grace period so
+a pursuit doesn't drop you behind the first parked bus. Lose them and units drive
+to your *last known position*, then sweep outward from it with a radius that
+widens the longer you stay hidden. Firing a weapon inside earshot hands your
+position straight back.
+
+Everything the player reads a pursuit through hangs off that one state, because
+all of it is really the same question:
+
+- **AI blips**, with the view cone that *is* what each officer can see. One per
+  vehicle, so a four-unit response doesn't smear the minimap.
+- **Sirens** go quiet on a search — lights stay on. A unit that has lost the
+  suspect wants to hear the street, not announce itself to it.
+- **Radio traffic** describing your vehicle, its colour, the street and your
+  direction of travel, built from real game data. Four or five calls per pursuit,
+  not a running commentary. Route it into your own scanner UI with
+  `Config.Pursuit.dispatchHandler`.
+- **Passengers hold fire** at a suspect nobody can see, instead of shooting
+  through walls at your live position.
+
+### Roadblocks and spike strips
+
+Dispatch service 8 is force-disabled in this resource and nothing replaced it, so
+the entire response at every wanted level was "more cars behind you" — a pursuit
+with no way to get in front of the suspect has only one shape.
+
+`client/tactics.lua` places both ahead of you along your actual route, never in
+your view, using the lane counts and carriageway width `client/roads.lua` already
+computes: a block that spans a road has to know where the road ends, and a strip
+laid across the wrong side of a dual carriageway is scenery. Only deployed
+against a suspect the police can currently see — getting a unit in front of you
+means knowing where you are going.
+
+### Every officer drives differently
+
+`SetDriverAbility(1.0)` and `SetDriverAggressiveness(1.0)` were re-applied to
+every driver every cycle, so every unit in every pursuit drove identically: all
+ramming, all cornering the same, none of them ever making a mistake. Profiles are
+now rolled per officer and kept for their lifetime, scaled by wanted level the
+way `Config.Combat` already scales shooting. Commanded speed is capped to what
+the car can actually do — a riot van and an interceptor were both told 42 m/s.
+
+Officers who end up on foot beside their car now **walk back and get in** rather
+than teleporting into the seat in front of you, with the warp kept only as a
+last resort for genuinely stuck peds.
+
 ### Officer budget
 
 `maxScenes` alone is a poor cap: two four-officer foot posts is eight officers
@@ -451,6 +564,9 @@ Precedence when judging a driver:
 | `/ambientpolice [on\|off]` | Toggle ambient policing, and list live scenes with distances, arm state, and the speed limit applying where you stand. **The bare form toggles** — pass `on` or `off` explicitly to be sure. |
 | `/ambientpolicereload` | Re-read `em_toolkit` points and clear existing scenes |
 | `/radartrace` | Per-second trace of the enforcement decision: tick state, speed vs allowed, and per-scene distance / reach / visibility |
+| `/fenixroads` | Draw every no-go zone in `Config.Roads.exclusionZones` as a wireframe box. **The zones are hand-measured — check them this way before trusting them.** |
+| `/fenixroads here` | Report what the road system makes of the ground you are standing on: zone, street name, whether it is excluded, whether a unit could spawn there, and the lane count in each direction |
+| `/fenixtactics` | List live roadblocks and spike strips with distances and entity counts |
 
 ---
 

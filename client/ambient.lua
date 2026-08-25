@@ -144,15 +144,6 @@ local function pickSceneKind()
     end
 end
 
---- Slide a point off the driving line onto the road's right-hand shoulder. GTA
---- heading h has forward = (-sin h, cos h), so the right-hand side is (cos h, sin h).
---- Static roadside scenes use this so they stop sitting in a live lane.
-local function shoulder(pos, heading, distance)
-    local off = distance or cfg().shoulderOffset or 4.5
-    local rad = math.rad(heading or 0.0)
-    return vector3(pos.x + math.cos(rad) * off, pos.y + math.sin(rad) * off, pos.z)
-end
-
 --- Distance from `pos` to the nearest live scene, or math.huge when there are
 --- none. Walks only the scenes this script owns (never more than maxScenes), so
 --- it costs nothing next to a world scan.
@@ -168,78 +159,44 @@ local function distToNearestScene(pos)
     return best
 end
 
---- Rate a candidate spawn position. Returns a score (higher is better), or nil
---- to reject the spot outright. This is what stops scenes appearing in the
---- middle of a junction, on top of traffic, or three-deep on one street.
-local function scorePosition(pos, playerCoords, opts)
-    local c = cfg()
-
-    local d = #(pos - playerCoords)
-    if d < c.minSpawnDistance or d > c.maxSpawnDistance then return nil end
-
-    -- Anti-clump: keep ambient scenes spread across the map, not stacked.
-    if distToNearestScene(pos) < (c.minSceneSpacing or 90.0) then return nil end
-
-    -- Traffic, parked cars or pedestrians already hold this spot. Spawning here
-    -- is what wedges a cruiser into a moving lane.
-    if IsPositionOccupied(pos.x, pos.y, pos.z, 3.5, false, true, true, false, false, 0, false) then
-        return nil
-    end
-
-    -- Nothing should pop into existence while the player is looking at it.
-    if opts.avoidVisible and c.avoidVisibleSpawns ~= false and IsSphereVisible(pos.x, pos.y, pos.z, 4.0) then
-        return nil
-    end
-
-    -- Mid-band is the sweet spot: near enough to be noticed, far enough that the
-    -- player drives up on it rather than watching it arrive.
-    local mid = (c.minSpawnDistance + c.maxSpawnDistance) * 0.5
-    local span = math.max(1.0, (c.maxSpawnDistance - c.minSpawnDistance) * 0.5)
-    local score = 100.0 - (math.abs(d - mid) / span) * 40.0
-
-    local okProps, density, flags = GetVehicleNodeProperties(pos.x, pos.y, pos.z)
-    if okProps then
-        -- Density 0-1 is a dirt track or a dead end — that is where "spawned in
-        -- the middle of nowhere" comes from.
-        if density <= 1 then return nil end
-        score = score + density * 2.0
-        -- Junction nodes: a parked scene here blocks the box for real traffic.
-        if flags and (flags & 8) ~= 0 then score = score - 25.0 end
-    end
-
-    return score
-end
-
---- Best road node between minSpawnDistance and maxSpawnDistance, chosen by
---- sampling several and scoring them rather than taking the first that fits.
---- Returns coords, heading — or nil if nothing usable is nearby (deep water,
---- wilderness, inside an interior, or everything nearby already occupied).
---- @param opts table { shoulder? = push onto the verge, avoidVisible? = never spawn on screen }
+--- Best placement between minSpawnDistance and maxSpawnDistance.
+---
+--- The road maths -- resolving a sample point to a real road, working out where
+--- its lanes actually are, and picking a direction that road legally permits --
+--- all lives in client/roads.lua, shared with the pursuit spawner so the two
+--- systems cannot drift apart on what counts as a valid spot. What stays here is
+--- the part that is specific to ambient scenes: keeping them spread out, and
+--- never letting one appear on screen.
+---
+--- Returns coords, heading -- or nil if nothing usable is nearby (deep water,
+--- wilderness, airside, or everything in range already occupied).
+--- @param opts table { shoulder? = park on the verge, avoidVisible? = never spawn on screen }
 local function bestRoadNode(playerCoords, opts)
     opts = opts or {}
     local c = cfg()
-    local bestPos, bestHeading, bestScore
 
-    for _ = 1, (c.nodeSamples or 10) do
-        local angle = math.random() * math.pi * 2
-        local dist = c.minSpawnDistance + math.random() * (c.maxSpawnDistance - c.minSpawnDistance)
-        local tx = playerCoords.x + math.cos(angle) * dist
-        local ty = playerCoords.y + math.sin(angle) * dist
+    return FenixRoads.findSpawnPoint(playerCoords, {
+        minDistance  = c.minSpawnDistance,
+        maxDistance  = c.maxSpawnDistance,
+        attempts     = c.nodeSamples or 10,
+        shoulder     = opts.shoulder,
+        avoidVisible = opts.avoidVisible and c.avoidVisibleSpawns ~= false,
+        towards      = playerCoords,
 
-        local found, pos, heading = GetClosestVehicleNodeWithHeading(tx, ty, playerCoords.z, 1, 3.0, 0)
-        if found and pos then
-            heading = heading or 0.0
-            local candidate = vector3(pos.x, pos.y, pos.z)
-            if opts.shoulder then candidate = shoulder(candidate, heading) end
+        -- Anti-clump: keep ambient scenes spread across the map, not stacked
+        -- three-deep on one street.
+        reject = function(pos)
+            return distToNearestScene(pos) < (c.minSceneSpacing or 90.0)
+        end,
 
-            local score = scorePosition(candidate, playerCoords, opts)
-            if score and (not bestScore or score > bestScore) then
-                bestPos, bestHeading, bestScore = candidate, heading, score
-            end
-        end
-    end
-
-    return bestPos, bestHeading
+        -- Junction nodes are legal but a parked scene on one blocks the box for
+        -- real traffic, so they lose to anything else in range.
+        score = function(pos)
+            local ok, _, flags = GetVehicleNodeProperties(pos.x, pos.y, pos.z)
+            if ok and flags and (flags & 8) ~= 0 then return -25.0 end
+            return 0.0
+        end,
+    })
 end
 
 --- Fixed points of `kind` (shipped list + toolkit list) that are in range and
@@ -429,6 +386,10 @@ local function spawnRadar(playerCoords)
     local anchor, roadHeading, pointKey
     local exact = false
     local pointVehicle, pointSpeed
+    -- Which way the cruiser ends up pointing, and — once a snap has run — where
+    -- it sits. nil until something sets it, so the `exact` and unsnapped paths
+    -- below can tell that no road placement happened.
+    local facing
 
     if #candidates > 0 then
         local chosen = candidates[math.random(#candidates)]
@@ -442,20 +403,39 @@ local function spawnRadar(playerCoords)
         pointVehicle, pointSpeed = p.vehicle, p.speed
 
         if cfg().snapToRoad and not exact then
-            local found, pos, nodeHeading = GetClosestVehicleNodeWithHeading(p.x, p.y, p.z, 1, 3.0, 0)
+            -- Snap onto the verge the car will actually face down. `p.h` is the
+            -- road's direction; a trap watches the traffic coming the other way,
+            -- so the placement is resolved against h+180 and the shoulder picked
+            -- for THAT direction. Doing it the other way round — snap to h, then
+            -- flip the car — is what parks a cruiser facing oncoming traffic
+            -- from the far verge, which is the wrong side of the road.
+            --
+            -- On a one-way street the opposite direction has no lanes, so the
+            -- snap falls back to the legal direction and the trap simply faces
+            -- with the flow. That is correct: there is no oncoming traffic.
             local snapRadius = (FenixAmbientPoints and FenixAmbientPoints.snapRadius) or 120.0
-            if found and pos and #(vector3(pos.x, pos.y, pos.z) - anchor) <= snapRadius then
-                anchor = vector3(pos.x, pos.y, pos.z)
-                roadHeading = nodeHeading or roadHeading
+            local pos, snapHeading, snapped = FenixRoads.snapToLane(
+                anchor, (roadHeading + 180.0) % 360.0, {
+                    shoulder = true,
+                    maxSnap  = snapRadius,
+                })
+            if snapped then
+                anchor, facing = pos, snapHeading
             end
         end
     elseif cfg().radarFallbackToRoadNodes then
-        -- No seed point in range: fall back to a scored road node so radar traps
-        -- still appear in areas the shipped list doesn't cover. Off by default —
-        -- with authored points this is the main source of "cops everywhere".
-        local pos, nodeHeading = bestRoadNode(playerCoords, { shoulder = true, avoidVisible = true })
+        -- No seed point in range: fall back to a scored road placement so radar
+        -- traps still appear in areas the shipped list doesn't cover. Off by
+        -- default — with authored points this is the main source of "cops
+        -- everywhere".
+        --
+        -- bestRoadNode aims the direction of travel at the player, so the verge
+        -- it returns is the one a car facing that direction parks on, and the
+        -- heading already looks up the road at anyone driving towards the trap.
+        -- No flip: flipping here would put the trap on the far verge.
+        local pos, travelHeading = bestRoadNode(playerCoords, { shoulder = true, avoidVisible = true })
         if not pos then return false end
-        anchor, roadHeading = pos, nodeHeading or 0.0
+        anchor, facing = pos, travelHeading or 0.0
     else
         return false
     end
@@ -469,13 +449,22 @@ local function spawnRadar(playerCoords)
         -- capture already IS where the car goes and which way it faces. Any
         -- offset or flip here would move it off the chosen spot.
         x, y, heading = anchor.x, anchor.y, roadHeading
+    elseif facing then
+        -- A road placement ran: the anchor is already a verge position and
+        -- `facing` is already the direction the car looks. Offsetting again here
+        -- is what used to push traps two shoulder-widths into the scenery.
+        x, y, heading = anchor.x, anchor.y, facing
     else
-        -- GTA heading h has forward = (-sin h, cos h), so the road's right-hand
-        -- side is (cos h, sin h). Slide onto that shoulder, then face back down
-        -- the road at oncoming traffic — the classic speed-trap read.
+        -- Approximate authored point with snapToRoad off. No road data to work
+        -- from, so fall back to the old hand-rolled offset: GTA heading h has
+        -- forward = (-sin h, cos h), so the road's right-hand side is
+        -- (cos h, sin h). Slide onto that verge and face back down the road at
+        -- oncoming traffic — the classic speed-trap read.
+        local roads = Config.Roads or {}
+        local off = (roads.laneWidth or 3.5) + (roads.shoulderOffset or 1.5)
         local rad = math.rad(roadHeading)
-        x = anchor.x + math.cos(rad) * 4.5
-        y = anchor.y + math.sin(rad) * 4.5
+        x = anchor.x + math.cos(rad) * off
+        y = anchor.y + math.sin(rad) * off
         heading = (roadHeading + 180.0) % 360.0
     end
 

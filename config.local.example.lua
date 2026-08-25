@@ -90,3 +90,97 @@ Config.PoliceJobsToCheck = {
 FenixAmbientPoints.radar = FenixAmbientPoints.radar or {}
 table.insert(FenixAmbientPoints.radar, { x = 0.0, y = 0.0, z = 0.0, h = 0.0 })
 ]]
+
+-- No-go areas. The shipped boxes over LSIA and Fort Zancudo are hand-measured,
+-- so this is the one setting you should expect to adjust: draw them in-world
+-- with /fenixroads, stand somewhere and run /fenixroads here, then trim.
+--
+-- Assigning the whole list replaces it, which is what you want if the shipped
+-- boxes are wrong for your map. To keep them and add one, table.insert instead.
+--[[
+Config.Roads.exclusionZones = {
+    {
+        name = 'LSIA airside',
+        min  = vector3(-1800.0, -3400.0, 0.0),
+        max  = vector3(-950.0,  -2830.0, 0.0),
+        zMin = -20.0,
+        zMax = 45.0,
+    },
+    {
+        name = 'my custom no-go area',
+        -- Boxes are `min`/`max`; cylinders are `center`/`radius`; polygons are
+        -- `poly` = a list of vector3 (only x and y are read, so you can paste
+        -- coordinates straight out of a capture).
+        center = vector3(0.0, 0.0, 0.0),
+        radius = 150.0,
+        zMin   = -20.0,
+        zMax   = 60.0,
+        -- Reject spawns here but leave AI pathing alone:
+        -- disableAiRoads = false,
+    },
+}
+]]
+
+-- Which lane a responding unit appears in, and how far a parked scene sits past
+-- the edge of the carriageway.
+--[[
+Config.Roads.lanePreference = 'random'   -- 'outer' (default) | 'inner' | 'random'
+Config.Roads.shoulderOffset = 1.5
+]]
+
+-- How much the police can see, and how forgiving losing them is. The two numbers
+-- worth touching first: sightRange (how far a ground officer sees) and
+-- loseContactMs (how long line of sight has to stay broken before they give up
+-- on your live position). Raising loseContactMs makes them dogged; lowering it
+-- makes corners matter more.
+--[[
+Config.Pursuit.sightRange     = 90.0
+Config.Pursuit.loseContactMs  = 4000
+Config.Pursuit.blipColour     = 3        -- blue rather than the default hostile red
+Config.Pursuit.blipDriversOnly = true
+]]
+
+-- Send radio traffic somewhere other than QBCore notifications. Receives the
+-- finished string.
+--[[
+Config.Pursuit.dispatchHandler = function(text)
+    exports['my_scanner']:Say(text)
+end
+]]
+
+-- Roadblocks and spike strips. Turn either off by pushing its wanted level above
+-- 5 rather than disabling the whole system.
+--[[
+Config.Tactics.roadblockFromLevel = 3
+Config.Tactics.spikeFromLevel     = 6    -- effectively off
+Config.Tactics.roadblockVehicles  = { 'your_addon_cruiser' }
+]]
+
+-- How police drive. Ranges are { min, max } per wanted level and rolled once per
+-- officer.
+--[[
+Config.Driving.aggression = {
+    [1] = { 0.15, 0.35 },   -- calmer low-level pursuits
+    [2] = { 0.25, 0.50 },
+    [3] = { 0.45, 0.70 },
+    [4] = { 0.70, 0.95 },
+    [5] = { 0.85, 1.00 },
+}
+]]
+
+-- Server-side entity security. The one setting worth revisiting: turn
+-- strictOwnership on once `fenixguard` in the server console shows entities
+-- being owned during a pursuit. Before that it risks police cars that never
+-- despawn.
+--[[
+Config.Security.strictOwnership = true
+Config.Security.logRefusals     = true
+]]
+
+-- Allowlist models that live outside Config.vehiclesByRegion and the heli/plane
+-- tables. Only needed if something else spawns police entities through this
+-- resource's server events.
+--[[
+Config.Security.extraVehicles = { 'your_addon_cruiser' }
+Config.Security.extraPeds     = { 'your_addon_cop_ped' }
+]]

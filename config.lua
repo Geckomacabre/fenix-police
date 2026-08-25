@@ -302,7 +302,11 @@ Config.Ambient = {
     -- rather than the first that happens to be in range, which is what keeps
     -- scenes off junctions, out of traffic and away from dead-end dirt tracks.
     -- Each sample is one cheap native call; 10 is plenty.
-    nodeSamples = 10,
+    -- Raised from 10 when road placement landed: candidates now have to clear
+    -- lane geometry, the no-go zones and a reachability test, so more of them
+    -- are rejected. Each sample is a handful of natives run once per spawn tick,
+    -- not per frame.
+    nodeSamples = 20,
 
     -- Minimum distance between two ambient scenes. Stops them clumping into a
     -- police convention on one street.
@@ -315,9 +319,11 @@ Config.Ambient = {
     maxNearbyCops = 6,
     nearbyRadius  = 260.0,
 
-    -- Static roadside scenes (radar traps, traffic stops) are pushed this far
-    -- onto the verge so they stop blocking a live lane. Moving scenes (patrol,
-    -- pursuit) still spawn on the carriageway — they drive off immediately.
+    -- Superseded by Config.Roads.shoulderOffset, below. That one is measured
+    -- from the edge of the carriageway rather than from the centre line, which
+    -- is the only way to get a verge that works on both a two-lane street and a
+    -- six-lane boulevard. Left here so an existing config.local/ override is
+    -- obvious rather than silently ignored — it is not read any more.
     shoulderOffset = 4.5,
 
     -- Never spawn a procedural scene the player can currently see, so nothing
@@ -740,6 +746,456 @@ Config.spawnGroundUnitsInHeli = true
 
 -- This controls whether ground units will spawn if the player is in a plane, already spawned units aren't removed.
 Config.spawnGroundUnitsInPlane = true
+
+
+
+
+-- SERVER-SIDE ENTITY SECURITY --
+--
+-- Read by server/guard.lua. Every mutating net event in server/server.lua used
+-- to take a network ID straight off the wire and act on whatever it resolved to:
+-- delete any entity, unlock any vehicle, arm any ped. Network IDs are small
+-- integers, so none of that needed guessing, only counting.
+--
+-- Three layers, and only the third is configurable:
+--   1. A player's ped, or a vehicle a player is sitting in, is always refused.
+--   2. The entity's model must be one this resource is configured to spawn.
+--      This is the layer that closes the serious hole, and it needs nothing
+--      from the client to be true.
+--   3. Entities are recorded against the player they were spawned for.
+
+Config.Security = {
+    -- Log every refusal to the server console. Worth leaving on: the first thing
+    -- you want when somebody starts probing net IDs is to know it is happening.
+    logRefusals = true,
+
+    -- Extra detail: allowlist size at boot, unit registrations as they land.
+    debug = false,
+
+    -- Require an ownership record before acting on an entity.
+    --
+    -- Left OFF by default. With layers 1 and 2 in place, the worst an unowned
+    -- entity permits is one player interfering with another player's police
+    -- units -- griefing, not theft -- and turning this on before you have
+    -- confirmed registration works on your server converts every gap into a
+    -- police car that never gets cleaned up. Turn it on once `fenixguard` in the
+    -- server console shows entities being owned during a pursuit.
+    strictOwnership = false,
+
+    -- Seconds a spawn ticket stays valid. A ticket is issued when the server
+    -- authorises a ground spawn and consumed when the client reports back what
+    -- it built; this only has to cover model loading on a slow client.
+    ticketLifetime = 30,
+
+    -- Ceiling on how many entities one player can have recorded at once. The
+    -- backstop against a client that passes every other check and simply asks
+    -- for units forever. Config.maxUnitsPerLevel tops out at 10 vehicles with
+    -- crews, so this has a lot of headroom before it can bite legitimately.
+    maxOwnedEntities = 60,
+
+    -- Requests per player per minute, per event group. These events are not
+    -- called at remotely similar rates: `spawn` is a deliberate request made a
+    -- handful of times a minute, `unlock` and `rearm` fire from the chase loop
+    -- once per officer per cycle, and `delete` arrives in bursts of thirty when
+    -- a pursuit ends and the cleanup sweep runs five passes over ten units and
+    -- their crews.
+    --
+    -- Too tight is worse than absent: a refused delete is a police car left in
+    -- the world forever. These exist to stop a loop, not to meter normal play,
+    -- so they sit far above anything legitimate. Set one to 0 to disable it.
+    rateLimits = {
+        spawn    = 60,
+        register = 60,
+        delete   = 600,
+        unlock   = 600,
+        rearm    = 600,
+        alert    = 30,
+    },
+
+    -- Fallback for any event group not named above.
+    maxRequestsPerMinute = 300,
+
+    -- `fenix:server:trigger` applies a wanted level to everyone standing near a
+    -- reported crime, and took the crime's coordinates from the client. Any
+    -- client could therefore pick a victim anywhere on the map and star them --
+    -- a wanted-level cannon aimed by whoever sent the event.
+    --
+    -- A player reporting a crime is reporting one they are AT, so coordinates
+    -- further than this from the caller are refused. Raise it if a resource of
+    -- yours legitimately reports crimes from a distance; 0 disables the check.
+    -- Calls from another resource server-side skip it either way, since there is
+    -- no caller to measure against.
+    maxAlertDistance = 100.0,
+
+    -- Models to allowlist that the config tables above don't mention. You only
+    -- need these if something outside Config.vehiclesByRegion / Config.polHelis
+    -- / Config.milHelis / Config.milPlanes spawns police entities through this
+    -- resource's server events.
+    extraVehicles = {},
+    extraPeds     = {},
+}
+
+
+-- PURSUIT PERCEPTION --
+--
+-- Read by client/pursuit.lua. See that file's header for the reasoning; the
+-- short version is that the chase loop used to re-task every unit to the
+-- player's live coordinates once a second, so officers were omniscient and
+-- hiding was a countdown rather than a thing you did.
+
+Config.Pursuit = {
+    enabled = true,
+
+    -- Prints contact transitions and every radio call.
+    debug = false,
+
+    -- How often the "can anybody see the player" pass runs, in ms. The main
+    -- pursuit loop is 1000ms, which is far too coarse for this: whether a wall
+    -- is between you and a cruiser changes at the speed of driving, not at the
+    -- speed of task assignment.
+    contactInterval = 250,
+
+    -- How far a ground officer can see, and how wide their cone of attention is
+    -- in degrees. 360 disables the cone entirely. Anything within 8m is seen
+    -- regardless of facing -- an officer does not lose the car touching their
+    -- bumper because the driver glanced sideways.
+    sightRange = 90.0,
+    sightFov   = 160.0,
+
+    -- Air crews. No cone: a helicopter carries a spotter whose entire job is
+    -- looking down, and giving them a forward arc makes them useless at the one
+    -- thing they exist for. This is what stops you breaking contact by turning a
+    -- corner while a heli is overhead, and it is most of what justifies one.
+    airSightRange = 250.0,
+
+    -- How long line of sight has to stay broken before contact is genuinely
+    -- lost, in ms. Sight breaks constantly in city driving -- every corner,
+    -- every truck, every overpass -- so without a grace period the pursuit would
+    -- drop you at the first parked bus.
+    loseContactMs = 4000,
+
+    -- Firing a weapon inside this range of any unit hands your position back
+    -- regardless of cover. Realistic, and the reason shooting your way out of a
+    -- hiding place should not work.
+    gunfireReveals = true,
+    gunfireRange   = 120.0,
+
+    -- The search, once contact is lost. Units drive to the last known position,
+    -- then sweep outward from it; the radius grows the longer you stay hidden,
+    -- so a search starts tight on the sighting and loosens into the surrounding
+    -- blocks rather than being a fixed circle.
+    searchRadiusStart  = 40.0,
+    searchRadiusGrowth = 4.0,    -- metres per second lost
+    searchRadiusMax    = 180.0,
+
+    -- Mute sirens (not lights) while searching. A unit that has lost the suspect
+    -- wants to hear the street, not announce itself to it.
+    quietSearch = true,
+
+    -- An officer who stops being refreshed by the chase loop for this long is
+    -- dropped from the perception set. This is how a deleted officer removes
+    -- itself without client.lua having to say so.
+    observerTimeout = 4000,
+
+    -- AI blips on responding officers, with the view cone that shows what each
+    -- one can see. The cone is not decoration: it is the same number sightRange
+    -- and sightFov feed, so a player watching the cones is reading the actual
+    -- contact model.
+    blips      = true,
+    blipCones  = true,
+
+    -- Blip colour index. Left nil, officers get the game's default AI blip,
+    -- which is the hostile red GTA uses for everything it tracks this way. Set a
+    -- colour index (3 is blue) if you would rather they read as police than as
+    -- enemies.
+    blipColour = nil,
+
+    -- One blip per vehicle rather than one per officer. A four-unit response is
+    -- eight officers, and eight overlapping blips on the same four cars is not
+    -- more information -- it is a smear that hides the cones underneath it.
+    -- Officers on foot always blip: at that point they are the unit.
+    blipDriversOnly = true,
+
+    -- Radio traffic. Roughly four or five calls per pursuit -- opening call,
+    -- lost visual, re-acquired -- not a running commentary.
+    dispatchMessages = true,
+    dispatchPrefix   = 'DISPATCH:',
+    dispatchCooldown = 8000,   -- ms between calls, ignored by the opening call
+    dispatchDuration = 6000,   -- how long the notification sits on screen
+
+    -- Route radio traffic somewhere else (a scanner UI, a phone app, ox_lib).
+    -- Receives the finished string. Leave nil for QBCore notifications.
+    -- dispatchHandler = function(text) exports['my_scanner']:Say(text) end,
+    dispatchHandler = nil,
+
+    -- Officers call out spotting and losing the target. Ambient speech is used
+    -- rather than scanner audio deliberately: a speech context this build of the
+    -- game doesn't have simply doesn't play, where a bad scanner report name is
+    -- an error. Nothing here is load-bearing.
+    officerSpeech  = true,
+    speechRange    = 60.0,
+    speechCooldown = 6000,
+}
+
+
+-- POLICE DRIVING --
+--
+-- Every driver used to be handed SetDriverAbility(1.0) and
+-- SetDriverAggressiveness(1.0), re-applied every cycle, so every unit in every
+-- pursuit drove identically: all ramming, all cornering the same, none of them
+-- ever making a mistake. These are rolled once per officer and kept for that
+-- officer's lifetime, the same way Config.Combat.engageChance is.
+
+Config.Driving = {
+    -- Ranges are { min, max } and indexed by wanted level, exactly like the
+    -- Config.Combat tables. A single { min, max } pair applies at every level.
+    --
+    -- ability      0-1. Cornering, braking, reading the road. Low values make
+    --              mistakes; that is the point.
+    -- aggression   0-1. Willingness to ram, cut across and force the issue.
+    ability = {
+        [1] = { 0.55, 0.80 },
+        [2] = { 0.60, 0.85 },
+        [3] = { 0.70, 0.90 },
+        [4] = { 0.80, 1.00 },
+        [5] = { 0.85, 1.00 },
+    },
+
+    aggression = {
+        [1] = { 0.25, 0.50 },   -- a pursuit, not a demolition derby
+        [2] = { 0.35, 0.60 },
+        [3] = { 0.50, 0.75 },
+        [4] = { 0.70, 0.95 },
+        [5] = { 0.85, 1.00 },
+    },
+
+    -- Commanded pursuit speed in m/s. 42 is roughly 94 mph.
+    speed = 42.0,
+
+    -- Cap the commanded speed to what the car can actually do. A riot van and an
+    -- interceptor were both told 42 m/s; the van never reached it and drove like
+    -- it was late for something.
+    matchVehicleSpeed = true,
+    speedFraction     = 0.92,
+
+    -- Per-officer multiplier on the result, so a convoy doesn't move as one
+    -- object.
+    speedVariance = { 0.90, 1.05 },
+
+    -- Speed while sweeping a search area. Slow: they are looking, not chasing.
+    searchSpeed = 16.0,
+
+    -- An officer on foot beside their car is tasked to walk back and get in.
+    -- After this many cycles, or beyond this distance, they are warped instead.
+    -- Something genuinely does get officers stuck -- ragdolled under the car,
+    -- wedged in scenery, holding a task that will not clear -- and a pursuit unit
+    -- standing in the road forever is worse than one visible teleport.
+    reboardPatience        = 12,
+    reboardGiveUpDistance  = 45.0,
+}
+
+
+
+-- ROADBLOCKS & SPIKE STRIPS --
+--
+-- Read by client/tactics.lua. Dispatch service 8 (DT_PoliceRoadBlock) is
+-- force-disabled elsewhere in this resource and nothing replaced it, so the
+-- entire response at every wanted level was "more cars behind you" — a pursuit
+-- with no way to get in front of the suspect has only one shape.
+--
+-- Both features lean on Config.Roads: a block that spans a carriageway has to
+-- know where the carriageway ends, and a strip laid across the wrong side of a
+-- dual carriageway is scenery.
+
+Config.Tactics = {
+    enabled = true,
+    debug   = false,
+
+    -- Deployed against a suspect the police can currently SEE. Getting a unit in
+    -- front of you means knowing where you are going, and during a search nobody
+    -- does — which is also what stops a search becoming a wall of roadblocks in
+    -- every direction at once.
+    --
+    -- Below this speed both are pointless: a suspect doing 15mph through a side
+    -- street drives around a block and steps over a strip. In m/s.
+    minSpeed = 12.0,
+
+    -- Ceiling across both kinds, and the minimum gap between any two. Two blocks
+    -- a hundred metres apart on the same road is one block with extra steps.
+    maxConcurrent = 2,
+    minSpacing    = 250.0,
+
+    -- Give up looking for a spot after this many samples along the player's
+    -- route. Sampled far-to-near so a block lands at the far end of its band
+    -- where possible, which is the difference between an obstacle and an ambush.
+    placementAttempts = 12,
+
+    -- ── Roadblocks ──────────────────────────────────────────────────────────
+    roadblockFromLevel  = 3,
+    roadblockChance     = 0.5,     -- rolled once per cooldown window
+    roadblockCooldown   = 45,      -- seconds
+    roadblockMinDistance = 170.0,
+    roadblockMaxDistance = 300.0,
+
+    -- One car per blocked lane, parked broadside. Officers stand behind the
+    -- line, facing back down the road, and hold position — the block is the
+    -- obstacle, it is not an ambush.
+    roadblockVehicles = { 'police', 'police2', 'police3', 'sheriff' },
+    roadblockOfficers = 2,
+
+    -- ── Spike strips ────────────────────────────────────────────────────────
+    -- Laid closer than a roadblock on purpose. A strip you cannot see until you
+    -- are on it is a coin flip; one you spot at two hundred metres is a
+    -- decision.
+    spikeFromLevel   = 3,
+    spikeChance      = 0.5,
+    spikeCooldown    = 35,         -- seconds
+    spikeMinDistance = 120.0,
+    spikeMaxDistance = 220.0,
+    spikeModel       = 'p_ld_stinger_s',
+    spikeNotify      = true,
+    spikeMessage     = 'Spike strip!',
+
+    -- ── Shared ──────────────────────────────────────────────────────────────
+    peds   = { 's_m_y_cop_01', 's_f_y_cop_01', 's_m_y_sheriff_01' },
+    weapon = 'weapon_pistol',
+
+    -- Placements are removed after this many seconds, or once the player is this
+    -- far away (with a floor on age, since a block placed 300m ahead is already
+    -- "far away" the moment it exists).
+    lifetime        = 90,
+    despawnDistance = 350.0,
+}
+
+
+-- ROAD PLACEMENT & NO-GO AREAS --
+--
+-- Read by client/roads.lua, which is what both the pursuit spawner and the
+-- ambient system use to pick a spot. See the header comment in that file for why
+-- it exists; the short version is that a vehicle node is the centre line of a
+-- road, not a lane, and the heading a node reports is only one of the road's two
+-- legal directions of travel. Placing a car on the raw node data is what put
+-- cruisers in the middle of the street facing oncoming traffic.
+
+Config.Roads = {
+    -- Prints every rejected spawn candidate with the reason. Noisy.
+    debug = false,
+
+    -- Width of one traffic lane, in metres. GTA's road network is built to
+    -- roughly 3.5m and the engine's own reported road widths agree, so there is
+    -- rarely a reason to change this. Too small and cars straddle the paint; too
+    -- large and they spawn on the pavement.
+    laneWidth = 3.5,
+
+    -- Which lane a responding unit appears in.
+    --   'outer'   kerbside lane. The plausible one, and the default.
+    --   'inner'   lane nearest the centre line.
+    --   'random'  any lane travelling the right way.
+    lanePreference = 'outer',
+
+    -- How far past the outermost lane a *parked* scene sits (radar traps,
+    -- traffic stops), in metres from the edge of the carriageway. Because it is
+    -- measured from the edge and not the centre line, the same number works on a
+    -- two-lane street and a six-lane boulevard. A car is about 2m wide, so 1.5
+    -- puts it mostly on the verge with a wheel still on the tarmac -- which is
+    -- how a real speed trap parks. Raise it and cars end up in the scenery.
+    shoulderOffset = 1.5,
+
+    -- Ring samples per spawn attempt. Each one is a GET_CLOSEST_ROAD plus a
+    -- handful of cheap checks, run once when a unit is dispatched — not per
+    -- frame — so this can afford to be generous.
+    spawnAttempts = 24,
+
+    -- Reject spawn points on surfaces the game gives no street name to. This is
+    -- the main defence against units appearing on runways, taxiways, aprons,
+    -- car park aisles and dirt scrapes: GTA V names every drivable public road,
+    -- rural trails included, and names none of those. Turn it off only if you
+    -- run a map addon whose roads have no street data.
+    requireNamedStreet = true,
+
+    -- Minimum vehicle node density. 0-1 is a dead end or a track, and a pursuit
+    -- that starts on one stalls immediately.
+    minNodeDensity = 2,
+
+    -- Radius, in metres, of the emptiness check around a candidate point. This
+    -- is what stops a cruiser materialising inside a moving car.
+    clearance = 3.0,
+
+    -- Reject a spawn point whose driving distance to the player is more than
+    -- this many times the straight-line distance. Catches the placements that
+    -- look perfect on a map and are useless in play: the freeway deck directly
+    -- above the player, the far bank of the Alamo Sea, the other side of a
+    -- canyon — 90m apart, three kilometres by road, and the unit spends its
+    -- entire lifetime driving. Set to 0 to disable the check.
+    maxTravelRatio = 4.0,
+
+    -- If GET_CLOSEST_ROAD reports nothing at a sample point, fall back to the
+    -- old vehicle-node native and assume an undivided two-lane road. Less
+    -- accurate, but "this one unit was placed with less information" beats "no
+    -- unit ever spawns" if a map addon has road data the native doesn't read.
+    nodeFallback = true,
+
+    -- Switch the AI road network off inside the exclusion zones below, using
+    -- SET_ROADS_IN_AREA. Rejecting spawns keeps units from *appearing* airside;
+    -- this is what stops a pursuit that started on a normal street from routing
+    -- across the runway, because the pathfinder stops seeing those nodes at all.
+    -- It applies to ambient traffic too, which is correct — airside has no
+    -- civilian traffic. Restored when the resource stops.
+    disableAiRoads = true,
+
+    -- How close the player has to be to a zone before the above is applied.
+    -- Node state is reset by the engine when a region streams back in, so it is
+    -- re-applied on a timer rather than once at startup.
+    suppressionRadius = 2000.0,
+
+    -- Areas police neither spawn in nor path through.
+    --
+    -- Each entry is a box (`min`/`max`), a cylinder (`center`/`radius`) or a
+    -- prism (`poly` = list of vector3, only x/y read). `zMin`/`zMax` bound it
+    -- vertically, which matters: without a ceiling, a box over an airfield also
+    -- swallows any road bridging over it.
+    --
+    --   enabled         false to keep the entry as documentation without effect
+    --   disableAiRoads  false to reject spawns here but leave pathing alone
+    --   disablePedPaths true to also clear pedestrian paths
+    --
+    -- THESE BOXES ARE HAND-MEASURED. Before trusting one, fly out and run
+    -- `/fenixroads` to draw them in-world, and `/fenixroads here` to see what
+    -- the system makes of the ground you are standing on. Adjust in
+    -- config.local/ rather than here so an update doesn't overwrite your work.
+    exclusionZones = {
+        {
+            name = 'LSIA airside',
+            -- Runways, taxiways, aprons and hangars. The north edge stops short
+            -- of the terminal frontage road so arrivals/departures traffic —
+            -- and police responding to it — is unaffected.
+            min  = vector3(-1800.0, -3400.0, 0.0),
+            max  = vector3(-950.0,  -2830.0, 0.0),
+            zMin = -20.0,
+            zMax = 45.0,
+        },
+        {
+            name = 'Fort Zancudo airfield',
+            -- Military. Even without the immersion argument, LSPD units driving
+            -- onto an active air base is not a thing that should happen.
+            min  = vector3(-2700.0, 2850.0, 0.0),
+            max  = vector3(-1600.0, 3650.0, 0.0),
+            zMin = -20.0,
+            zMax = 120.0,
+        },
+        {
+            name = 'Sandy Shores airstrip',
+            -- Off by default: the strip sits close enough to Route 68 and the
+            -- Alamo Sea road that a box big enough to cover it risks eating real
+            -- roads. Draw it with /fenixroads, trim it to fit, then enable.
+            enabled = false,
+            min  = vector3(1300.0, 3200.0, 0.0),
+            max  = vector3(1800.0, 3350.0, 0.0),
+            zMin = 20.0,
+            zMax = 80.0,
+        },
+    },
+}
 
 
 -- SPAWN DISTANCES ETC --
