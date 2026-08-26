@@ -36,6 +36,59 @@ carjacking provenance note below.
 
 ---
 
+## 2.4.2 — units spawning on the opposite carriageway of divided roads — 2026-08-25
+
+`client/roads.lua`, `Config.Roads` in `config.lua`.
+
+Reported with a screenshot: a cruiser and pickup parked on the far side of a
+divided highway's median, facing into oncoming traffic on that carriageway —
+not just the wrong lane, the wrong side of the road entirely.
+
+### Fixed — GET_CLOSEST_ROAD's lane-count output was never actually confirmed
+
+2.1.0's lane placement leaned on GET_CLOSEST_ROAD returning, alongside the
+segment endpoints, how many lanes run in each direction. Checked against
+`_tools/nativedb` while investigating this: those later parameters are typed
+`Any*` — unconfirmed. "Lanes forward / lanes back" is long-standing community
+convention for this native, not something Rockstar's own decompiled scripts or
+FiveM's native reference actually verify. Reasonable enough on an ordinary
+two-way street, and wrong in exactly the way this screenshot shows on a
+**divided** one: each carriageway is functionally its own road, close enough
+to its twin across a narrow median that "closest road" can hand back the FAR
+carriageway's segment instead of the near one. Every number after that —
+centre line, lane offsets, heading — was then correct arithmetic performed on
+the wrong road.
+
+### Added — cross-checked against a confirmed native
+
+Every GET_CLOSEST_ROAD result is now checked against
+GET_CLOSEST_VEHICLE_NODE_WITH_HEADING — a plain position + heading with a
+confirmed contract, and the exact native this file already trusted as its own
+no-data fallback (see 2.1.0's `nodeFallback`). If GET_CLOSEST_ROAD's segment
+sits more than `crossCheckDistance` (20m) from that anchor, or its heading —
+allowing for either direction of travel — differs by more than
+`crossCheckAngle` (40°), it is describing a different road and gets discarded.
+The reliable anchor takes over instead: one lane each way, the same
+conservative shape the no-data fallback already used.
+
+Chose a distance-and-heading check over trying to detect "is there a median
+here" directly, because the failure signature doesn't need a name for what it
+is — it only needs to be far enough from, or angled away from, a source that's
+independently known to be right. That's testable by construction; "is this a
+divided road" is a much harder question to answer from a single point query,
+and answering the narrower one is sufficient.
+
+### Note — the lane-count assumption elsewhere
+
+Every ordinary (undivided) road, which is the overwhelming majority of what
+this resource places units on, is unaffected — the cross-check passes there
+and GET_CLOSEST_ROAD's lane data is used exactly as before. This only ever
+discards a result on a divided road where the two carriageways are close
+enough together for the wrong one to be picked, which is precisely the case
+that was broken.
+
+---
+
 ## 2.4.1 — stop and pursuit were starved by 2.4.0's density cut — 2026-08-25
 
 `Config.Ambient` in `config.lua` only.

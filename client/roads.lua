@@ -216,6 +216,22 @@ end)
 -- Lane geometry
 -------------------------------------------------------------------------------
 
+--- One lane each way at `pos`/`heading`, the conservative fallback shape used
+--- both when GET_CLOSEST_ROAD has nothing and when its answer fails the
+--- cross-check below. It still offsets the car into a lane instead of onto
+--- the centre line, and still allows both directions, which is what an
+--- ordinary two-way street permits anyway.
+local function conservativeRoad(pos, heading)
+    return {
+        center      = pos,
+        heading     = heading or 0.0,
+        fwdLanes    = 1,
+        bwdLanes    = 1,
+        width       = (cfg().laneWidth or 3.5) * 2.0,
+        approximate = true,
+    }
+end
+
 --- Everything known about the road nearest `x,y,z`, or nil when there isn't one.
 ---
 --- GET_CLOSEST_ROAD gives the segment endpoints and, crucially, how many lanes
@@ -223,6 +239,24 @@ end)
 --- natives don't expose, and the whole reason units used to face the wrong way:
 --- with only a centre point and one arbitrary heading there is no way to tell a
 --- one-way street from the oncoming side of a two-way one.
+---
+--- That lane-count output is undocumented, though — FiveM's own native
+--- reference lists GET_CLOSEST_ROAD's later parameters as untyped, unconfirmed
+--- `Any*`, not "lanes forward" / "lanes back". Treating them that way is
+--- community convention, not a confirmed contract, and on a DIVIDED highway
+--- it can go wrong in a very visible way: each carriageway is effectively its
+--- own road, close enough to the other across a narrow median that "closest
+--- road" can hand back the FAR carriageway's segment instead of the near one.
+--- Placing a car on that segment's own lane maths then drops it in the
+--- opposite carriageway facing oncoming traffic, having done everything this
+--- file exists to prevent — just working from the wrong road.
+---
+--- So the result is cross-checked against GET_CLOSEST_VEHICLE_NODE_WITH_HEADING
+--- — a plain, confirmed position + heading, and the same native this file
+--- already trusts as its own no-data fallback below. If GET_CLOSEST_ROAD's
+--- segment sits further from that anchor than a lane change should ever be, or
+--- points a different way entirely, it is not describing the road under the
+--- query point and gets discarded in favour of the reliable anchor instead.
 ---
 --- Returns a table:
 ---   center   vector3  point on the road's centre line closest to the query
@@ -234,27 +268,15 @@ local function roadAt(x, y, z)
     local found, srcNode, targetNode, fwdLanes, bwdLanes, width =
         GetClosestRoad(x, y, z, 1.0, 1, true)
 
+    local nodeFound, nodePos, nodeHeading = GetClosestVehicleNodeWithHeading(x, y, z, 1, 3.0, 0)
+
     if not found or not srcNode or not targetNode then
         -- Degrade rather than disappear. If GET_CLOSEST_ROAD has nothing here
         -- there is usually nothing here at all, but "no unit ever spawns" is a
-        -- far worse failure than "this one unit is placed with less information",
-        -- so fall back to the node native and assume an undivided two-lane road.
-        -- One lane each way is the conservative guess: it still offsets the car
-        -- into a lane instead of onto the centre line, and it still allows both
-        -- directions, which is what a two-way street permits anyway.
+        -- far worse failure than "this one unit is placed with less information".
         if cfg().nodeFallback == false then return nil end
-
-        local nodeFound, nodePos, nodeHeading = GetClosestVehicleNodeWithHeading(x, y, z, 1, 3.0, 0)
         if not nodeFound or not nodePos then return nil end
-
-        return {
-            center   = vector3(nodePos.x, nodePos.y, nodePos.z),
-            heading  = nodeHeading or 0.0,
-            fwdLanes = 1,
-            bwdLanes = 1,
-            width    = (cfg().laneWidth or 3.5) * 2.0,
-            approximate = true,
-        }
+        return conservativeRoad(vector3(nodePos.x, nodePos.y, nodePos.z), nodeHeading)
     end
 
     local sx, sy, sz = srcNode.x, srcNode.y, srcNode.z
@@ -270,9 +292,44 @@ local function roadAt(x, y, z)
     local t = (((x - sx) * dx) + ((y - sy) * dy)) / lenSq
     if t < 0.0 then t = 0.0 elseif t > 1.0 then t = 1.0 end
 
+    local center = vector3(sx + (dx * t), sy + (dy * t), sz + (dz * t))
+    local heading = GetHeadingFromVector_2d(dx, dy)
+
+    -- The cross-check. Only possible when the reliable anchor also found
+    -- something; if it didn't, GET_CLOSEST_ROAD is all there is, and it
+    -- already found this segment near a real query point.
+    if nodeFound and nodePos then
+        local c = cfg()
+        local maxDrift = c.crossCheckDistance or 20.0
+
+        if maxDrift > 0.0 then
+            local drift = #(center - vector3(nodePos.x, nodePos.y, nodePos.z))
+            if drift > maxDrift then
+                dbg(('GET_CLOSEST_ROAD segment %.0fm from the reliable anchor at %.1f,%.1f — '
+                    .. 'likely the far carriageway of a divided road, using the anchor instead')
+                    :format(drift, x, y))
+                return conservativeRoad(vector3(nodePos.x, nodePos.y, nodePos.z), nodeHeading)
+            end
+
+            -- Same road, or the wrong one running past it at an angle? A real
+            -- carriageway pair runs parallel — nearly the same heading, or
+            -- nearly opposite. A cross street or ramp does not.
+            local maxAngle = c.crossCheckAngle or 40.0
+            if nodeHeading then
+                local diff = math.abs(((heading - nodeHeading + 180.0) % 360.0) - 180.0)
+                local alignment = math.min(diff, math.abs(180.0 - diff))
+                if alignment > maxAngle then
+                    dbg(('GET_CLOSEST_ROAD segment misaligned %.0f degrees from the reliable anchor '
+                        .. 'at %.1f,%.1f — using the anchor instead'):format(alignment, x, y))
+                    return conservativeRoad(vector3(nodePos.x, nodePos.y, nodePos.z), nodeHeading)
+                end
+            end
+        end
+    end
+
     return {
-        center   = vector3(sx + (dx * t), sy + (dy * t), sz + (dz * t)),
-        heading  = GetHeadingFromVector_2d(dx, dy),
+        center   = center,
+        heading  = heading,
         fwdLanes = math.max(0, math.floor(fwdLanes or 0)),
         bwdLanes = math.max(0, math.floor(bwdLanes or 0)),
         width    = width or 0.0,
@@ -749,8 +806,9 @@ RegisterCommand('fenixroads', function(_, args)
         print(('  excluded   %s'):format(excluded and zoneName or 'no'))
         print(('  spawnable  %s'):format(ok and 'yes' or ('no - ' .. tostring(reason))))
         if road then
-            print(('  road       heading %.1f, %d lane(s) forward / %d back, width %.1f')
-                :format(road.heading, road.fwdLanes, road.bwdLanes, road.width))
+            print(('  road       heading %.1f, %d lane(s) forward / %d back, width %.1f%s')
+                :format(road.heading, road.fwdLanes, road.bwdLanes, road.width,
+                    road.approximate and '  [fallback: GET_CLOSEST_ROAD unavailable or failed the divided-road cross-check]' or ''))
         else
             print('  road       none')
         end

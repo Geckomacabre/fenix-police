@@ -1253,6 +1253,27 @@ Config.Roads = {
     -- unit ever spawns" if a map addon has road data the native doesn't read.
     nodeFallback = true,
 
+    -- GET_CLOSEST_ROAD's lane-count output is community convention, not a
+    -- Rockstar-confirmed contract — FiveM's own native reference lists those
+    -- parameters as untyped and unverified. On a DIVIDED highway that can go
+    -- wrong visibly: each carriageway is close enough to the other across a
+    -- narrow median that "closest road" can hand back the FAR one, dropping a
+    -- unit in the opposite carriageway facing oncoming traffic.
+    --
+    -- Every GET_CLOSEST_ROAD result is checked against
+    -- GET_CLOSEST_VEHICLE_NODE_WITH_HEADING — a plain, confirmed position and
+    -- heading, the same native this file already falls back to when
+    -- GET_CLOSEST_ROAD finds nothing. A result further than crossCheckDistance
+    -- from that anchor, or angled more than crossCheckAngle away from it
+    -- (allowing for the anchor facing either direction of travel), is treated
+    -- as describing a different road and discarded in favour of the anchor —
+    -- one lane each way, same as the no-data fallback above.
+    --
+    -- crossCheckDistance in metres, 0 disables the check. crossCheckAngle in
+    -- degrees.
+    crossCheckDistance = 20.0,
+    crossCheckAngle    = 40.0,
+
     -- Switch the AI road network off inside the exclusion zones below, using
     -- SET_ROADS_IN_AREA. Rejecting spawns keeps units from *appearing* airside;
     -- this is what stops a pursuit that started on a normal street from routing

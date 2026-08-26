@@ -160,7 +160,17 @@ end)
 RegisterNetEvent('police:server:policeAlert', function(text, _, alertSrc)
     if not CRIME.catchAllPoliceAlert then return end
 
-    local src = (type(alertSrc) == 'number' and GetPlayerName(alertSrc)) and alertSrc or source
+    -- alertSrc is only trustworthy when this fired via a local TriggerEvent
+    -- (source == 0, no real network caller) -- that's qbx_jewelery's own
+    -- server code reporting on someone else's behalf. A real network call
+    -- (source ~= 0) already IS the offender -- qbx_vehiclekeys fires this
+    -- about itself. Previously a client-supplied alertSrc could override a
+    -- real network source, letting a modified client frame an arbitrary
+    -- victim with wanted stars and summoned police.
+    local src = source
+    if src == 0 and type(alertSrc) == 'number' and GetPlayerName(alertSrc) then
+        src = alertSrc
+    end
     if not src or src == 0 or not GetPlayerName(src) then return end
 
     -- The jewellery scripts are the loud ones worth their own tier; everything

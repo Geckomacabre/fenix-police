@@ -194,3 +194,12 @@ Config.Ambient.maxScenes        = 2
 Config.Ambient.convoyThirdCarChance = 0.0 -- convoys are always 2 cars
 Config.Ambient.convoyCooldownSeconds = 480
 ]]
+
+-- If a divided highway is still occasionally getting a unit on the wrong
+-- carriageway, tighten these; if legitimate spawns near ordinary roads are
+-- being rejected and falling back to the conservative one-lane-each-way
+-- placement more than expected, loosen them.
+--[[
+Config.Roads.crossCheckDistance = 15.0
+Config.Roads.crossCheckAngle    = 30.0
+]]
