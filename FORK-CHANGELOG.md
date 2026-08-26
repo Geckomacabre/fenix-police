@@ -36,6 +36,63 @@ carjacking provenance note below.
 
 ---
 
+## 2.4.1 — stop and pursuit were starved by 2.4.0's density cut — 2026-08-25
+
+`Config.Ambient` in `config.lua` only.
+
+Reported after 2.4.0: cop cars driving around constantly, but traffic stops and
+pursuits almost never seen.
+
+### Fixed — long-lived filler scenes were starving the rare ones
+
+Not a new bug, a side effect of 2.4.0's own fix. `patrol` and `convoy` are
+long-lived (`roamingLifetime` / `convoyLifetime`, 130-150s) and have no cooldown
+of their own. At `maxScenes = 3`, once those filled the available slots — which
+they do quickly, having no cooldown to hold them back — no new spawn *attempt*
+happened at all until one expired:
+
+```lua
+if sceneCount() >= (cfg().maxScenes or 4) then return end
+```
+
+`stop` and `pursuit` only ever got a shot at that rare open slot, on top of
+needing to be off their own cooldown (150s / 300s) at the same moment. A much
+narrower window than the weight table suggested, and it kept losing to whatever
+filler was already parked.
+
+`maxNearbyCops = 4` compounded it: a single 3-car `convoy` came within one
+officer of the entire area budget by itself, which blocked `pursuit` (1-2
+officers) or `stop` (1 officer) even when a scene slot genuinely was free.
+
+### Changed
+
+| Setting | Was | Now | Why |
+|---|---|---|---|
+| `weights.stop` | 3 | 4 | |
+| `weights.pursuit` | 1 | 2 | |
+| `weights.patrol` | 3 | 2 | trimmed to make room |
+| `weights.convoy` | 2 | 1 | trimmed to make room |
+| `weights.radar` | 3 | 2 | trimmed to make room |
+| `weights.post` | 3 | 2 | trimmed to make room |
+| `roamingLifetime` | 180 | 130 | `patrol` gives its slot back sooner |
+| `maxNearbyCops` | 4 | 5 | room for `pursuit`/`stop` next to a `convoy` |
+| `stopCooldownSeconds` | 150 | 100 | tuned against the old 8s/4-scene cadence |
+| `pursuitCooldownSeconds` | 300 | 220 | tuned against the old 8s/4-scene cadence |
+
+The weight changes are a mix fix, not a frequency one — weight only decides
+which kind spawns when a slot is free, and that's still gated entirely by
+`spawnInterval`/`maxScenes`/`minSceneSpacing`/`maxNearbyCops`, none of which
+this touches. Overall encounter rate should read the same as 2.4.0; what's
+actually in the mix should not.
+
+The two cooldowns were carried over from before 2.4.0 without being
+re-examined — they were tuned to hold `stop`/`pursuit` back against an 8-second,
+4-scene spawn cadence that no longer exists. Left at their old values, they were
+a second brake stacked on top of the new density settings, doing the same job
+twice.
+
+---
+
 ## 2.4.0 — ambient density tuned down, convoy scene added — 2026-08-24
 
 `client/ambient.lua` (new `spawnConvoy`), `Config.Ambient` in `config.lua`.

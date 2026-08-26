@@ -273,13 +273,22 @@ Config.Ambient = {
 
     -- Roaming scenes are torn down after this many seconds regardless of distance
     -- so patrols and pursuits keep cycling instead of following you forever.
-    roamingLifetime = 180,
+    --
+    -- Lowered from 180. This is also how often a `patrol` gives its scene slot
+    -- back — at maxScenes=3, a patrol camping a slot for three minutes is three
+    -- minutes `stop` and `pursuit` cannot even attempt to spawn.
+    roamingLifetime = 130,
 
     -- ── Pursuits ────────────────────────────────────────────────────────────
     -- A pursuit is an event, not background traffic. The scene weight alone
     -- can't express "rare but memorable", so this is a hard floor between them
     -- regardless of how the weighted roll lands.
-    pursuitCooldownSeconds = 300,
+    --
+    -- Lowered from 300 for the same reason as stopCooldownSeconds: the
+    -- 8s/4-scene cadence this was tuned against no longer exists, and 5 minutes
+    -- on top of a slot that's already hard to win made a pursuit a rare sight
+    -- rather than an occasional one.
+    pursuitCooldownSeconds = 220,
 
     -- Pursuits get their own lifetime because they need room to run, resolve and
     -- be watched. Shortened automatically once the arrest tableau has held.
@@ -341,7 +350,15 @@ Config.Ambient = {
     -- a stop around every corner. This puts a floor between them instead.
     --
     -- Raise it if stops still feel constant; 0 restores the old behaviour.
-    stopCooldownSeconds = 150,
+    --
+    -- Lowered from 150. That value assumed the original 8s/4-scene cadence;
+    -- spawnInterval alone is now 15s with a 3-scene cap, which already throttles
+    -- how often anything spawns. Leaving the old cooldown on top of the new
+    -- density settings was two brakes doing one job, and `stop` in particular
+    -- needs its retries: the player can drive past a stop parked on the verge
+    -- without ever registering it happened, and there was nothing to make a
+    -- missed one try again soon.
+    stopCooldownSeconds = 100,
 
     -- ── Placement quality ───────────────────────────────────────────────────
     -- Candidate road nodes sampled per spawn attempt. The best-scoring one wins
@@ -369,8 +386,13 @@ Config.Ambient = {
     -- before the scene cap does. Counted from the scenes this script already
     -- owns during the cull pass — no world scans, no extra bookkeeping.
     --
-    -- Lowered from 6 alongside maxScenes and spawnInterval.
-    maxNearbyCops = 4,
+    -- Lowered from 6 alongside maxScenes and spawnInterval, then raised back
+    -- partway to 5: at 4, a single 3-car `convoy` came within one officer of
+    -- the whole area budget on its own, which was blocking `pursuit` (1-2
+    -- officers) and `stop` (1 officer) from spawning even when a scene slot
+    -- was free. 5 leaves room for one of those alongside a convoy without
+    -- undoing the reason this was lowered in the first place.
+    maxNearbyCops = 5,
     nearbyRadius  = 260.0,
 
     -- Superseded by Config.Roads.shoulderOffset, below. That one is measured
@@ -482,13 +504,26 @@ Config.Ambient = {
     },
 
     -- Relative weight of each scene type. Set a weight to 0 to disable that type.
+    --
+    -- Rebalanced toward `stop` and `pursuit` after the density pass above made
+    -- them close to invisible. The weight was never really the problem —
+    -- `patrol` and `convoy` are long-lived (roamingLifetime / convoyLifetime,
+    -- 130-150s) and have no cooldown of their own, so once maxScenes=3 fills
+    -- with a mix of those plus `radar`/`post`, no new spawn ATTEMPT happens at
+    -- all until one expires. `stop` and `pursuit` only ever get a shot at that
+    -- rare open slot, on top of needing to be off their own cooldown (below) —
+    -- a much narrower window that kept losing to whatever filler was already
+    -- parked. This raises their odds of winning the roll when a slot IS free,
+    -- which is a variety fix, not a frequency one: overall encounter rate is
+    -- still governed entirely by spawnInterval/maxScenes/minSceneSpacing/
+    -- maxNearbyCops above, none of which this touches.
     weights = {
-        radar    = 3,  -- cruiser parked facing traffic, officer inside
-        stop     = 3,  -- NPC pulled over, officer at the driver's window
-        patrol   = 3,  -- cruiser driving a normal route, no siren
-        convoy   = 2,  -- 2-3 cruisers travelling together, no lights — see below
-        post     = 3,  -- officers on foot at a station/landmark doing scenarios
-        pursuit  = 1,  -- NPC vehicle fleeing, cruisers chasing with sirens
+        radar    = 2,  -- cruiser parked facing traffic, officer inside
+        stop     = 4,  -- NPC pulled over, officer at the driver's window
+        patrol   = 2,  -- cruiser driving a normal route, no siren
+        convoy   = 1,  -- 2-3 cruisers travelling together, no lights — see below
+        post     = 2,  -- officers on foot at a station/landmark doing scenarios
+        pursuit  = 2,  -- NPC vehicle fleeing, cruisers chasing with sirens
         carjack  = 1,  -- suspect drags a driver out and takes off
     },
 
