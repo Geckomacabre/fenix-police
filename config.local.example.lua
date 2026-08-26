@@ -184,3 +184,13 @@ Config.Security.logRefusals     = true
 Config.Security.extraVehicles = { 'your_addon_cruiser' }
 Config.Security.extraPeds     = { 'your_addon_cop_ped' }
 ]]
+
+-- Ambient encounter rate and the convoy scene. Turned down in 2.4.0 after
+-- reports of a cop on 7/10 corners; these are the knobs to move if it's still
+-- too much, too little, or you want convoys more or less often.
+--[[
+Config.Ambient.spawnInterval    = 20      -- even sparser
+Config.Ambient.maxScenes        = 2
+Config.Ambient.convoyThirdCarChance = 0.0 -- convoys are always 2 cars
+Config.Ambient.convoyCooldownSeconds = 480
+]]

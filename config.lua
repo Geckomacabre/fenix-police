@@ -245,12 +245,24 @@ Config.Ambient = {
     -- a wanted level appears, so they never get tangled up in a real pursuit.
     despawnWhenWanted = true,
 
-    -- How many ambient scenes may exist at once. Each scene is 1-2 vehicles and
+    -- How many ambient scenes may exist at once. Each scene is 1-3 vehicles and
     -- 1-4 peds, so keep this low.
-    maxScenes = 4,
+    --
+    -- Lowered from 4. Four scenes inside a 220m maxSpawnDistance is close to
+    -- one every couple of blocks in a dense area — enough that turning a
+    -- corner into a fresh one felt less like a city with police in it and more
+    -- like the slots were always full.
+    maxScenes = 3,
 
     -- Seconds between scene spawn attempts.
-    spawnInterval = 8,
+    --
+    -- Raised from 8. At 8s with maxScenes=4 the scene population barely has
+    -- time to fall before the next attempt tops it back up, and reports were
+    -- "a cop every corner, most corners" — closer to filling every open slot
+    -- than to ambient presence. This alone is the biggest lever on how often
+    -- you encounter something; maxScenes and maxNearbyCops below cap how much
+    -- is on screen at once, but this caps how fast a gap gets refilled.
+    spawnInterval = 15,
 
     -- A scene must spawn between these distances from the player, and is deleted
     -- past cleanupDistance. Fixed-point scenes are also deleted when their point
@@ -297,6 +309,40 @@ Config.Ambient = {
     stopDurationSeconds  = 60,
     stopDepartureSeconds = 25,
 
+    -- ── Convoys ─────────────────────────────────────────────────────────────
+    -- Two or three cruisers travelling the same road together, lights and
+    -- sirens off — the "cops driving in a group, no lights" sight, done on
+    -- purpose instead of by three independent scenes drifting together. Reads
+    -- as backup en route to a call that never renders.
+    --
+    -- Minimum seconds between convoys. A group is a more noticeable sight than
+    -- a single patrol car, so it gets its own floor the same way stop and
+    -- pursuit do — otherwise the weight alone can make them common instead of
+    -- occasional.
+    convoyCooldownSeconds = 240,
+
+    -- Chance the group is three cars instead of two.
+    convoyThirdCarChance = 0.35,
+
+    -- Nose-to-tail spacing between cars in the group, in metres.
+    convoySpacing = 9.0,
+
+    -- Seconds before the group is torn down regardless of distance. Falls back
+    -- to roamingLifetime when unset.
+    convoyLifetime = 150,
+
+    -- Minimum seconds between traffic stops, for the same reason pursuits have
+    -- one: the weights cannot express "occasional".
+    --
+    -- `stop` is only 3 of 15, which sounds rare until you notice a radar trap
+    -- that clocks someone ALSO ends as a cruiser stopped behind a civilian car.
+    -- The two read as the same scene to a player, so the effective rate is
+    -- closer to 6 of 15, and with a spawn attempt every 8 seconds that becomes
+    -- a stop around every corner. This puts a floor between them instead.
+    --
+    -- Raise it if stops still feel constant; 0 restores the old behaviour.
+    stopCooldownSeconds = 150,
+
     -- ── Placement quality ───────────────────────────────────────────────────
     -- Candidate road nodes sampled per spawn attempt. The best-scoring one wins
     -- rather than the first that happens to be in range, which is what keeps
@@ -310,13 +356,21 @@ Config.Ambient = {
 
     -- Minimum distance between two ambient scenes. Stops them clumping into a
     -- police convention on one street.
-    minSceneSpacing = 90.0,
+    --
+    -- Raised from 90 for the same reason as spawnInterval and maxScenes: three
+    -- separate scenes 90m apart on the same road reads as one big encounter,
+    -- not three small ones. If you want a deliberate multi-car look, that's
+    -- now the `convoy` scene below rather than an accidental overlap of
+    -- `patrol` and `stop`.
+    minSceneSpacing = 120.0,
 
     -- Hard ceiling on ambient OFFICERS within nearbyRadius of the player, on top
     -- of maxScenes. A couple of 4-officer foot posts reach "too many cops" long
     -- before the scene cap does. Counted from the scenes this script already
     -- owns during the cull pass — no world scans, no extra bookkeeping.
-    maxNearbyCops = 6,
+    --
+    -- Lowered from 6 alongside maxScenes and spawnInterval.
+    maxNearbyCops = 4,
     nearbyRadius  = 260.0,
 
     -- Superseded by Config.Roads.shoulderOffset, below. That one is measured
@@ -431,7 +485,8 @@ Config.Ambient = {
     weights = {
         radar    = 3,  -- cruiser parked facing traffic, officer inside
         stop     = 3,  -- NPC pulled over, officer at the driver's window
-        patrol   = 4,  -- cruiser driving a normal route, no siren
+        patrol   = 3,  -- cruiser driving a normal route, no siren
+        convoy   = 2,  -- 2-3 cruisers travelling together, no lights — see below
         post     = 3,  -- officers on foot at a station/landmark doing scenarios
         pursuit  = 1,  -- NPC vehicle fleeing, cruisers chasing with sirens
         carjack  = 1,  -- suspect drags a driver out and takes off
@@ -1118,8 +1173,36 @@ Config.Roads = {
     minNodeDensity = 2,
 
     -- Radius, in metres, of the emptiness check around a candidate point. This
-    -- is what stops a cruiser materialising inside a moving car.
-    clearance = 3.0,
+    -- is what stops a cruiser materialising inside a moving car. A police
+    -- cruiser is about 5m long, so anything under 4 leaves them overlapping.
+    clearance = 4.0,
+
+    -- Minimum gap between a new spawn point and one already promised to a spawn
+    -- that is still in flight.
+    --
+    -- The dispatcher fires several spawn requests in a single tick, and each is a
+    -- round trip to the server before any vehicle exists -- so the occupancy
+    -- check above cannot see the car that is about to be there. Two cruisers then
+    -- land on the same point and flip each other. Scoring makes this more likely
+    -- than the first-fit code it replaced, because two calls a few milliseconds
+    -- apart agree on which lane centre is best.
+    spawnSeparation = 18.0,
+
+    -- How long a promised spot stays claimed. Only has to outlive the server
+    -- round trip; after that the vehicle exists and `clearance` takes over.
+    reservationSeconds = 25,
+
+    -- How much of the player's view counts as "in front", as the cosine of the
+    -- half-angle. Candidates inside it are refused outright.
+    --   0.0  refuse anything in the forward half-plane (the default)
+    --   0.7  refuse only the front 90-degree cone
+    --   1.0  refuse nothing, units may spawn dead ahead
+    --
+    -- Sampling already biases towards the rear, but a sample is only a starting
+    -- point: the road it snaps to can be anywhere. This is the check that
+    -- actually keeps units out of the windscreen. Raise it if you want units
+    -- cutting you off from in front at higher wanted levels.
+    maxForwardDot = 0.0,
 
     -- Reject a spawn point whose driving distance to the player is more than
     -- this many times the straight-line distance. Catches the placements that

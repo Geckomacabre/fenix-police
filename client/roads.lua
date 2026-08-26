@@ -438,6 +438,87 @@ end
 -- The spawn point finder
 -------------------------------------------------------------------------------
 
+-------------------------------------------------------------------------------
+-- Reservations
+-------------------------------------------------------------------------------
+--
+-- Two cruisers landing on the same square metre and flipping each other.
+--
+-- maintainPoliceUnits fires up to MAX_CONCURRENT_SPAWNS requests in a single
+-- tick, and each one is a separate round trip to the server before any vehicle
+-- actually exists. IsPositionOccupied cannot help: when the second request picks
+-- its spot, the first car has not been created yet. There is nothing in the
+-- world to collide with, right up until there is.
+--
+-- Scoring made this worse rather than better. First-fit picked the first random
+-- node that passed, so two calls scattered; scoring converges, and two calls a
+-- few milliseconds apart with the same player position and the same road network
+-- reliably agree on which lane centre is best. Deterministic lane choice
+-- ('outer') then puts them on the exact same point.
+--
+-- So a chosen point is reserved for a few seconds, and later candidates have to
+-- keep clear of it. The reservation outlives the round trip; after that the
+-- vehicle exists and the ordinary occupancy check takes over.
+
+local reservations = {}
+
+local function pruneReservations(now, ttl)
+    for i = #reservations, 1, -1 do
+        if (now - reservations[i].at) > ttl then table.remove(reservations, i) end
+    end
+end
+
+--- Is `pos` too close to a spot already promised to an in-flight spawn?
+local function isReserved(pos, separation)
+    local now = GetGameTimer()
+    pruneReservations(now, (cfg().reservationSeconds or 25) * 1000)
+
+    for _, r in ipairs(reservations) do
+        if #(r.pos - pos) < separation then return true end
+    end
+    return false
+end
+
+--- Promise this spot to the spawn that just won it.
+function FenixRoads.reserve(pos)
+    if not pos then return end
+    table.insert(reservations, { pos = pos, at = GetGameTimer() })
+end
+
+--- Drop every reservation. Called when a pursuit ends, so the next one is not
+--- working around spots that were promised to units which no longer exist.
+function FenixRoads.clearReservations()
+    reservations = {}
+end
+
+
+--- Is this spot inside the arc the player is looking at?
+---
+--- Applied to the FINAL lane position rather than the sample point, because
+--- resolving a sample to a road can move it a long way -- which is how a rear
+--- sample ends up as a spawn dead ahead.
+---
+--- `maxForwardDot` is the cosine of the half-angle that counts as "in front":
+---   0.0  anything in the forward half-plane is refused (the default)
+---   0.7  only the front 90-degree cone is refused
+---   1.0  nothing is refused
+local function inFrontOfPlayer(pos, origin, opts)
+    if not opts.behindVector then return false end
+
+    local limit = opts.maxForwardDot or cfg().maxForwardDot or 0.0
+    if limit >= 1.0 then return false end
+
+    local fx, fy = opts.behindVector.x, opts.behindVector.y
+    local flen = math.sqrt((fx * fx) + (fy * fy))
+    if flen < 0.01 then return false end
+
+    local dx, dy = pos.x - origin.x, pos.y - origin.y
+    local dlen = math.sqrt((dx * dx) + (dy * dy))
+    if dlen < 0.01 then return false end
+
+    return ((((dx / dlen) * (fx / flen)) + ((dy / dlen) * (fy / flen)))) > limit
+end
+
 --- Can a car actually drive from here to there, without a detour so long the
 --- unit would never arrive?
 ---
@@ -497,19 +578,37 @@ function FenixRoads.findSpawnPoint(origin, opts)
     local lastReason = 'no road nearby'
 
     for _ = 1, attempts do
-        local angle
+        -- Rear arc, so units do not pop into existence straight ahead.
+        --
+        -- This used to convert the player's forward vector to a GTA heading with
+        -- GetHeadingFromVector_2d, add the arc offset, and feed the result to
+        -- sin/cos. Those two conventions run opposite ways -- GTA headings
+        -- increase anticlockwise from north, sin/cos as used here sweeps
+        -- clockwise from north -- so the result was the player's direction
+        -- MIRRORED across the north-south axis. Facing north it happened to
+        -- work; facing east, "behind" resolved to due east, and every unit
+        -- appeared in the windscreen.
+        --
+        -- Rotating the forward vector directly sidesteps the conversion, and
+        -- with it the chance of getting the convention wrong again.
+        local dirX, dirY
         if opts.behindVector then
-            -- Rear arc, so units do not pop into existence straight ahead.
-            local playerHeading = GetHeadingFromVector_2d(opts.behindVector.x, opts.behindVector.y)
-            angle = math.rad(playerHeading + math.random(110, 250))
+            local ang = math.rad(math.random(110, 250))
+            local ca, sa = math.cos(ang), math.sin(ang)
+            local fx, fy = opts.behindVector.x, opts.behindVector.y
+            local len = math.sqrt((fx * fx) + (fy * fy))
+            if len > 0.01 then fx, fy = fx / len, fy / len else fx, fy = 0.0, 1.0 end
+            dirX = (fx * ca) - (fy * sa)
+            dirY = (fx * sa) + (fy * ca)
         else
-            angle = math.rad(math.random(0, 359))
+            local ang = math.rad(math.random(0, 359))
+            dirX, dirY = math.sin(ang), math.cos(ang)
         end
 
         local dist = minDist + (math.random() * (maxDist - minDist))
         local road = roadAt(
-            origin.x + (math.sin(angle) * dist),
-            origin.y + (math.cos(angle) * dist),
+            origin.x + (dirX * dist),
+            origin.y + (dirY * dist),
             origin.z)
 
         if road then
@@ -526,6 +625,20 @@ function FenixRoads.findSpawnPoint(origin, opts)
                     local ok, reason = FenixRoads.isSpawnable(pos, opts)
                     if not ok then
                         lastReason = reason
+                    elseif isReserved(pos, opts.separation or c.spawnSeparation or 18.0) then
+                        -- Another spawn from this same tick already claimed
+                        -- here. Without this two cruisers land on one point and
+                        -- flip each other the instant the second one appears.
+                        lastReason = 'too close to a spawn already in flight'
+                    elseif inFrontOfPlayer(pos, origin, opts) then
+                        -- Sampling biases towards the rear arc, but the sample is
+                        -- only a starting point -- the road it resolves to can be
+                        -- anywhere, including straight ahead. The old first-fit
+                        -- code had exactly this test and it was the only thing
+                        -- actually keeping units out of the windscreen; the
+                        -- rewrite replaced it with a scoring bonus on the ROAD's
+                        -- direction, which is a different question entirely.
+                        lastReason = 'in front of the player'
                     elseif opts.reject and opts.reject(pos, heading) then
                         lastReason = 'caller rejected'
                     elseif not reachable(pos, towards, d) then
@@ -570,6 +683,9 @@ function FenixRoads.findSpawnPoint(origin, opts)
             :format(minDist, maxDist, attempts, lastReason))
         return nil
     end
+
+    -- Claim it, so the next request in this same tick has to keep clear.
+    if opts.reserve ~= false then FenixRoads.reserve(bestPos) end
 
     return bestPos, bestHeading
 end

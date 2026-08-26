@@ -538,7 +538,20 @@ end
 
 --- NPC pulled over: civilian car on the shoulder, cruiser behind with its
 --- lights on (muted), officer at the driver's window writing a ticket.
+--- Last traffic stop, so they stay occasional rather than lining the route.
+local lastStopAt = -math.huge
+
 local function spawnStop(playerCoords)
+    -- Same reasoning as the pursuit cooldown above. A traffic stop is a thing
+    -- you come across, and the weights alone cannot say that: `stop` is only 3
+    -- of 15, but radar traps also end up as a cruiser stopped behind a civilian
+    -- car, so the two together read as one scene type at roughly double the
+    -- weight. Without a floor between them you turn a corner and there is
+    -- another one.
+    local c = cfg()
+    local now = GetGameTimer()
+    if now - lastStopAt < (c.stopCooldownSeconds or 150) * 1000 then return false end
+
     -- Static scene: put it on the verge, not in a lane.
     local pos, heading = bestRoadNode(playerCoords, { shoulder = true, avoidVisible = true })
     if not pos then return false end
@@ -586,6 +599,11 @@ local function spawnStop(playerCoords)
         borrowed = false,
     }
 
+    -- Only once the scene is real. Starting the cooldown on a failed attempt
+    -- would silently suppress stops for the next couple of minutes over a
+    -- placement that never happened.
+    lastStopAt = GetGameTimer()
+
     return commitScene(scene, true)
 end
 
@@ -612,6 +630,90 @@ local function spawnPatrol(playerCoords)
     SetDriverAggressiveness(cop, 0.2)
     -- Driving style 786603: obeys lights, avoids traffic, no shortcuts.
     TaskVehicleDriveWander(cop, veh, 16.0, 786603)
+
+    return commitScene(scene, true)
+end
+
+--- Last convoy start, so it stays an occasional sight rather than the normal
+--- traffic pattern.
+local lastConvoyAt = -math.huge
+
+--- Two or three cruisers travelling together, lights and sirens off — backup
+--- en route to a call that never renders, rather than a pursuit or a stop.
+---
+--- This is a deliberate version of something that already happened by
+--- accident: independent `patrol` scenes, spawned close enough together and
+--- started on the same road, drift into a loose convoy on their own, because
+--- TaskVehicleDriveWander just keeps a car on whatever road it is already on.
+--- It looked good and cost three times what it should have — three scene
+--- slots and three officers out of the nearby-cops budget for one visual.
+--- This is the same look, on purpose, for the price of one scene.
+local function spawnConvoy(playerCoords)
+    local c = cfg()
+    local now = GetGameTimer()
+    if now - lastConvoyAt < (c.convoyCooldownSeconds or 240) * 1000 then return false end
+
+    -- Moving scene: spawns on the carriageway and drives off, same as patrol.
+    local pos, heading = bestRoadNode(playerCoords, { avoidVisible = true })
+    if not pos then return false end
+
+    local count = 2
+    if math.random() < (c.convoyThirdCarChance or 0.35) then count = 3 end
+
+    local scene = newScene('convoy', pos, nil)
+    scene.expiresAt = now + (c.convoyLifetime or c.roamingLifetime or 180) * 1000
+
+    -- Heading h has forward = (-sin h, cos h) — see the header comment in
+    -- client/roads.lua. Trailing cars are placed back along that line, nose to
+    -- tail, so the group reads as one unit travelling together rather than a
+    -- coincidence of timing.
+    local rad = math.rad(heading)
+    local bx, by = -math.sin(rad), math.cos(rad)
+    local spacing = c.convoySpacing or 9.0
+
+    -- One model for the whole convoy. Matching cars is what sells "these are
+    -- travelling together" — a mixed cruiser and sheriff truck reads as two
+    -- coincidental patrols instead.
+    local model = regionVehicle()
+    local peds = regionList(c.peds)
+
+    for i = 0, count - 1 do
+        local x = pos.x - (bx * spacing * i)
+        local y = pos.y - (by * spacing * i)
+        local z = pos.z
+
+        -- The lead position already cleared bestRoadNode's own checks.
+        -- Trailing spots are new ground — parked traffic, a postbox, whatever's
+        -- actually there — and get the same emptiness test so a cruiser doesn't
+        -- spawn through something.
+        if i == 0 or FenixRoads.isSpawnable(vector3(x, y, z), { clearance = 2.5 }) then
+            local veh = createVehicle(model, x, y, z + 0.5, heading)
+            if veh then
+                scene.vehicles[#scene.vehicles + 1] = veh
+                SetVehicleEngineOn(veh, true, true, false)
+
+                local cop = createPed(pick(peds), x, y, z + 0.5, heading, true)
+                if cop then
+                    trackPed(scene, cop, true)
+                    SetPedIntoVehicle(cop, veh, -1)
+                    SetDriverAbility(cop, 0.9)
+                    SetDriverAggressiveness(cop, 0.15)
+                    -- Same style and speed as spawnPatrol — the one that let
+                    -- independent patrols drift together in the first place.
+                    -- Deliberate here, so the group holds together instead of
+                    -- scattering at the first junction the way three unrelated
+                    -- patrols would.
+                    TaskVehicleDriveWander(cop, veh, 14.0, 786603)
+                end
+            end
+        end
+    end
+
+    if #scene.vehicles == 0 then return commitScene(scene, false) end
+
+    -- Only once the scene is real — the same reasoning spawnStop uses for its
+    -- own cooldown timer.
+    lastConvoyAt = now
 
     return commitScene(scene, true)
 end
@@ -927,6 +1029,7 @@ local BUILDERS = {
     post    = spawnPost,
     stop    = spawnStop,
     patrol  = spawnPatrol,
+    convoy  = spawnConvoy,
     pursuit = spawnPursuit,
     carjack = spawnCarjack,
 }

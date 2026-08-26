@@ -28,27 +28,22 @@ FenixAmbientPoints.snapRadius = 120.0
 -- instead, rotated 90 degrees so the car sits across the traffic flow.
 -- ---------------------------------------------------------------------------
 FenixAmbientPoints.radar = {
-    -- Los Santos
-    { x = -1600.0, y = -1000.0, z = 13.0,  h = 130.0 },  -- Del Perro Fwy / pier
-    { x = -500.0,  y = -1800.0, z = 20.0,  h = 300.0 },  -- La Puerta Fwy
-    { x = 200.0,   y = -2200.0, z = 6.0,   h = 265.0 },  -- Elysian Fields Fwy
-    { x = 1000.0,  y = -1500.0, z = 30.0,  h = 90.0  },  -- East Los Santos
-    { x = 1500.0,  y = -1700.0, z = 80.0,  h = 20.0  },  -- Palomino Fwy
-    { x = 300.0,   y = 200.0,   z = 100.0, h = 160.0 },  -- Vinewood Blvd
-    { x = -800.0,  y = -100.0,  z = 40.0,  h = 210.0 },  -- Rockford Hills
-    { x = 100.0,   y = -900.0,  z = 30.0,  h = 340.0 },  -- Downtown
-
-    -- Countryside / Route 68 / Senora Fwy
-    { x = 500.0,   y = 2600.0,  z = 42.0,  h = 190.0 },  -- Route 68, Harmony
-    { x = 1700.0,  y = 3200.0,  z = 40.0,  h = 30.0  },  -- Senora Fwy, Sandy
-    { x = 1300.0,  y = 4300.0,  z = 30.0,  h = 190.0 },  -- Alamo Sea east
-    { x = 2200.0,  y = 4800.0,  z = 40.0,  h = 250.0 },  -- Grapeseed
-    { x = -1300.0, y = 2500.0,  z = 20.0,  h = 100.0 },  -- Route 68 west
-    { x = -1900.0, y = 2100.0,  z = 130.0, h = 300.0 },  -- Great Ocean Hwy
-
-    -- Paleto / north
-    { x = -200.0,  y = 6300.0,  z = 31.0,  h = 220.0 },  -- Route 1, Paleto
-    { x = 100.0,   y = 6600.0,  z = 31.0,  h = 45.0  },  -- Paleto north
+    { x = -1606.5, y = -1014.0, z = 12.0, h = 51.3 },  -- Del Perro Fwy / pier [backroad]
+    { x = -483.25, y = -1871.25, z = 16.53, h = 283.8 },  -- La Puerta Fwy [freeway]
+    { x = 198.75, y = -2188.0, z = 6.16, h = 90.0 },  -- Elysian Fields Fwy [backroad]
+    { x = 1044.5, y = -1503.0, z = 27.16, h = 4.0 },  -- East Los Santos [freeway]
+    { x = 1410.25, y = -1723.0, z = 64.94, h = 195.5 },  -- Palomino Fwy [street]
+    { x = 292.25, y = 162.5, z = 103.19, h = 250.3 },  -- Vinewood Blvd [street]
+    { x = -783.25, y = -97.75, z = 36.78, h = 27.6 },  -- Rockford Hills [street]
+    { x = 133.5, y = -901.25, z = 29.28, h = 340.8 },  -- Downtown [street]
+    { x = 490.5, y = 2626.25, z = 41.94, h = 101.3 },  -- Route 68, Harmony [street]
+    { x = 1736.25, y = 3159.25, z = 42.12, h = 112.1 },  -- Senora Fwy, Sandy [backroad]
+    { x = 1338.0, y = 4333.0, z = 36.88, h = 273.8 },  -- Alamo Sea east [gravel]
+    { x = 2190.25, y = 4793.75, z = 42.47, h = 168.0 },  -- Grapeseed [street]
+    { x = -1291.0, y = 2497.25, z = 20.47, h = 318.8 },  -- Route 68 west [street]
+    { x = -1823.25, y = 2034.75, z = 130.88, h = 274.9 },  -- Great Ocean Hwy [street]
+    { x = -135.5, y = 6242.0, z = 30.16, h = 143.1 },  -- Route 1, Paleto [freeway]
+    { x = 87.5, y = 6594.5, z = 30.56, h = 225.0 },  -- Paleto north [street]
 }
 
 -- ---------------------------------------------------------------------------

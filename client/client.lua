@@ -230,16 +230,30 @@ local function getSafeSpawnPoint(playerCoords, minDistance, maxDistance, playerF
         behindVector = playerForward,
         towards      = playerCoords,
     })
-
     if pos then return pos, heading end
 
     -- Widening the band once covers the common near-miss: the player is on a
     -- long rural road where the only qualifying tarmac is just past maxDistance.
-    return FenixRoads.findSpawnPoint(playerCoords, {
+    pos, heading = FenixRoads.findSpawnPoint(playerCoords, {
         minDistance  = minDistance,
         maxDistance  = maxDistance * 1.75,
         behindVector = playerForward,
         towards      = playerCoords,
+    })
+    if pos then return pos, heading end
+
+    -- Last resort, and the only pass that will place a unit ahead of the player.
+    -- Strictly-behind is right almost always, but "almost" is doing work: park
+    -- facing the end of a cul-de-sac and there is no road behind you at all, and
+    -- a response that never arrives is worse than one you saw coming. The front
+    -- cone stays excluded (0.7 is a 90-degree arc), so this can put a unit
+    -- alongside or diagonally ahead but never straight into the windscreen.
+    return FenixRoads.findSpawnPoint(playerCoords, {
+        minDistance   = minDistance,
+        maxDistance   = maxDistance * 1.75,
+        behindVector  = playerForward,
+        towards       = playerCoords,
+        maxForwardDot = 0.7,
     })
 end
 
@@ -2326,6 +2340,14 @@ local function handleEndWantedDelete()
             for _, pedNetID in ipairs(pedKeys) do
                 local ped = NetToPed(pedNetID)
                 if DoesEntityExist(ped) then
+                    -- DeleteEntity on a networked entity this client doesn't
+                    -- have control of can silently no-op -- the owning client
+                    -- just re-syncs it back. That is what a pursuit unit that
+                    -- "won't die" actually is, so take control before deleting
+                    -- rather than after the fact.
+                    if not NetworkHasControlOfEntity(ped) then
+                        NetworkRequestControlOfEntity(ped)
+                    end
                     DeleteEntity(ped)
                 end
                 TriggerServerEvent('deleteSpawnedPed', pedNetID)
@@ -2333,6 +2355,9 @@ local function handleEndWantedDelete()
             end
             local vehicle = NetToVeh(vehNetID)
             if DoesEntityExist(vehicle) then
+                if not NetworkHasControlOfEntity(vehicle) then
+                    NetworkRequestControlOfEntity(vehicle)
+                end
                 DeleteEntity(vehicle)
             end
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
@@ -2352,6 +2377,14 @@ local function handleEndWantedDelete()
             for _, pedNetID in ipairs(pedKeys) do
                 local ped = NetToPed(pedNetID)
                 if DoesEntityExist(ped) then
+                    -- DeleteEntity on a networked entity this client doesn't
+                    -- have control of can silently no-op -- the owning client
+                    -- just re-syncs it back. That is what a pursuit unit that
+                    -- "won't die" actually is, so take control before deleting
+                    -- rather than after the fact.
+                    if not NetworkHasControlOfEntity(ped) then
+                        NetworkRequestControlOfEntity(ped)
+                    end
                     DeleteEntity(ped)
                 end
                 TriggerServerEvent('deleteSpawnedPed', pedNetID)
@@ -2359,6 +2392,9 @@ local function handleEndWantedDelete()
             end
             local vehicle = NetToVeh(vehNetID)
             if DoesEntityExist(vehicle) then
+                if not NetworkHasControlOfEntity(vehicle) then
+                    NetworkRequestControlOfEntity(vehicle)
+                end
                 DeleteEntity(vehicle)
             end
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
@@ -2378,6 +2414,14 @@ local function handleEndWantedDelete()
             for _, pedNetID in ipairs(pedKeys) do
                 local ped = NetToPed(pedNetID)
                 if DoesEntityExist(ped) then
+                    -- DeleteEntity on a networked entity this client doesn't
+                    -- have control of can silently no-op -- the owning client
+                    -- just re-syncs it back. That is what a pursuit unit that
+                    -- "won't die" actually is, so take control before deleting
+                    -- rather than after the fact.
+                    if not NetworkHasControlOfEntity(ped) then
+                        NetworkRequestControlOfEntity(ped)
+                    end
                     DeleteEntity(ped)
                 end
                 TriggerServerEvent('deleteSpawnedPed', pedNetID)
@@ -2385,6 +2429,9 @@ local function handleEndWantedDelete()
             end
             local vehicle = NetToVeh(vehNetID)
             if DoesEntityExist(vehicle) then
+                if not NetworkHasControlOfEntity(vehicle) then
+                    NetworkRequestControlOfEntity(vehicle)
+                end
                 DeleteEntity(vehicle)
             end
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
@@ -2763,6 +2810,10 @@ function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
         local driver = GetPedInVehicleSeat(vehicle, -1)
         if driver and driver ~= 0 and DoesEntityExist(driver) then
             if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+            -- Clear the chase task first, or the driver keeps steering at the
+            -- player under TaskVehicleChase while BringVehicleToHalt fights it
+            -- for control -- the ram this feature exists to prevent.
+            ClearPedTasks(driver)
             BringVehicleToHalt(vehicle, 6.0, 2, false)
         end
         return true
@@ -2967,6 +3018,15 @@ function triggerArrest(arrestingCop)
         ClearPlayerWantedLevel(PlayerId())
         SetPlayerWantedLevel(PlayerId(), 0, false)
         SetPlayerWantedLevelNow(PlayerId(), false)
+
+        -- [Upstate Mafia] This cinematic used to be the entire consequence -
+        -- clear wanted, wake up at a station, done. qbx_arrest (standalone
+        -- resource) turns "got busted" into an actual rcore_prison sentence,
+        -- scaled by qbx_reputation's criminal tier. One report, best-effort:
+        -- if qbx_arrest isn't running this plays exactly like it did before.
+        if GetResourceState('um_livingworld') == 'started' then
+            TriggerServerEvent('qbx_arrest:server:reportArrest')
+        end
 
         local station
         if (Config.ArrestSystem.releaseAt or 'nearest') == 'random' then
@@ -3267,6 +3327,12 @@ function handleTicketApproach(vehicleData, playerPed, vehNetID)
             local driver = GetPedInVehicleSeat(vehicle, -1)
             if driver and driver ~= 0 and DoesEntityExist(driver) then
                 if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+                -- Drop the chase task before forcing a halt. Without this the
+                -- driver is still under TaskVehicleChase, actively steering and
+                -- accelerating at the player, and fights the forced braking the
+                -- whole way down — which is what reads as a ram or a PIT on a
+                -- car that has already pulled over.
+                ClearPedTasks(driver)
                 BringVehicleToHalt(vehicle, 8.0, 2, false)
             end
         end
@@ -3289,6 +3355,9 @@ function handleTicketApproach(vehicleData, playerPed, vehNetID)
         local driver = GetPedInVehicleSeat(vehicle, -1)
         if driver and driver ~= 0 and DoesEntityExist(driver) then
             if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+            -- Same reason as the backup-unit branch above: clear the live
+            -- chase task first, or this unit fights its own forced stop.
+            ClearPedTasks(driver)
             BringVehicleToHalt(vehicle, 6.0, 2, false)
         end
         return true
@@ -3598,6 +3667,7 @@ Citizen.CreateThread(function()
                 pursuitAnnounced = false
                 FenixPursuit.reset()
                 FenixTactics.clearAll()
+                FenixRoads.clearReservations()
             end
             -- [Upstate Mafia] Roadside stop state follows the same rule: no wanted
             -- level, nothing to stop for. ticketWrapUp is left alone — it is

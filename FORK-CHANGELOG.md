@@ -36,6 +36,148 @@ carjacking provenance note below.
 
 ---
 
+## 2.4.0 — ambient density tuned down, convoy scene added — 2026-08-24
+
+`client/ambient.lua` (new `spawnConvoy`), `Config.Ambient` in `config.lua`.
+
+Reported: a cop on 7 out of 10 corners, and — separately, and liked — two or
+three cruisers occasionally seen driving together with no lights on. Asked for
+the first turned down and the second turned into a real thing.
+
+### Tuned — ambient encounter rate
+
+Four settings govern how often you run into something, not what kind:
+
+| Setting | Was | Now |
+|---|---|---|
+| `spawnInterval` | 8s | 15s |
+| `maxScenes` | 4 | 3 |
+| `maxNearbyCops` | 6 | 4 |
+| `minSceneSpacing` | 90m | 120m |
+
+At 8 seconds with a cap of 4, the scene population barely had time to fall
+before the next attempt topped it back up — closer to "every open slot always
+full" than to background presence. `spawnInterval` is the biggest lever on
+that; `maxScenes` and `maxNearbyCops` cap how much is visible at once,
+`minSceneSpacing` stops independent scenes landing close enough to read as one
+big encounter.
+
+Scene-kind weights are unaffected by any of this — weights decide *which* scene
+spawns when one does, not how often one does. Turned down here on purpose,
+because the frequency complaint and the kind mix are different questions and
+tuning the wrong one doesn't fix the right one.
+
+### Added — the `convoy` scene
+
+Two or three cruisers travelling the same road together, lights and sirens
+off. This was already happening by accident: independent `patrol` scenes,
+spawned close enough together and started on the same road, drift into a loose
+group on their own, because `TaskVehicleDriveWander` just keeps a car on
+whatever road it is already on. It looked good and cost three times what it
+should have to get — three scene slots and three officers out of the
+nearby-cops budget for one visual, which is also part of why corners felt
+crowded.
+
+`spawnConvoy` is the same look, deliberately, for the price of one scene.
+Placement reuses `bestRoadNode` for the lead car exactly as `patrol` does;
+trailing cars are placed nose-to-tail behind it along the road's own heading
+(`Config.Ambient.convoySpacing`, 9m), each checked for clearance individually
+so a trailing spot landing on parked traffic just spawns one fewer car rather
+than failing the whole scene. One vehicle model for the group — matching cars
+is most of what sells "travelling together" over "three coincidental patrols."
+
+Two cars by default, three `convoyThirdCarChance` (35%) of the time. Its own
+cooldown (`convoyCooldownSeconds`, 240s) for the same reason `stop` and
+`pursuit` have one: a group is more noticeable than a single patrol car, so the
+weight alone can't express "occasional" — it needs a floor. Added to
+`Config.Ambient.weights` at 2, with `patrol` trimmed 4 → 3 alongside it so the
+total rate of "driving cop" encounters doesn't rise just because there are now
+two kinds of it.
+
+Enforcement (radar-style speed checks against the player) applies to convoy
+scenes exactly as it already does to patrol — that's `enforceFromAllCops`,
+unrelated to and untouched by this change. A convoy that happens to be nearby
+when you fly past still notices, which is correct: they're cops, not props.
+
+---
+
+## 2.3.1 — two cruisers spawning on one point — 2026-08-24
+
+`client/roads.lua`, `client/client.lua`, `config.lua`.
+
+### Fixed — two cruisers landing on the same point and flipping each other
+
+Reported: two cop cars spawning on top of each other and flipping, three times
+in one session, always in front of the player.
+
+Two independent bugs, both introduced in 2.1.0's road rewrite.
+
+**No coordination between concurrent spawn requests.** `maintainPoliceUnits` can
+fire several spawn requests in one tick, and each is a round trip to the server
+before any vehicle exists. `IsPositionOccupied` cannot see a car that has not
+been created yet, so nothing stopped two requests picking the same spot. This
+used to happen rarely, because the old first-fit node search took whichever
+random candidate passed first and scattered. The 2.1.0 rewrite scores every
+candidate and keeps the best, and two calls a few milliseconds apart — same
+player position, same road network — reliably converge on the *same* best
+lane centre, with the same deterministic 'outer' lane choice putting them on the
+exact same point.
+
+Fixed with a short-lived reservation: the winning point is claimed for
+`Config.Roads.reservationSeconds` (25s), and a later candidate within
+`spawnSeparation` (18m) of a live reservation is rejected. The reservation only
+has to outlive the round trip — once the vehicle exists, the ordinary occupancy
+check takes over. Cleared when a pursuit ends, so the next one doesn't work
+around spots promised to units that no longer exist.
+
+**Units spawning in front of the player.** Two problems compounding into one
+symptom.
+
+The rear-arc bias was built by converting the player's forward vector to a
+heading with `GetHeadingFromVector_2d`, adding the arc offset, and feeding the
+result to `sin`/`cos`. GTA headings increase anticlockwise from north; the
+`sin`/`cos` pairing used throughout this codebase (see `forwardOf` /
+`rightOf` in `client/roads.lua`) sweeps the opposite way. The two conventions
+run in opposite directions, so the result was the player's facing **mirrored
+across the north-south axis**. Facing exactly north or south, the mirror is
+its own inverse and the bug is invisible — which is almost certainly why it
+shipped unnoticed. Facing anywhere else, "behind" resolved to a direction with
+no fixed relationship to actually-behind, up to and including dead ahead.
+Fixed by rotating the forward vector directly, which has no heading-convention
+round trip to get backwards.
+
+Separately: the *old*, pre-2.1.0 code rejected any candidate whose position
+dotted positive against the player's forward vector — a hard "never in front"
+rule. The 2.1.0 rewrite kept the rear-arc *sampling* bias but dropped that
+rejection, replacing it with a scoring bonus on which way the ROAD's own
+direction faced the target. Those are different questions: sampling biases
+where you start looking, but the sample point is only a seed — `roadAt`
+resolves it to the nearest real road, which can be a considerable distance
+away in any direction, rear sample included. Nothing was left refusing a
+final position ahead of the player. Restored as `Config.Roads.maxForwardDot`
+(0.0 — the whole forward half-plane is refused), checked against the final
+lane position rather than the sample point.
+
+With both fixed independently, either bug reproduces the report on its own —
+the mirroring explains appearing in front regardless of facing, and the missing
+reservation explains two cars doing it in the same place. Together they were
+worse: the mirrored sampling made "in front" the common case rather than the
+occasional one, so a same-tick pair of requests converging on one best road was
+also usually converging on a road ahead of the player, which is where the
+flipping was being watched happen.
+
+`getSafeSpawnPoint`'s widen-the-band retry (for a player on a long rural road
+past `maxPoliceSpawnDistance`) now has a third pass if the first two still find
+nothing: same widened band, `maxForwardDot = 0.7` (a 90-degree forward cone
+allowed rather than none). Strictly-behind is correct almost always, but parked
+facing the end of a cul-de-sac there may be no road behind at all, and a unit
+that never arrives is worse than one seen coming. The cone stays excluded even
+here, so this can place a unit alongside or diagonally ahead, never straight
+into the windscreen.
+
+`Config.Roads.clearance` raised 3.0 -> 4.0. A police cruiser is roughly 5m long;
+3m left cars that spawned close but not reserved-close still overlapping.
+
 ## 2.3.0 — server-side entity security — 2026-08-24
 
 New file `server/guard.lua`; `Config.Security` in `config.lua`;

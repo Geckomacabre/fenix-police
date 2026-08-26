@@ -115,6 +115,20 @@ carriageway because they drive off immediately.
 `radarFallbackToRoadNodes` now defaults **off** — it invented traps at random
 nodes and was the single largest source of "there are cops everywhere".
 
+### Encounter rate, and the convoy scene
+
+`spawnInterval`, `maxScenes`, `maxNearbyCops` and `minSceneSpacing` are all
+tuned down from their original defaults — a cop on 7 out of 10 corners was the
+reported experience, and the first three of those in particular are what
+control how fast an empty scene slot gets refilled, not just how many exist at
+once.
+
+Two or three cruisers occasionally seen driving together with no lights on is
+now a real scene (`convoy`) instead of an accident of independent patrols
+drifting together on the same road. Two cars normally, three sometimes, on
+their own cooldown so it stays a sight rather than the new normal. See
+`Config.Ambient.convoy*` in `config.lua`.
+
 ### Lane-correct placement and airside no-go zones
 
 Both spawners now go through `client/roads.lua`, which resolves a candidate
