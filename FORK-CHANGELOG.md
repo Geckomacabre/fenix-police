@@ -36,6 +36,61 @@ carjacking provenance note below.
 
 ---
 
+## 2.5.0 — vice_hud integration: search overlay, GPS tracker, real tells — 2026-08-27
+
+`client/pursuit.lua`, `client/tracker.lua` (new), `server/tracker.lua` (new),
+`server/guard.lua`, `config.lua`, `fxmanifest.lua`.
+
+### Added — exports for vice_hud's own search-radius overlay
+
+`FenixPursuit`'s existing contact/search model (`IsSearching`, `HasContact`,
+`SearchRadius`, `SearchCentre`, `SearchRadiusBounds`) is now exported
+read-only, so vice_hud can draw its own minimap overlay — a tight ring at the
+last-known position, a lighter one tracking the live search radius — instead
+of this resource's own AI blips. `Config.Pursuit.blips` now defaults `false`
+to match: police visibility on the minimap is vice_hud's job now.
+
+### Added — GPS tracker
+
+Every dispatch vehicle (`Config.vehiclesByRegion` — the exact set
+`server/guard.lua` already allowlists, not a second list to keep in sync)
+carries a tracker by default. While a wanted player is DRIVING one,
+`pursuit.lua`'s contact thread treats them as seen regardless of actual line
+of sight — the same override gunfire already gets (see `makingNoise`).
+Stealing a cruiser no longer makes you invisible to dispatch.
+
+Removable via a new ox_target vehicle option ("Remove GPS Tracker"), gated on
+holding `Config.Tracker.removeTool` (`screwdriverset` by default) and, by
+default, on nobody currently being able to see the removal
+(`FenixPursuit.hasContact()`). State lives in a vehicle statebag
+(`trackerRemoved`) so it survives the vehicle changing hands; only
+`server/tracker.lua` ever sets it, after independently re-validating the
+vehicle's model against `server/guard.lua`'s allowlist and confirming the
+requester is that vehicle's actual driver — the client-side gates are UX, not
+the authority.
+
+### Added — real outfit/voice/vehicle tells
+
+`callItIn()` (fires once per pursuit, describing the crime) now also
+snapshots the player's clothing (drawable+texture ids across every component)
+and current vehicle model. New `FenixPursuit.tells()` / exported `GetTells()`
+compares the player's CURRENT state against that snapshot: change clothes and
+the `outfit` tell clears; leave (or swap out of) the snapshotted vehicle and
+`vehicle` clears. `voice` never clears — there's no voice-changing mechanic in
+this codebase, so once dispatch has heard you that one is permanent for the
+pursuit.
+
+### Note — the native hidden-evasion timer is untouched
+
+`SET_WANTED_LEVEL_HIDDEN_ESCAPE_TIME` (`SetWantedLevelHiddenEvasionTime`) is
+left exactly as this resource already configures it. Gating that native's own
+internal "how long have you been continuously hidden" clock on tracker/outfit
+state would have meant fighting an opaque engine timer for no real benefit —
+this resource's own contact/search model is what actually drives unit
+behaviour, and that's where the tracker gate above lives instead.
+
+---
+
 ## 2.4.2 — units spawning on the opposite carriageway of divided roads — 2026-08-25
 
 `client/roads.lua`, `Config.Roads` in `config.lua`.
