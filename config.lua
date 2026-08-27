@@ -982,9 +982,15 @@ Config.Pursuit = {
     -- then sweep outward from it; the radius grows the longer you stay hidden,
     -- so a search starts tight on the sighting and loosens into the surrounding
     -- blocks rather than being a fixed circle.
-    searchRadiusStart  = 40.0,
-    searchRadiusGrowth = 4.0,    -- metres per second lost
-    searchRadiusMax    = 180.0,
+    --
+    -- These feed vice_hud's inner/outer search-radius circles directly (see
+    -- its Config.PoliceSearch) -- there's no separate "visual size" knob on
+    -- that end, this IS the size. Scaled up ~3.5x from the original
+    -- 40/4/180 after the circles read as too small on the actual minimap/
+    -- pause map: units now search a wider area for the same reason.
+    searchRadiusStart  = 140.0,
+    searchRadiusGrowth = 14.0,    -- metres per second lost
+    searchRadiusMax    = 630.0,
 
     -- Mute sirens (not lights) while searching. A unit that has lost the suspect
     -- wants to hear the street, not announce itself to it.
