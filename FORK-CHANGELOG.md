@@ -36,6 +36,36 @@ carjacking provenance note below.
 
 ---
 
+## 2.5.1 — wanted level never rising: max wanted level stuck at 0 — 2026-08-27
+
+`client/client.lua` (main thread), `config.lua`.
+
+### Fixed — the engine's own wanted-level ceiling was 0
+
+Reported live: killing peds on a rampage produced no stars at all, and a
+manual `SetPlayerWantedLevel` didn't work either. `/fenix:diag` showed
+`maxWantedLevel = 0` with `disableAIPolice = false` — meaning
+`UpdateDispatchServices()` (which calls `SetMaxWantedLevel(5)`) HAD already
+run, since `disableAIPolice` had moved off its `nil` default, and yet the
+engine's own cap still read back 0.
+
+That call only ever happened reactively, inside `UpdateDispatchServices()`,
+itself only invoked from the server's `fenix-police:updateCopsOnline`
+broadcast (`server/server.lua`, every 55s) when `disableAIPolice` actually
+changes value. With `GetMaxWantedLevel()` at 0, `SET_PLAYER_WANTED_LEVEL`
+silently clamps every crime to 0 stars no matter what raises it — a native
+crime, `ApplyWantedLevel`, or a manual `SetPlayerWantedLevel` call all hit the
+same ceiling.
+
+New `Config.MaxWantedLevel` (5), re-applied unconditionally every cycle in
+the main thread — the exact same defensive pattern that loop already uses two
+lines above it for `policet` suppression ("the game can reset this
+suppression flag") and two lines below it for the ambient dispatch-service
+disables. No longer depends on one event's timing or the `disableAIPolice`
+transition guard ever lining up correctly.
+
+---
+
 ## 2.5.0 — vice_hud integration: search overlay, GPS tracker, real tells — 2026-08-27
 
 `client/pursuit.lua`, `client/tracker.lua` (new), `server/tracker.lua` (new),
