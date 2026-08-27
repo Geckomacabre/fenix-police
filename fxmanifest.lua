@@ -6,6 +6,10 @@ description "AI police dispatch and wanted levels, with ambient enforcement"
 version "2.4.2"
 
 shared_scripts {
+    -- Needed by client/tracker.lua (lib.notify, lib.progressCircle). Nothing
+    -- else in this resource used ox_lib before that file existed.
+    '@ox_lib/init.lua',
+
     'config.lua',
     'data/ambient_points.lua',
 
@@ -16,10 +20,18 @@ shared_scripts {
     'config.local/*.lua'
 }
 
+dependencies {
+    'ox_lib'
+}
+
 client_scripts {
     -- Shared road/lane/no-go-zone helper. Loaded first: both scripts below call
     -- into the FenixRoads global it defines.
     'client/roads.lua',
+
+    -- GPS tracker model. Loaded before pursuit.lua, whose contact thread
+    -- calls into the FenixTracker global this defines.
+    'client/tracker.lua',
 
     -- Pursuit contact model (what the police can actually see), AI blips and
     -- radio traffic. Also loaded before client.lua, which drives it.
@@ -38,5 +50,9 @@ server_scripts {
     -- defines, and a handler that ran before it existed would be an open door.
     'server/guard.lua',
 
-    'server/server.lua'
+    'server/server.lua',
+
+    -- GPS tracker removal. Reads FenixGuard.isAllowedVehicleModel, so it must
+    -- load after guard.lua.
+    'server/tracker.lua'
 }

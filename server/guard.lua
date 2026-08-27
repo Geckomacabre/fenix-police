@@ -81,6 +81,15 @@ local function allowVehicle(model)
     if type(model) == 'string' then allowedVehicles[GetHashKey(model)] = true end
 end
 
+--- Is this model one of the dispatch vehicles built above? Exposed read-only
+--- for anything that needs the same "is this a police vehicle" answer
+--- without re-deriving it from Config.vehiclesByRegion itself — server/tracker.lua,
+--- for one: whether a vehicle is trackable is exactly this same question.
+--- @param model number a model HASH, not a name
+function FenixGuard.isAllowedVehicleModel(model)
+    return allowedVehicles[model] == true
+end
+
 local function allowPed(model)
     if type(model) == 'string' then allowedPeds[GetHashKey(model)] = true end
 end

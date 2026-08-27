@@ -54,6 +54,13 @@ local contact = {
     lostAt       = 0,          -- game timer when contact broke, 0 while held
     everSeen     = false,      -- suppresses "lost the suspect" before first sight
     vehicleDesc  = nil,        -- cached description of the car they were last in
+
+    -- What dispatch broadcast when the crime was called in — see callItIn().
+    -- Read by tells() below to answer "does the player still match their own
+    -- description". nil (outfitSig especially) doubles as "no pursuit called
+    -- in since the last reset", which is what gates tells() entirely.
+    outfitSig    = nil,        -- string, drawable+texture ids across every clothing component
+    vehicleModel = nil,        -- model hash the player was in when called in, or nil for on foot
 }
 
 -- Rate limiting for the radio, so a player weaving through traffic doesn't
@@ -122,6 +129,19 @@ local function describeVehicle(vehicle)
         return ('a %s %s'):format(colour, name)
     end
     return ('a %s'):format(name)
+end
+
+--- Drawable+texture id across every clothing component, concatenated into one
+--- comparable string. Not a real appearance hash (props/hair colour/etc.
+--- aren't included) — just enough to answer "did they change clothes since
+--- the crime", which is a coarser question than "what do they look like now".
+local function outfitSignature(ped)
+    local parts = {}
+    for i = 0, 11 do
+        parts[#parts + 1] = GetPedDrawableVariation(ped, i)
+        parts[#parts + 1] = GetPedTextureVariation(ped, i)
+    end
+    return table.concat(parts, ':')
 end
 
 -------------------------------------------------------------------------------
@@ -377,19 +397,50 @@ function FenixPursuit.sirenWanted()
     return not FenixPursuit.isSearching()
 end
 
+--- What dispatch's description of the player still matches, right now.
+--- `true` on a key means that tell is still live — the player still looks
+--- like the person dispatch described, so it's still working against them.
+--- Getting a tell to read `false` is what "changing your outfit" / "changing
+--- vehicles" actually buys the player; see client/tracker.lua for the same
+--- idea applied to the vehicle itself rather than its description.
+---
+--- Every key reads false before any pursuit has been called in (outfitSig is
+--- nil) — nothing to compare against yet — and `voice` never clears once one
+--- has: there's no voice-changing mechanic in this codebase, so once
+--- dispatch has heard the player that tell is permanent for the pursuit.
+--- @return { outfit: boolean, vehicle: boolean, voice: boolean }
+function FenixPursuit.tells()
+    if cfg().enabled == false or not contact.outfitSig then
+        return { outfit = false, vehicle = false, voice = false }
+    end
+
+    local playerPed = PlayerPedId()
+    local outfitTell = contact.outfitSig == outfitSignature(playerPed)
+
+    local vehicleTell = false
+    if contact.vehicleModel then
+        local veh = GetVehiclePedIsIn(playerPed, false)
+        vehicleTell = veh ~= 0 and GetEntityModel(veh) == contact.vehicleModel
+    end
+
+    return { outfit = outfitTell, vehicle = vehicleTell, voice = true }
+end
+
 --- Full reset. Called when the wanted level clears, so the next pursuit starts
 --- from no knowledge rather than inheriting the last one's last known position.
 function FenixPursuit.reset()
     for ped in pairs(observers) do clearBlip(ped) end
     observers = {}
 
-    contact.active      = false
-    contact.lastKnown   = nil
-    contact.lastHeading = 0.0
-    contact.lastSeenAt  = 0
-    contact.lostAt      = 0
-    contact.everSeen    = false
-    contact.vehicleDesc = nil
+    contact.active       = false
+    contact.lastKnown    = nil
+    contact.lastHeading  = 0.0
+    contact.lastSeenAt   = 0
+    contact.lostAt       = 0
+    contact.everSeen     = false
+    contact.vehicleDesc  = nil
+    contact.outfitSig    = nil
+    contact.vehicleModel = nil
 
     lastDispatchAt = 0
     lastSpeechAt = 0
@@ -405,6 +456,12 @@ function FenixPursuit.callItIn(wantedLevel)
     local vehicle = GetVehiclePedIsIn(playerPed, false)
 
     contact.vehicleDesc = describeVehicle(vehicle)
+
+    -- What tells() compares the player's CURRENT state against — this is the
+    -- description dispatch actually has, snapshotted the moment it goes out,
+    -- not re-derived later from whatever the player looks like by then.
+    contact.outfitSig = outfitSignature(playerPed)
+    contact.vehicleModel = (vehicle ~= 0) and GetEntityModel(vehicle) or nil
 
     local where = streetAt(coords)
     local parts = {}
@@ -478,6 +535,14 @@ CreateThread(function()
                 seen = true
             end
 
+            -- A tracked dispatch vehicle overrides line of sight entirely —
+            -- see client/tracker.lua. Checked last since it's the priciest of
+            -- the three (a model lookup plus a statebag read) and the other
+            -- two already short-circuit most ticks.
+            if not seen and FenixTracker and FenixTracker.playerInTrackedVehicle(playerPed) then
+                seen = true
+            end
+
             if seen then
                 contact.lastKnown  = playerCoords
                 contact.lastSeenAt = now
@@ -526,4 +591,35 @@ end)
 AddEventHandler('onResourceStop', function(res)
     if res ~= GetCurrentResourceName() then return end
     for ped in pairs(observers) do clearBlip(ped) end
+end)
+
+-------------------------------------------------------------------------------
+-- Exports (for vice_hud's search-radius circle overlay)
+-------------------------------------------------------------------------------
+-- Nothing here changes state -- these just expose the contact model read-only
+-- so another resource can draw what it means without duplicating it.
+
+exports('IsSearching', FenixPursuit.isSearching)
+exports('HasContact', FenixPursuit.hasContact)
+exports('SearchRadius', FenixPursuit.searchRadius)
+
+-- { outfit, vehicle, voice } -- which parts of dispatch's description of the
+-- player are still accurate right now. See FenixPursuit.tells() above; this
+-- is what vice_hud's wanted-tells row polls instead of the placeholder
+-- "all three, always" it shipped with.
+exports('GetTells', FenixPursuit.tells)
+
+-- Where the circle should be centred right now: the player's live position
+-- while seen, the last known position while searching, nil otherwise.
+exports('SearchCentre', function()
+    if not FenixPursuit.isSearching() then return nil end
+    local coords = FenixPursuit.targetCoords(GetEntityCoords(PlayerPedId()))
+    return { x = coords.x, y = coords.y, z = coords.z }
+end)
+
+-- Static config a caller needs once, not every poll: the fixed radius a
+-- search starts at (the "crime origin" ring) and the cap it grows to.
+exports('SearchRadiusBounds', function()
+    local c = cfg()
+    return { start = c.searchRadiusStart or 40.0, max = c.searchRadiusMax or 180.0 }
 end)

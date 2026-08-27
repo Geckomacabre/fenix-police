@@ -991,7 +991,12 @@ Config.Pursuit = {
     -- one can see. The cone is not decoration: it is the same number sightRange
     -- and sightFov feed, so a player watching the cones is reading the actual
     -- contact model.
-    blips      = true,
+    --
+    -- Off by default: vice_hud draws its own inner/outer search-radius circles
+    -- (fed by FenixPursuit.isSearching/.searchRadius/.targetCoords via this
+    -- resource's exports) instead of per-officer blips, so the player reads
+    -- "the area cops are working" rather than individual unit positions.
+    blips      = false,
     blipCones  = true,
 
     -- Blip colour index. Left nil, officers get the game's default AI blip,
@@ -1025,6 +1030,34 @@ Config.Pursuit = {
     officerSpeech  = true,
     speechRange    = 60.0,
     speechCooldown = 6000,
+}
+
+-- GPS TRACKER --
+--
+-- Every dispatch vehicle (everything in Config.vehiclesByRegion — the exact
+-- set server/guard.lua already allowlists) is fitted with a tracker by
+-- default. While a wanted player is DRIVING one, client/pursuit.lua's contact
+-- thread treats them as seen regardless of actual line of sight, the same way
+-- gunfire already overrides it (see makingNoise in pursuit.lua) — stealing a
+-- cruiser doesn't make you invisible, because whoever's watching the fleet
+-- already knows exactly where it is.
+--
+-- The only way out is removing it: client/tracker.lua's ox_target
+-- interaction, gated on holding removeTool and (by default) on nobody
+-- currently being able to see you do it.
+Config.Tracker = {
+    enabled = true,
+
+    -- ox_inventory item required to attempt a removal. '' or nil skips the
+    -- check entirely.
+    removeTool = 'screwdriverset',
+
+    -- How long the ox_lib progress bar takes, in ms.
+    removeMs = 12000,
+
+    -- Refuse the attempt while FenixPursuit.hasContact() is true — an officer
+    -- can currently see the player. Set false to allow it in plain sight.
+    blockWhileSeen = true,
 }
 
 
