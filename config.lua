@@ -69,6 +69,14 @@ Config.PoliceJobsToCheck = {
     },
 }
 
+-- The engine's own wanted-level CEILING (SET_MAX_WANTED_LEVEL), not this
+-- resource's own settings. If this ever reads back as 0 (see /fenix:diag),
+-- GetPlayerWantedLevel can never rise above 0 no matter what sets it --
+-- native crimes, ApplyWantedLevel, even a manual SetPlayerWantedLevel are all
+-- silently clamped. Re-applied every cycle in the main thread rather than
+-- only reactively, for exactly that reason.
+Config.MaxWantedLevel = 5
+
 -- Are players with police jobs in the list above protected from becoming wanted?
 Config.PoliceWantedProtection = true
 

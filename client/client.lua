@@ -3558,6 +3558,21 @@ Citizen.CreateThread(function()
         -- Keep policet suppressed every cycle — the game can reset this suppression flag.
         SetVehicleModelIsSuppressed(GetHashKey('policet'), true)
 
+        -- [Upstate Mafia patch] SetMaxWantedLevel(5) previously only ran
+        -- reactively inside UpdateDispatchServices(), itself only called from
+        -- the server's fenix-police:updateCopsOnline broadcast (server/server.lua,
+        -- every 55s) when disableAIPolice actually CHANGES value. Observed on a
+        -- live server: GetMaxWantedLevel() reads back 0 even though that path
+        -- had already run (disableAIPolice was correctly false, not its nil
+        -- default) — the engine's own cap was never actually reaching 5, so
+        -- SET_PLAYER_WANTED_LEVEL silently clamped every crime to 0 stars, no
+        -- matter the cause (killing peds, ApplyWantedLevel, even a manual
+        -- SetPlayerWantedLevel). Re-asserted here every cycle instead, same
+        -- reasoning as the policet suppression above it and the ambient
+        -- dispatch-service disables below it: cheap, idempotent, and no longer
+        -- depends on one event's timing/logic ever landing correctly.
+        SetMaxWantedLevel(Config.MaxWantedLevel or 5)
+
         if wantedLevel > 0 then
             print(('[FENIX-LOOP] wanted=%d disableAI=%s pendingGround=%d'):format(wantedLevel, tostring(disableAIPolice), pendingGroundSpawns))
             -- Open spawn gate so new spawns are accepted for this chase.
