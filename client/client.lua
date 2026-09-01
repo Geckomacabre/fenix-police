@@ -50,6 +50,21 @@ Citizen.CreateThread(function()
 end)
 
 
+-- [Upstate Mafia] Aftermath state, declared here (not down by the functions
+-- that use it, see the AFTERMATH section below) specifically so the
+-- independent cleanup watchdog thread further down this file -- which runs
+-- BEFORE that section and would otherwise have no visibility into a `local`
+-- declared after it -- can check aftermath.active too. That watchdog exists
+-- precisely to hammer handleEndWantedDelete() regardless of what the main
+-- loop is doing; without this it deleted every officer mid field-revive
+-- attempt within half a second of the wanted level clearing, the exact bug
+-- this comment is here to stop from happening again.
+local aftermath = {
+    active            = false, -- a sequence currently owns nearby units
+    until_            = 0,     -- GetGameTimer() hard cap on how long a failed attempt holds the scene
+    attemptedThisDown = false, -- at most one attempt per down, not per tick
+}
+
 -- TABLES --
 -- Tables to keep track of spawned police units
 local spawnedVehicles = {} -- Table to store {vehicle = vehicle, officers = {driver = officer1, passenger = officer2...}, officerTasks = {}}
@@ -2465,9 +2480,18 @@ end)
 -- seconds regardless of wantedTimer state, pcall health, or in-flight spawns.
 -- This is completely separate from the main loop so nothing in that loop's
 -- error handling or timing can prevent cleanup from firing.
+--
+-- [Upstate Mafia] Held off while aftermath.active. This ran unconditionally
+-- within 500ms of the wanted level clearing -- which happens the instant the
+-- player is incapacitated -- so it deleted every officer mid field-revive
+-- attempt regardless of anything the aftermath sequence or the main loop
+-- were doing. pendingCleanup latches the moment wanted drops rather than
+-- re-testing prevWanted, since by the time aftermath actually ends prevWanted
+-- has long since settled to false and the falling edge would already be gone.
 -- ============================================================================
 CreateThread(function()
     local prevWanted = false
+    local pendingCleanup = false
     while true do
         Wait(500)
         local plyPed = PlayerPedId()
@@ -2476,9 +2500,15 @@ CreateThread(function()
         local wanted = GetPlayerWantedLevel(PlayerId()) > 0
 
         if prevWanted and not wanted then
-            -- Wanted level just dropped — run cleanup five times over five seconds.
-            -- Five passes ensures in-flight server-side spawn responses that arrive
-            -- up to ~4 seconds after cleanup still get caught and deleted.
+            pendingCleanup = true
+        end
+
+        if pendingCleanup and not aftermath.active then
+            pendingCleanup = false
+            -- Wanted level dropped and nothing is holding the scene — run
+            -- cleanup five times over five seconds. Five passes ensures
+            -- in-flight server-side spawn responses that arrive up to ~4
+            -- seconds after cleanup still get caught and deleted.
             for i = 1, 5 do
                 local ok, err = pcall(handleEndWantedDelete)
                 if not ok then
@@ -3550,11 +3580,9 @@ end
 
 local function aftermathCfg() return Config.Aftermath or {} end
 
-local aftermath = {
-    active           = false,  -- a sequence currently owns nearby units
-    until_           = 0,      -- GetGameTimer() hard cap on how long a failed attempt holds the scene
-    attemptedThisDown = false, -- at most one attempt per down, not per tick
-}
+-- aftermath itself is declared near the top of the file (see the comment
+-- there) so the cleanup watchdog thread, which runs before this section,
+-- can see it too.
 
 --- Nearest ground officer peds to `coords`, nearest first. Air/heli units are
 --- excluded -- nobody is landing a helicopter to perform CPR.
