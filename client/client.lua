@@ -3533,6 +3533,21 @@ end)
 -- anything itself; it just means the scene holds in case that alert gets
 -- answered, instead of the units already on scene disappearing first.
 
+--- Framework-agnostic incapacitation check, shared by the wanted-clear logic
+--- below and the aftermath hold check further down (client/client.lua's main
+--- loop). Both used to run this independently, and the copy guarding
+--- handleEndWantedDelete() was missing the metadata fallback -- meaning on any
+--- framework where incapacitation only shows up in metadata (not the native
+--- IsEntityDead/IsPedFatallyInjured checks), aftermath saw "recovered" the
+--- instant the wanted level cleared and let the despawn sweep run immediately,
+--- before a field revive ever got a chance to start.
+local function isPlayerIncapacitated(playerPed)
+    if IsEntityDead(playerPed) or IsPedFatallyInjured(playerPed) then return true end
+    local pd = QBCore and QBCore.Functions and QBCore.Functions.GetPlayerData and QBCore.Functions.GetPlayerData()
+    local md = pd and pd.metadata or nil
+    return md ~= nil and (md['isdead'] or md['inlaststand'] or md['dead']) == true
+end
+
 local function aftermathCfg() return Config.Aftermath or {} end
 
 local aftermath = {
@@ -3599,7 +3614,7 @@ local function attemptFieldRevive(medicPed, playerCoords)
         if not aftermath.active then return end
         if DoesEntityExist(medicPed) then ClearPedTasks(medicPed) end
 
-        local stillDown = IsEntityDead(cache.ped) or IsPedFatallyInjured(cache.ped)
+        local stillDown = isPlayerIncapacitated(cache.ped)
         if stillDown and math.random() < (c.reviveChance or 0.35) then
             if Config.isDebug then print('[fenix-police] field revive succeeded') end
             TriggerEvent('wasabi_ambulance:revive')
@@ -3741,11 +3756,9 @@ Citizen.CreateThread(function()
             -- Original line read metadata['isdead'] / ['inlaststand'] from qb-ambulancejob.
             -- wasabi_ambulance doesn't set those keys, so dead players never cleared their wanted level.
             -- Native checks work regardless of EMS resource. Metadata kept as fallback for qbx_ambulancejob users.
-            local _pd = QBCore and QBCore.Functions and QBCore.Functions.GetPlayerData and QBCore.Functions.GetPlayerData()
-            local _md = _pd and _pd.metadata or nil
-            local _incapacitated = IsEntityDead(playerPed)
-                or IsPedFatallyInjured(playerPed)
-                or (_md and (_md['isdead'] or _md['inlaststand'] or _md['dead']))
+            -- See isPlayerIncapacitated() above the aftermath section -- shared
+            -- with the recovery check below so the two can't drift apart again.
+            local _incapacitated = isPlayerIncapacitated(playerPed)
             if _incapacitated then
                 if not aftermath.attemptedThisDown then
                     aftermath.attemptedThisDown = true
@@ -3840,7 +3853,7 @@ Citizen.CreateThread(function()
             -- field-revive/scene-hold sequence owns nearby units. Ends itself
             -- once the player recovers (field revive, real EMS, an admin
             -- command -- any of them) or the hold cap runs out.
-            local recovered = not (IsEntityDead(playerPed) or IsPedFatallyInjured(playerPed))
+            local recovered = not isPlayerIncapacitated(playerPed)
             if recovered then
                 aftermath.attemptedThisDown = false
                 if aftermath.active then endAftermath() end
