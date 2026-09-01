@@ -33,10 +33,32 @@ end)
 
 
 
--- CLEANUP LOGIC -- 
+-- CLEANUP LOGIC --
 local activeGroundUnits = {}
 local playerWantedStatus = {}
 local lastGlobalCleanup = 0
+
+-- [Upstate Mafia] AFTERMATH -- src -> true while that player's client is
+-- running a field-revive/scene-hold sequence (client/client.lua's
+-- beginAftermath/endAftermath). The wanted level clears the instant the
+-- player is incapacitated, so without this the server had no way to tell
+-- "no longer wanted because they're being revived" apart from "no longer
+-- wanted, clean everything up" -- applyGroundPursuitTask kept re-tasking
+-- units to shoot at and ram the player's body every second, and
+-- cleanupIfNoPlayersWanted() kept wiping activeGroundUnits and broadcasting
+-- a global despawn every couple of seconds, regardless of what the client
+-- was doing with those same officers.
+local aftermathHolding = {}
+
+RegisterNetEvent('fenix-police:aftermathState')
+AddEventHandler('fenix-police:aftermathState', function(active)
+    local src = source
+    if active then
+        aftermathHolding[src] = true
+    else
+        aftermathHolding[src] = nil
+    end
+end)
 
 local function removeActiveGroundUnit(vehNetID)
     activeGroundUnits[vehNetID] = nil
@@ -69,6 +91,12 @@ local function dispatchCombatProfile(pedNetID, profile)
 end
 
 local function applyGroundPursuitTask(unit)
+    -- Player's client owns these officers now (walking one over for a field
+    -- revive, parking others to hold the scene) -- re-issuing combat/chase
+    -- tasks every second on top of that just fights it, which is how a unit
+    -- ends up shooting at and running over a body it should be reviving.
+    if aftermathHolding[unit.target] then return end
+
     local vehicle = NetworkGetEntityFromNetworkId(unit.vehNetID)
     local targetPed = GetPlayerPed(unit.target)
 
@@ -121,10 +149,35 @@ local function applyGroundPursuitTask(unit)
 
     local distance = getDistanceBetweenEntities(driver, targetPed)
     if distance > 45.0 then
-        -- Direct response phase: drive to where the wanted player is now.
+        -- Direct response phase. Every unit used to drive straight at the
+        -- player's live position, which reads as a conga line converging from
+        -- one direction rather than a real response -- especially with
+        -- several units all spawned behind the player at once (see
+        -- Config.Roads' rear-arc spawn bias).
+        --
+        -- Half the units (by a stable per-vehicle split, so a unit doesn't
+        -- flip roles every second) instead drive to where the player is
+        -- HEADING: current position plus their velocity projected forward
+        -- Config.Driving.interceptLeadDistance metres. No road graph lookup
+        -- needed -- GET_ENTITY_VELOCITY/COORDS are synced entity state, valid
+        -- server side, unlike the AI/task natives combat_bridge exists for.
+        -- Falls back to tailing (the old behaviour) below the configured
+        -- minimum speed: leading a target that isn't meaningfully moving just
+        -- means driving to nowhere in particular.
+        local dc = Config.Driving or {}
+        local driveTarget = targetCoords
+        if (tonumber(unit.vehNetID) or 0) % 2 == 0 then
+            local vel = GetEntityVelocity(targetPed)
+            local speed = #(vector2(vel.x, vel.y))
+            if speed >= (dc.interceptMinSpeed or 4.0) then
+                local lead = dc.interceptLeadDistance or 70.0
+                driveTarget = targetCoords + (vector3(vel.x, vel.y, 0.0) / speed) * lead
+            end
+        end
+
         dispatchCombatProfile(unit.driverNetID, {
             vehicleDriveTo = {
-                x = targetCoords.x, y = targetCoords.y, z = targetCoords.z,
+                x = driveTarget.x, y = driveTarget.y, z = targetCoords.z,
                 speed = 42.0,
                 vehicleModelHash = GetEntityModel(vehicle),
                 drivingStyle = 6,
@@ -174,7 +227,16 @@ local function anyPlayerWanted()
     return false, true
 end
 
+local function anyPlayerHoldingAftermath()
+    for _, holding in pairs(aftermathHolding) do
+        if holding then return true end
+    end
+    return false
+end
+
 local function cleanupIfNoPlayersWanted()
+    if anyPlayerHoldingAftermath() then return end
+
     local someoneWanted, allPlayersKnown = anyPlayerWanted()
     if not someoneWanted and allPlayersKnown then
         local now = os.time()
@@ -189,6 +251,7 @@ end
 AddEventHandler('playerDropped', function()
     local src = source
     playerWantedStatus[src] = nil
+    aftermathHolding[src] = nil
     for vehNetID, unit in pairs(activeGroundUnits) do
         if unit.target == src then
             removeActiveGroundUnit(vehNetID)

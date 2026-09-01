@@ -65,6 +65,19 @@ local aftermath = {
     attemptedThisDown = false, -- at most one attempt per down, not per tick
 }
 
+-- A resource restart while aftermath.active was true (a crash, a manual
+-- `restart fenix-police` mid-sequence) wipes this client's Lua state clean,
+-- but the server's aftermathHolding[src] flag it was told about has no way
+-- to know that happened -- it would stay stuck true forever, permanently
+-- blocking that player's units from being re-tasked and blocking the global
+-- cleanup sweep for every player. Clear it on every start so a restart can't
+-- leave the flag stranded.
+AddEventHandler('onClientResourceStart', function(res)
+    if res == GetCurrentResourceName() then
+        TriggerServerEvent('fenix-police:aftermathState', false)
+    end
+end)
+
 -- TABLES --
 -- Tables to keep track of spawned police units
 local spawnedVehicles = {} -- Table to store {vehicle = vehicle, officers = {driver = officer1, passenger = officer2...}, officerTasks = {}}
@@ -2338,9 +2351,21 @@ end
 
 
 
--- This function handles deleting the police units when you have lost your wanted level and the timer has expired. 
--- The above function + this function attempts to have the police drive off, then when far enough away delete them. 
+-- This function handles deleting the police units when you have lost your wanted level and the timer has expired.
+-- The above function + this function attempts to have the police drive off, then when far enough away delete them.
+--
+-- [Upstate Mafia] Single choke point for the aftermath.active guard, rather
+-- than gating every caller individually. There are THREE independent paths
+-- that call this: the main loop, a standalone watchdog thread, and the
+-- fenix-police:cleanupAllPolice net event the server broadcasts. Gating them
+-- one at a time missed the third one -- the server-triggered broadcast has
+-- no idea aftermath exists at all, so it kept nuking every officer regardless
+-- of what the client was doing. Gating the function itself covers all three
+-- (and any future caller) in one place instead of relying on every call site
+-- remembering to check.
 local function handleEndWantedDelete()
+    if aftermath.active then return end
+
     -- Collect keys BEFORE iterating so that nilling entries mid-loop (which Lua's
     -- pairs iterator can silently skip) doesn't leave orphan units behind.
 
@@ -3605,6 +3630,7 @@ end
 
 local function endAftermath()
     aftermath.active = false
+    TriggerServerEvent('fenix-police:aftermathState', false)
 end
 
 --- Officer walks to the player and attempts field CPR (CODE_HUMAN_MEDIC_KNEEL,
@@ -3688,6 +3714,11 @@ local function beginAftermath(playerCoords)
 
     aftermath.active = true
     aftermath.until_ = GetGameTimer() + (c.holdAfterFailedMs or 240000)
+    -- Tell the server so it stops re-tasking these officers (see
+    -- applyGroundPursuitTask/cleanupIfNoPlayersWanted in server/server.lua) --
+    -- otherwise the pursuit dispatch loop keeps shooting at and ramming a
+    -- body someone is supposed to be reviving.
+    TriggerServerEvent('fenix-police:aftermathState', true)
 
     attemptFieldRevive(nearby[1].ped, playerCoords)
 
