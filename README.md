@@ -21,16 +21,17 @@ practical.
 ## Contents
 
 1. [What this fork adds](#what-this-fork-adds)
-2. [Project status](#project-status)
-3. [Features](#features)
-4. [Requirements](#requirements)
-5. [Installation](#installation)
-6. [Exports](#exports)
-7. [Bundled — um_fenix_bridge](#bundled--um_fenix_bridge)
-8. [Optional — posted speed limits](#optional--posted-speed-limits)
-9. [Commands](#commands)
-10. [Credits](#credits)
-11. [Licence](#licence)
+2. [How the pieces fit together](#how-the-pieces-fit-together)
+3. [Project status](#project-status)
+4. [Features](#features)
+5. [Requirements](#requirements)
+6. [Installation](#installation)
+7. [Exports](#exports)
+8. [Bundled — um_fenix_bridge](#bundled--um_fenix_bridge)
+9. [Optional — posted speed limits](#optional--posted-speed-limits)
+10. [Commands](#commands)
+11. [Credits](#credits)
+12. [Licence](#licence)
 
 ---
 
@@ -53,6 +54,11 @@ Ambient officers read speed and act on it, rather than being set dressing.
 - Caught players are handed to this resource's **existing** pursuit stack via
   `ApplyWantedLevel` rather than a second parallel one. Caught NPCs get a chase,
   a yield, and a roadside stop, with no wanted system involved.
+- A catch **signals and follows calmly first** rather than jumping straight to
+  an aggressive chase indistinguishable from a wanted-5 pursuit. Only
+  continuing to speed past a grace period turns it into a real pursuit, at
+  which point the aggression roll comes from the same wanted-level table a
+  dispatched officer already uses.
 
 ### Roadside citations
 
@@ -195,12 +201,22 @@ three streets away in an alley and every unit still drove straight at you.
 the units knew, so hiding was a countdown you sat through rather than a thing you
 did.
 
-`client/pursuit.lua` adds the missing state machine — **contact**, **searching**,
-**re-acquired** — built from line of sight, a facing cone, and a grace period so
-a pursuit doesn't drop you behind the first parked bus. Lose them and units drive
-to your *last known position*, then sweep outward from it with a radius that
-widens the longer you stay hidden. Firing a weapon inside earshot hands your
-position straight back.
+`client/pursuit.lua` adds the missing state machine, four states:
+**contact**, **searching**, **re-acquired**, **given up**, built from line of
+sight, a facing cone, and a grace period so a pursuit doesn't drop you behind
+the first parked bus. Lose them and units drive to your *last known
+position*, then sweep outward from it with a radius that widens the longer
+you stay hidden; stay hidden long enough and the search itself is called off
+rather than running until the wanted level clears, which is what makes
+vice_hud's "given up" state reachable at all (see [How the pieces fit
+together](#how-the-pieces-fit-together) below).
+Firing a weapon inside earshot hands your position straight back.
+
+The opening dispatch call, the one that snapshots your outfit and vehicle for
+`GetTells()`, now waits for an officer's **first real sighting** rather than
+firing off whoever originally witnessed the crime. Change clothes or ditch the
+car before a cop actually lays eyes on you and there is nothing yet for
+dispatch to describe.
 
 Everything the player reads a pursuit through hangs off that one state, because
 all of it is really the same question:
@@ -269,9 +285,92 @@ now carry an `exact` flag and skip all three.
   raises on Lua 5.3+ for fractional `x`, and speed in mph always is. The throw
   landed *after* the cooldown was set and *before* the wanted level was applied,
   so every catch detected the speeder, marked itself as done, and died.
+- **Helicopters (and occasionally officers) survived the despawn sweep.**
+  `NetworkRequestControlOfEntity` is a request, not an instant grant, and
+  `DeleteEntity` was called in the same tick regardless, so a helicopter had
+  no second chance the way a ground officer does from the independent cleanup
+  watchdog. Fixed with a shared helper that waits for control to actually land
+  before deleting.
+
+**Tried and shelved:** a field-revive / hold-the-scene sequence for when a
+player goes down (`Config.Aftermath`). The nearest officer attempts CPR, and
+others hold the scene instead of every unit despawning within a couple of
+ticks. It fought the rest of the pursuit AI through several rounds of fixes
+(a watchdog thread, server-side re-tasking, other units staying hostile) and
+still wasn't behaving correctly, so it ships **disabled**; death goes back to
+instant despawn. Left in the code rather than removed, in case it's worth
+picking back up.
 
 Full detail in [`FORK-CHANGELOG.md`](FORK-CHANGELOG.md); the earlier patch series
 this builds on is in [`UPSTATE_PATCHES.md`](UPSTATE_PATCHES.md).
+
+---
+
+## How the pieces fit together
+
+The sections above describe each piece on its own. In theory, end to end, a
+session looks like this:
+
+1. **Ambient layer** (`client/ambient.lua`) populates the world with officers
+   who have nothing to do with any player's wanted level: `radar` traps,
+   foot `post`s, procedural `stop`s, `patrol`s, `pursuit`s (NPC on NPC) and
+   `convoy`s. Every scene is torn down the moment a real wanted level appears
+   nearby, so ambient units can never get tangled in a real chase.
+2. **A player gets a wanted level** one of three ways: a native crime the game
+   itself detects, a radar trap clocking a speeder who then keeps speeding
+   past the grace period, or an export (`ApplyWantedLevel`/`SetWantedLevel`)
+   called by another resource, for example a robbery script through
+   `um_fenix_bridge`.
+3. **Dispatch decides who responds** (`client/client.lua` + `server/server.lua`).
+   Units are spawned server side, network IDs handed to the requesting
+   client, driving profile and combat aggression scaled by the current
+   wanted level (`Config.Combat`, `Config.Driving`).
+4. **The pursuit state machine** (`client/pursuit.lua`) tracks what the
+   police actually know, separately from the wanted level itself: whether an
+   officer currently has line of sight (`contact`), is hunting a last known
+   position (`searching`), regains it (`re-acquired`), or has stopped
+   looking (`given up`, after `Config.Pursuit.giveUpAfterMs` with no
+   contact). The very first real sighting is also what fires the one opening
+   radio call, snapshotting outfit, voice and vehicle as the tells dispatch
+   now "knows" (`FenixPursuit.tells()` / exported `GetTells()`).
+5. **Tactics respond to that state.** `client/tactics.lua` drops roadblocks
+   and spike strips ahead of a suspect police can currently see. Passengers
+   hold fire at a suspect nobody can see rather than shooting through walls
+   at a live coordinate.
+6. **The player escapes, or doesn't.** Change clothes, ditch the marked
+   vehicle, or simply break contact and stay hidden past the giveup window,
+   and the tells and search state both reflect it. `Config.evasionTimes`
+   still governs when the stars themselves come off.
+
+### Where vice_hud comes in
+
+This resource has no UI of its own beyond native FiveM wanted stars and
+minimap blips. The optional companion
+**[vice_hud](https://github.com/Geckomacabre/GTA-VI-UI-and-HUD-for-FiveM)**
+(a separate resource, `../vice_hud` on this server) is what actually renders
+the richer states above:
+
+- **Wanted stars** read `HasContact()` and `IsSearching()` directly
+  (`vice_hud/client.lua`'s `wantedState()`) to draw four states: solid
+  (contact), flashing (searching), hollow outline (wanted but never seen),
+  and solid red (contact made, then fully lost, i.e. "given up" but the
+  wanted level hasn't cleared yet). Without this resource running, vice_hud
+  falls back to its own simple line-of-sight check and can only tell
+  `contact` from `hollow`.
+- **The tells row** reads `GetTells()` for the outfit and voice signals
+  (shown as "hanger" and "person" icons) and adds its own health-based
+  "medical" tell on top; the `vehicle` tell this resource tracks has no icon
+  in vice_hud's current reference design and isn't drawn, but is still
+  readable by anything else that calls `GetTells()`.
+- **The search-radius rings** on the minimap poll this resource's exported
+  search bounds and draw two circles: a fixed inner "crime origin" ring and
+  an outer one tracking the live, growing search radius, both removed the
+  moment contact is regained or the wanted level clears.
+
+None of that wiring is required. Every read is behind a
+`GetResourceState('fenix-police') == 'started'` check and a `pcall` on the
+vice_hud side, so a server running vice_hud without this resource (or vice
+versa) just gets the simpler fallback behaviour, not an error.
 
 ---
 

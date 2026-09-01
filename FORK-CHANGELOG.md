@@ -36,6 +36,139 @@ carjacking provenance note below.
 
 ---
 
+## 2.6.0 (2026-09-01): softer radar stops, search giveup, aftermath tried and disabled
+
+`client/client.lua`, `client/pursuit.lua`, `client/combat_bridge.lua` (new),
+`server/server.lua`, `config.lua`.
+
+### Changed: the opening dispatch call now waits for an actual sighting
+
+`FenixPursuit.callItIn()` used to fire the instant a wanted level appeared,
+from whoever the wanted level's own witness was, not necessarily a cop. That
+meant dispatch had the player's outfit and vehicle, and `FenixPursuit.tells()`
+started reporting them as known, before any officer had actually laid eyes on
+the player: changing clothes or ditching the car to shake a pursuit did
+nothing, because the description had already gone out. The call now fires
+from the contact thread's `firstEver` branch instead, the first *real*
+sighting by a cop, which is also the first moment `tells()` has anything true
+to report (its snapshot is `nil` until then). Re-acquisition after a lost
+contact still gets its own, separate call, as before.
+
+### Changed: radar catches escalate instead of jumping straight to a chase
+
+A speeding catch used to go straight to a wanted level plus an aggressive
+`TaskVehicleChase` (0.8 aggressiveness, 25 m following distance), identical to
+a real wanted-5 pursuit from the first frame. The catching officer now
+signals and follows calmly first
+(`Config.Ambient.radar.pulloverAggressiveness` 0.15,
+`pulloverDistance` 20 m), and holds that as long as the driver is actually
+slowing down. Only continuing to speed past `pulloverGraceMs` (12 s) escalates
+it into a real pursuit, and when it does, the aggression roll comes from
+`Config.Driving.aggression` for the current wanted level, the same table a
+dispatched pursuit officer already uses, instead of a flat hardcoded value.
+
+### Added: a search can now actually be given up
+
+Units used to search a lost suspect's last known position forever, until the
+wanted level itself cleared: `HasContact()` and `IsSearching()` being false at
+the same time never happened before that. `FenixPursuit` now calls the search
+off after `Config.Pursuit.giveUpAfterMs` (45 s) of no contact;
+`isSearching()` drops to false without clearing `lastKnown`, so units hold
+position rather than snapping back to the player's live coordinates. This is
+what makes vice_hud's red "given up" wanted-star state reachable at all (see
+`vice_hud/client.lua`'s `wantedState()`, which reads this resource's
+`HasContact()`/`IsSearching()` exports directly).
+
+### Fixed: units could spawn far closer than configured
+
+`findSpawnPoint()`'s distance band accepted anything down to 0.6x the
+configured minimum, so a unit could land 48 m out even with
+`minPoliceSpawnDistance` set to 80. Tightened to
+`Config.Roads.spawnDistanceMinRatio` / `spawnDistanceMaxRatio` (0.85x / 1.3x).
+
+### Fixed: search-radius circles too small on the real map
+
+`searchRadiusStart/Growth/Max` feed vice_hud's search-radius rings directly,
+with no separate visual-size knob on that end; reported too small against the
+real pause map. Scaled roughly 3.5x (40/4/180 to 140/14/630) at the same
+ratio.
+
+### Fixed: server-side combat/task natives don't exist server-side
+
+`SET_PED_COMBAT_ATTRIBUTES`, `SET_PED_FLEE_ATTRIBUTES`, `SET_PED_ACCURACY`,
+`SET_PED_FIRING_PATTERN`, `SetDriverAbility`/`Aggressiveness` and the `TASK_*`
+natives aren't registered in the server Lua environment; calling them from
+`server/server.lua` threw "attempt to call a nil value". New
+`client/combat_bridge.lua`: the server builds a profile table and hands it to
+whichever client actually owns the ped, where those natives exist. Targeted
+at the owner only, not broadcast: the vehicle-chase profile reissues
+`TASK_VEHICLE_DRIVE_TO_COORD` every second, a real pathfinding request, and
+broadcasting it had every nearby client (not just the owner) re-request
+pathfinding for the same ped every tick, exhausting the engine's 20-slot road
+node pool and freezing the game.
+
+### Fixed: helicopters (and occasionally officers) surviving the despawn sweep
+
+`NetworkRequestControlOfEntity` is a request, not an instant grant. The
+transfer completes over subsequent network frames, and `DeleteEntity` was
+called in the same tick regardless, which can silently no-op on an entity
+that hasn't finished transferring. Ground officers had some redundancy
+against this (the independent watchdog re-runs the whole sweep five times
+over five seconds); a helicopter is one entity with no equivalent second
+chance, which is why it tended to be the one still sitting there afterward.
+Replaced six duplicated request-then-delete blocks with one
+`deleteNetworkedEntity()` helper that waits up to 150 ms for control to land
+before deleting, still attempting the delete either way afterward.
+
+### Added, then disabled: field revive / scene hold on player down (`Config.Aftermath`)
+
+Attempted this cycle: instead of the wanted level clearing and every unit
+despawning within a couple of ticks the moment a player goes down, the
+nearest officer would attempt field CPR and other nearby units would hold the
+scene, lights on, rather than vanish. Getting it to actually behave took
+several more fixes in the same cycle:
+
+- The recovery check gating the despawn sweep looked only at
+  `IsEntityDead`/`IsPedFatallyInjured`, missing the metadata fallback
+  (`isdead`/`inlaststand`/`dead`) needed because wasabi_ambulance doesn't
+  reliably trip those native flags, so the sweep read the player as
+  recovered, and ran, the instant the wanted level cleared, before a field
+  revive could even start. Both checks are now one `isPlayerIncapacitated()`
+  so they can't drift apart again.
+- The despawn sweep has two independent call sites: the main loop, and a
+  standalone watchdog thread that exists specifically to hammer cleanup on
+  its own 500 ms timer regardless of what the main loop is doing. Gating only
+  the main loop's call left the watchdog deleting every responding officer
+  within half a second of the wanted level clearing, undoing the sequence
+  before it could do anything.
+- Two more paths, both server-side and both blind to aftermath because it
+  only ever existed client-side, were fighting it independently:
+  `applyGroundPursuitTask` re-issues combat/chase tasks to every unit every
+  second regardless of what the client is doing with them (a responding
+  officer would sit in its car shooting at the body it was meant to be
+  reviving), and `cleanupIfNoPlayersWanted` wipes and despawns the instant
+  nobody is server-side wanted, which is within roughly 2 s of a death
+  regardless of aftermath. A new `fenix-police:aftermathState` event syncs a
+  per-player `aftermathHolding` flag to the server so both back off, cleared
+  on resource start and player drop so a crash mid-sequence can't stick it
+  `true` forever.
+- Aftermath only ever stood down the medic and up to two more officers within
+  `responseRange`, capped at three. A wanted 4-5 response is commonly 6-10
+  units per `Config.maxUnitsPerLevel`, and everyone else kept whatever
+  hostile relationship group and combat task they already had, which is how
+  a responding unit ended up ramming the officer performing CPR. New
+  `standDownOfficer()` is now applied to every officer still tracked for the
+  pursuit, uncapped and regardless of distance.
+
+Despite all of that, it still wasn't behaving correctly in practice, so
+`Config.Aftermath.enabled` now ships **false**: death goes back to instant
+despawn. The code is left in place rather than removed, in case it's worth
+picking back up later; see `client/client.lua`'s `beginAftermath()` /
+`attemptFieldRevive()` and `Config.Aftermath` in `config.lua` for where it
+stands.
+
+---
+
 ## 2.5.1 — wanted level never rising: max wanted level stuck at 0 — 2026-08-27
 
 `client/client.lua` (main thread), `config.lua`.

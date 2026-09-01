@@ -461,8 +461,13 @@ function FenixPursuit.reset()
     lastSpeechAt = 0
 end
 
---- Opening radio call, made once when a pursuit starts. Separate from the
---- contact machine because it describes the CRIME, not the sighting.
+--- Opening radio call, made once per pursuit, but on the first REAL
+--- contact (see the contact thread's `firstEver` branch below), not on the
+--- wanted level going up. Getting a wanted level only means SOMEONE
+--- witnessed something; it says nothing about whether a cop has actually
+--- seen the player yet, and dispatch describing an outfit/vehicle nobody in
+--- uniform has laid eyes on is what let cops "know what you look like" from
+--- the moment you became wanted.
 function FenixPursuit.callItIn(wantedLevel)
     if cfg().enabled == false then return end
 
@@ -570,9 +575,22 @@ CreateThread(function()
                     contact.lostAt = 0
                     contact.gaveUp = false
 
-                    if not firstEver then
-                        -- Re-acquired. Worth a call; the first sighting of a
-                        -- pursuit is not, because callItIn already covered it.
+                    if firstEver then
+                        -- The opening radio call used to fire the instant the
+                        -- wanted level went up, from ANY witness, not
+                        -- necessarily a cop, which meant dispatch had the
+                        -- player's outfit and vehicle before an officer had
+                        -- ever actually seen them. It belongs here instead:
+                        -- the first time a cop genuinely lays eyes on the
+                        -- player, which is also the moment FenixPursuit.tells()
+                        -- starts being able to return anything true (see its
+                        -- own comment, every key reads false while
+                        -- contact.outfitSig is nil).
+                        FenixPursuit.callItIn(GetPlayerWantedLevel(PlayerId()))
+                    else
+                        -- Re-acquired, a later sighting after contact was lost.
+                        -- Worth its own call; the first sighting just got one
+                        -- above, from callItIn itself.
                         local where = streetAt(playerCoords)
                         local msg = ('Suspect re-acquired heading %s'):format(compassFor(contact.lastHeading))
                         if where then msg = msg .. ' on ' .. where end

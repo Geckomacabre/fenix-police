@@ -3,7 +3,7 @@ resource_manifest_version "05cfa83c-a124-4cfa-a768-c24a5811d8f9"
 game "gta5"
 author "Fenix, fork by Upstate Mafia"
 description "AI police dispatch and wanted levels, with ambient enforcement"
-version "2.5.1"
+version "2.6.0"
 
 shared_scripts {
     -- Needed by client/tracker.lua (lib.notify, lib.progressCircle). Nothing

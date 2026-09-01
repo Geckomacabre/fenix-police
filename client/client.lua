@@ -3864,13 +3864,18 @@ Citizen.CreateThread(function()
 
                 wantedTimer = 0
 
-                -- Opening radio call, once per pursuit. Placed after the
-                -- police-protection and incapacitation checks above, so a cop
-                -- who is exempt and a player who is already down never generate
-                -- a call for a response that will not exist.
+                -- Just marks a pursuit as live, for the reset-guard at the
+                -- "pursuit over" branch below. The opening radio call itself
+                -- (FenixPursuit.callItIn) no longer fires here, see the
+                -- contact thread in pursuit.lua, `firstEver`. Firing it here
+                -- meant dispatch had the player's outfit and vehicle the
+                -- instant ANY witness (not necessarily a cop) triggered the
+                -- wanted level, before an officer had ever actually laid eyes
+                -- on them: cops "knew what you look like" from the moment
+                -- you were wanted, which defeats changing your outfit/vehicle
+                -- to shake a pursuit that never had real contact yet.
                 if not pursuitAnnounced then
                     pursuitAnnounced = true
-                    FenixPursuit.callItIn(wantedLevel)
                 end
 
                 -- [Upstate Mafia] Don't reinforce a response that is standing
