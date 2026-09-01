@@ -3516,6 +3516,148 @@ exports('IsPlayerAtTrafficStop', function()
 end)
 
 
+-- =============================================================================
+-- [Upstate Mafia] AFTERMATH: what happens after officers actually win
+-- =============================================================================
+-- Previously the wanted level cleared and handleEndWantedDelete() wiped every
+-- responding unit within a couple of ticks of the player going down -- cops
+-- that just fought a whole pursuit vanish mid-frame, no different from the
+-- player simply losing them. This gives the scene a beat instead: the nearest
+-- officer attempts field first aid, other nearby units hold the road, and
+-- only once that resolves (revived, or given up and left for EMS) does the
+-- normal despawn path run.
+--
+-- Deliberately NOT a replacement for EMS -- ps-dispatch already raises its own
+-- automatic PlayerDowned alert to on-duty medics the moment the player goes
+-- down, independent of anything here. A failed field revive doesn't call
+-- anything itself; it just means the scene holds in case that alert gets
+-- answered, instead of the units already on scene disappearing first.
+
+local function aftermathCfg() return Config.Aftermath or {} end
+
+local aftermath = {
+    active           = false,  -- a sequence currently owns nearby units
+    until_           = 0,      -- GetGameTimer() hard cap on how long a failed attempt holds the scene
+    attemptedThisDown = false, -- at most one attempt per down, not per tick
+}
+
+--- Nearest ground officer peds to `coords`, nearest first. Air/heli units are
+--- excluded -- nobody is landing a helicopter to perform CPR.
+local function nearbyGroundOfficers(coords, maxDist)
+    local found = {}
+    for _, vehicleData in pairs(spawnedVehicles) do
+        for pedNetID in pairs(vehicleData.officers or {}) do
+            local ped = NetToPed(pedNetID)
+            if ped and ped ~= 0 and DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true) then
+                local d = #(GetEntityCoords(ped) - coords)
+                if d <= maxDist then
+                    found[#found + 1] = { ped = ped, dist = d }
+                end
+            end
+        end
+    end
+    table.sort(found, function(a, b) return a.dist < b.dist end)
+    return found
+end
+
+local function endAftermath()
+    aftermath.active = false
+end
+
+--- Officer walks to the player and attempts field CPR (CODE_HUMAN_MEDIC_KNEEL,
+--- the same kneel-over-patient scenario the base game's own EMTs use). Rolls
+--- once after reviveDuration -- success revives the player directly
+--- (TriggerEvent, not TriggerClientEvent: this already IS the player's own
+--- client). A failed roll does not end the sequence; it leaves aftermath
+--- active so nearby units keep holding the scene for real EMS, until either
+--- the player recovers or the hold cap in the main loop below gives up.
+local function attemptFieldRevive(medicPed, playerCoords)
+    Citizen.CreateThread(function()
+        local c = aftermathCfg()
+        if not DoesEntityExist(medicPed) then return end
+        if not NetworkHasControlOfEntity(medicPed) then
+            NetworkRequestControlOfEntity(medicPed)
+        end
+        ClearPedTasks(medicPed)
+        TaskSetBlockingOfNonTemporaryEvents(medicPed, true)
+        TaskGoStraightToCoord(medicPed, playerCoords.x, playerCoords.y, playerCoords.z, 1.5, 8000, 0.0, 0.5)
+
+        local approachStart = GetGameTimer()
+        while aftermath.active and DoesEntityExist(medicPed)
+            and #(GetEntityCoords(medicPed) - playerCoords) > (c.reviveRange or 8.0)
+            and GetGameTimer() - approachStart < 10000 do
+            Wait(250)
+        end
+
+        if not aftermath.active or not DoesEntityExist(medicPed) then return end
+
+        TaskStartScenarioAtPosition(medicPed, 'CODE_HUMAN_MEDIC_KNEEL',
+            playerCoords.x, playerCoords.y, playerCoords.z, GetEntityHeading(medicPed), 0, false, false)
+
+        Wait(c.reviveDuration or 8000)
+
+        if not aftermath.active then return end
+        if DoesEntityExist(medicPed) then ClearPedTasks(medicPed) end
+
+        local stillDown = IsEntityDead(cache.ped) or IsPedFatallyInjured(cache.ped)
+        if stillDown and math.random() < (c.reviveChance or 0.35) then
+            if Config.isDebug then print('[fenix-police] field revive succeeded') end
+            TriggerEvent('wasabi_ambulance:revive')
+            endAftermath()
+        elseif Config.isDebug then
+            print('[fenix-police] field revive failed, holding scene for EMS')
+        end
+    end)
+end
+
+--- A nearby unit besides the medic holds position near the scene instead of
+--- idling mid-road -- lights on, parked, ped standing by. Deliberately not
+--- Config.Tactics' roadblock placement: that system finds a spot AHEAD of a
+--- moving pursuit along a route, and there is no route here, just a fixed
+--- point where the player went down.
+local function holdSceneWithOfficer(entry)
+    local ped = entry.ped
+    if not DoesEntityExist(ped) then return end
+    local vehicle = GetVehiclePedIsIn(ped, false)
+    if vehicle == 0 then return end
+    if not NetworkHasControlOfEntity(vehicle) then NetworkRequestControlOfEntity(vehicle) end
+
+    BringVehicleToHalt(vehicle, 8.0, 3, false)
+    SetVehicleIndicatorLights(vehicle, 0, true)
+    SetVehicleIndicatorLights(vehicle, 1, true)
+    SetVehicleSiren(vehicle, true)
+    SetSirenKeepOn(vehicle, true)
+
+    if not NetworkHasControlOfEntity(ped) then NetworkRequestControlOfEntity(ped) end
+    ClearPedTasks(ped)
+    TaskStartScenarioInPlace(ped, 'WORLD_HUMAN_GUARD_STAND', 0, true)
+end
+
+--- Called once, the instant the player is newly detected incapacitated while
+--- ground officers are nearby. No-ops (leaves the previous instant-despawn
+--- behaviour alone) if nothing is close enough to plausibly react.
+local function beginAftermath(playerCoords)
+    local c = aftermathCfg()
+    if c.enabled == false or aftermath.active then return end
+
+    local nearby = nearbyGroundOfficers(playerCoords, c.responseRange or 60.0)
+    if #nearby == 0 then return end
+
+    aftermath.active = true
+    aftermath.until_ = GetGameTimer() + (c.holdAfterFailedMs or 240000)
+
+    attemptFieldRevive(nearby[1].ped, playerCoords)
+
+    for i = 2, math.min(#nearby, 3) do
+        holdSceneWithOfficer(nearby[i])
+    end
+
+    if Config.isDebug then
+        print(('[fenix-police] aftermath started: %d unit(s) responding'):format(#nearby))
+    end
+end
+
+
 -- MAIN THREAD --
 -- Monitor the player's wanted level and maintain police units
 Citizen.CreateThread(function()
@@ -3605,6 +3747,10 @@ Citizen.CreateThread(function()
                 or IsPedFatallyInjured(playerPed)
                 or (_md and (_md['isdead'] or _md['inlaststand'] or _md['dead']))
             if _incapacitated then
+                if not aftermath.attemptedThisDown then
+                    aftermath.attemptedThisDown = true
+                    beginAftermath(GetEntityCoords(playerPed))
+                end
 
                 local vehicle = GetVehiclePedIsIn(playerPed, false)
 
@@ -3689,16 +3835,36 @@ Citizen.CreateThread(function()
             -- cleared by the stop that set it, immediately after clearing the
             -- wanted level that got us here.
             if isPullingOver then cancelPullOver() end
-            -- Wanted level just cleared — delete all spawned units.
-            --
-            -- We run for 3 cycles (wantedTimer < 3) instead of just once so that any
-            -- in-flight server responses that arrive late still get cleaned up.  The
-            -- spawnGate flag (closed by handleEndWantedDelete) prevents those late
-            -- responses from re-populating the tracking tables between cleanup cycles.
-            if wantedTimer < 3 then
-                handleEndWantedDelete()
+
+            -- [Upstate Mafia] Aftermath: hold the despawn sweep off while a
+            -- field-revive/scene-hold sequence owns nearby units. Ends itself
+            -- once the player recovers (field revive, real EMS, an admin
+            -- command -- any of them) or the hold cap runs out.
+            local recovered = not (IsEntityDead(playerPed) or IsPedFatallyInjured(playerPed))
+            if recovered then
+                aftermath.attemptedThisDown = false
+                if aftermath.active then endAftermath() end
+            elseif aftermath.active and GetGameTimer() > aftermath.until_ then
+                endAftermath() -- gave up waiting on EMS, hand off to the normal despawn path
             end
-            wantedTimer = wantedTimer + 1
+
+            if aftermath.active then
+                -- Scene held: skip the delete sweep entirely and leave
+                -- wantedTimer where it is, so normal cleanup resumes at
+                -- whatever cycle it was on instead of finding it already past
+                -- 3 and never running once this ends.
+            else
+                -- Wanted level just cleared — delete all spawned units.
+                --
+                -- We run for 3 cycles (wantedTimer < 3) instead of just once so that any
+                -- in-flight server responses that arrive late still get cleaned up.  The
+                -- spawnGate flag (closed by handleEndWantedDelete) prevents those late
+                -- responses from re-populating the tracking tables between cleanup cycles.
+                if wantedTimer < 3 then
+                    handleEndWantedDelete()
+                end
+                wantedTimer = wantedTimer + 1
+            end
         end
 
         end) -- end pcall

@@ -674,7 +674,8 @@ function FenixRoads.findSpawnPoint(origin, opts)
                 lastReason = 'road reports no drivable lane'
             else
                 local d = #(pos - origin)
-                if d < (minDist * 0.6) or d > (maxDist * 1.6) then
+                if d < (minDist * (c.spawnDistanceMinRatio or 0.6))
+                    or d > (maxDist * (c.spawnDistanceMaxRatio or 1.6)) then
                     -- The nearest road to the sample point was somewhere else
                     -- entirely; taking it would ignore the distance band.
                     lastReason = 'snapped outside the distance band'

@@ -488,6 +488,21 @@ Config.Ambient = {
         catchPlayers = true,
         playerWantedLevel = 1,
 
+        -- [Upstate Mafia] Signal-and-follow grace period before a radar catch
+        -- turns into a real pursuit. The wanted level still applies immediately
+        -- (that's what makes the existing surrender/ticket flow -- beginPullOver
+        -- in client.lua -- available), but the catching officer starts calm:
+        -- lights and siren, low aggressiveness, a following distance rather than
+        -- a bumper-lock. Only once the driver keeps speeding past this window
+        -- does the officer switch to the same aggressive TaskVehicleChase a real
+        -- pursuit uses. Slowing below pulloverStoppedMph at any point holds the
+        -- calm behaviour indefinitely -- no reason to escalate on someone who is
+        -- visibly complying.
+        pulloverGraceMs        = 12000,
+        pulloverStoppedMph     = 8.0,
+        pulloverAggressiveness = 0.15,
+        pulloverDistance       = 20.0, -- metres, following distance during the calm phase
+
         -- Never enforce against a player who is on duty as police. Checked
         -- against this resource's own job list (Config.PoliceJobsToCheck) and
         -- against night_ers' shift state, either being sufficient.
@@ -674,6 +689,40 @@ Config.ArrestSystem = {
         vector4(360.6, -1584.8, 29.3, 320.0),     -- Davis Sheriff
         vector4(-561.8, -131.0, 38.0, 200.0),     -- Rockford Hills PD
     },
+}
+
+
+-- AFTERMATH: FIELD REVIVE / SCENE HOLD --
+-- What responding officers do once the player actually goes down, instead of
+-- the wanted level clearing and every unit despawning within a couple of
+-- ticks. See client.lua's beginAftermath()/attemptFieldRevive() for the
+-- actual sequence -- this is deliberately not a replacement for real EMS
+-- (ps-dispatch's own automatic PlayerDowned alert already handles that): a
+-- failed field revive just holds the scene, it never calls anyone itself.
+Config.Aftermath = {
+    enabled = true,
+
+    -- How far to look for ground officers to respond, in metres. Air/heli
+    -- units never respond -- nobody lands a helicopter to perform CPR.
+    responseRange = 60.0,
+
+    -- The nearest responding officer's chance of a successful field revive.
+    -- Kept low and deliberate: this is a coin-flip exception, not a way to
+    -- skip EMS outright. 0 disables field revives entirely -- officers still
+    -- hold the scene, they just never attempt one.
+    reviveChance = 0.35,
+
+    -- How close the officer has to be to the player before starting the
+    -- kneel-and-work animation, and how long that animation runs before the
+    -- reviveChance roll resolves, in ms.
+    reviveRange    = 8.0,
+    reviveDuration = 8000,
+
+    -- How long a failed attempt holds the scene (nearby units parked, lights
+    -- on, waiting) before giving up and letting the normal despawn path run,
+    -- in ms. Not a guarantee EMS shows up in this window, just a cap so
+    -- units don't hold forever if nobody answers the dispatch alert.
+    holdAfterFailedMs = 240000,
 }
 
 
@@ -992,6 +1041,15 @@ Config.Pursuit = {
     searchRadiusGrowth = 14.0,    -- metres per second lost
     searchRadiusMax    = 630.0,
 
+    -- How long units keep actively searching a last-known position before
+    -- calling it off, in ms. Once this elapses without contact, the search
+    -- stands down (FenixPursuit.isSearching() drops to false) but the wanted
+    -- level itself is untouched -- that's the gap between "actively hunting
+    -- you" and "shaken them, but still in the search zone" vice_hud's
+    -- wanted stars read as the 'red' state, matching GTA's own reference:
+    -- red stars only appear in that window, before the level actually decays.
+    giveUpAfterMs = 45000,
+
     -- Mute sirens (not lights) while searching. A unit that has lost the suspect
     -- wants to hear the street, not announce itself to it.
     quietSearch = true,
@@ -1269,6 +1327,21 @@ Config.Roads = {
     -- than the first-fit code it replaced, because two calls a few milliseconds
     -- apart agree on which lane centre is best.
     spawnSeparation = 18.0,
+
+    -- [Upstate Mafia] How far a sample point is allowed to snap to the nearest
+    -- real road before findSpawnPoint() throws it out as "ignoring the
+    -- distance band" -- see its use in client/roads.lua. The requested ring is
+    -- opts.minDistance/maxDistance (Config.minPoliceSpawnDistance = 80m by
+    -- default), but the nearest actual road to a sample point is rarely
+    -- exactly on that ring, so some slack is unavoidable. It was a flat
+    -- 0.6x/1.6x band, which let a unit land as close as 48m despite the
+    -- config saying 80 -- close enough to read as spawning right on top of
+    -- the player. Tightened toward the requested distance; still not 1.0
+    -- because a hard cutoff on a sparse road network means more attempts
+    -- fall through to getSafeSpawnPoint's wider fallback passes instead,
+    -- which allow more distance, not less.
+    spawnDistanceMinRatio = 0.85,
+    spawnDistanceMaxRatio = 1.3,
 
     -- How long a promised spot stays claimed. Only has to outlive the server
     -- round trip; after that the vehicle exists and `clearance` takes over.

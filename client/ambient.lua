@@ -1209,16 +1209,79 @@ local function catchPlayer(scene, veh, speedMph, threshold, posted)
         and GetVehiclePedIsIn(cop, false) == copVeh then
         SetVehicleSiren(copVeh, true)
         SetSirenKeepOn(copVeh, true)
+
+        -- Calm phase first: lights and siren, low aggressiveness, a real
+        -- following distance. advancePlayerStop() below is what escalates this
+        -- to the aggressive posture -- a driver who slows down or stops never
+        -- sees it at all.
         SetDriverAbility(cop, 1.0)
-        SetDriverAggressiveness(cop, 0.8)
+        SetDriverAggressiveness(cop, c.pulloverAggressiveness or 0.15)
         TaskVehicleChase(cop, PlayerPedId())
         SetTaskVehicleChaseBehaviorFlag(cop, 8, true)
-        SetTaskVehicleChaseIdealPursuitDistance(cop, 25.0)
+        SetTaskVehicleChaseIdealPursuitDistance(cop, c.pulloverDistance or 20.0)
+
+        scene.playerStop = {
+            veh       = veh,
+            cop       = cop,
+            copVeh    = copVeh,
+            since     = GetGameTimer(),
+            escalated = false,
+        }
     end
 
     -- No longer a fixed scene once it's rolling: let it time out like a patrol
     -- instead of hanging on its point forever.
     scene.expiresAt = GetGameTimer() + (cfg().roamingLifetime or 180) * 1000
+end
+
+--- Same per-level aggression roll client.lua's officerDrivingProfile uses for
+--- real pursuit-spawned officers (Config.Driving.aggression), so an escalated
+--- radar catch drives like the rest of a wanted-level-1 pursuit instead of the
+--- flat 0.8 every radar catch used to get regardless of level.
+local function rollAggression(level)
+    local range = Config.Driving and Config.Driving.aggression and Config.Driving.aggression[level]
+    local lo = (range and range[1]) or 0.7
+    local hi = (range and range[2]) or 0.95
+    if hi < lo then hi = lo end
+    return lo + (math.random() * (hi - lo))
+end
+
+--- Escalates a signalled radar stop into a real pursuit if the driver keeps
+--- speeding past the grace period, instead of the officer being aggressive
+--- from the first frame. Mirrors advanceNpcStop's shape (called from the same
+--- per-scene loop in radarTick) but for the player, who additionally has the
+--- existing surrender/ticket flow (beginPullOver in client.lua) available the
+--- moment the wanted level is applied -- this only controls how hostile the
+--- catching officer looks before that gets used.
+local function advancePlayerStop(scene)
+    local ps = scene.playerStop
+    if not ps or ps.escalated then return end
+
+    local c = radarCfg()
+    local playerPed = PlayerPedId()
+    local playerVeh = GetVehiclePedIsIn(playerPed, false)
+
+    -- Switched vehicles, went on foot, or the cop despawned/died: nothing left
+    -- to track an escalation decision for.
+    if playerVeh ~= ps.veh or not DoesEntityExist(ps.cop) or not DoesEntityExist(ps.copVeh) then
+        scene.playerStop = nil
+        return
+    end
+
+    local speedMph = GetEntitySpeed(playerVeh) * MPS_TO_MPH
+    if speedMph <= (c.pulloverStoppedMph or 8.0) then
+        -- Visibly slowing or stopped: hold the calm behaviour, no matter how
+        -- long it takes. Only speeding past the grace window counts as
+        -- ignoring the signal.
+        return
+    end
+
+    if (GetGameTimer() - ps.since) < (c.pulloverGraceMs or 12000) then return end
+
+    ps.escalated = true
+    SetDriverAggressiveness(ps.cop, rollAggression(c.playerWantedLevel or 1))
+    SetTaskVehicleChaseIdealPursuitDistance(ps.cop, 25.0)
+    dbg('radar catch escalated to a real pursuit -- driver never slowed down')
 end
 
 --- NPC caught: chase it down, no wanted system involved.
@@ -1417,7 +1480,9 @@ local function radarTick()
 
     local armed = {}
     for _, scene in pairs(scenes) do
-        if scene.chase then
+        if scene.playerStop then
+            advancePlayerStop(scene)
+        elseif scene.chase then
             advanceNpcStop(scene)
         elseif scene.cops > 0 and not scene.enforcing and not scene.stop
             and (allCops or scene.kind == 'radar') and observerOf(scene) then

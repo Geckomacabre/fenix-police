@@ -52,6 +52,7 @@ local contact = {
     lastHeading  = 0.0,        -- which way they were going, for the radio call
     lastSeenAt   = 0,          -- game timer
     lostAt       = 0,          -- game timer when contact broke, 0 while held
+    gaveUp       = false,      -- search called off after Config.Pursuit.giveUpAfterMs, see isSearching()
     everSeen     = false,      -- suppresses "lost the suspect" before first sight
     vehicleDesc  = nil,        -- cached description of the car they were last in
 
@@ -352,9 +353,20 @@ function FenixPursuit.hasContact()
 end
 
 --- True while units are working a last known position instead of the player.
+--- False again once the search is called off (see giveUpAfterMs above) even
+--- though lastKnown is still set -- that gap is what lets vice_hud tell "still
+--- actively hunting" apart from "gave up, but you're still wanted".
 function FenixPursuit.isSearching()
     if cfg().enabled == false then return false end
-    return (not contact.active) and contact.everSeen and contact.lastKnown ~= nil
+    return (not contact.active) and contact.everSeen and contact.lastKnown ~= nil and not contact.gaveUp
+end
+
+--- True once a search has been called off without the wanted level clearing.
+--- This is the state vice_hud's wanted stars read as 'red' (see wantedState()
+--- in vice_hud/client.lua): HasContact() and IsSearching() both false, but
+--- the pursuit was contacted at some point since the level was raised.
+function FenixPursuit.hasGivenUp()
+    return contact.gaveUp
 end
 
 --- Where units should currently be driving.
@@ -391,10 +403,12 @@ end
 
 --- Should this unit's siren be running? Units go quiet on a search: a siren is
 --- how you tell a street you are coming, and a unit that has lost the suspect
---- wants to hear, not announce. Lights stay on throughout.
+--- wants to hear, not announce. Lights stay on throughout. Also quiet once
+--- the search is called off entirely -- standing down is not a reason to
+--- start announcing again, it's the opposite.
 function FenixPursuit.sirenWanted()
     if cfg().quietSearch == false then return true end
-    return not FenixPursuit.isSearching()
+    return contact.active
 end
 
 --- What dispatch's description of the player still matches, right now.
@@ -437,6 +451,7 @@ function FenixPursuit.reset()
     contact.lastHeading  = 0.0
     contact.lastSeenAt   = 0
     contact.lostAt       = 0
+    contact.gaveUp       = false
     contact.everSeen     = false
     contact.vehicleDesc  = nil
     contact.outfitSig    = nil
@@ -553,6 +568,7 @@ CreateThread(function()
                     contact.active = true
                     contact.everSeen = true
                     contact.lostAt = 0
+                    contact.gaveUp = false
 
                     if not firstEver then
                         -- Re-acquired. Worth a call; the first sighting of a
@@ -581,6 +597,21 @@ CreateThread(function()
                     speak('LOST_TARGET')
                     dbg('contact lost')
                 end
+            elseif contact.lastKnown and not contact.gaveUp
+                and (now - contact.lostAt) > (c.giveUpAfterMs or 45000) then
+                -- Search called off: isSearching() drops to false (see its
+                -- definition below) without touching lastKnown, everSeen, or
+                -- the wanted level itself -- a full FenixPursuit.reset() only
+                -- happens once the level decays to 0. Deliberately NOT
+                -- clearing lastKnown: targetCoords() falls back to the
+                -- player's LIVE coords once lastKnown is nil, which would
+                -- make units omniscient again right when they're supposed to
+                -- be standing down. They keep sitting on the stale last-known
+                -- point (already the existing idle behaviour once a search
+                -- goes cold) instead.
+                contact.gaveUp = true
+                dispatch('No visual, no leads. Units resuming patrol.')
+                dbg('search called off')
             end
         end
 
@@ -601,6 +632,7 @@ end)
 
 exports('IsSearching', FenixPursuit.isSearching)
 exports('HasContact', FenixPursuit.hasContact)
+exports('HasGivenUp', FenixPursuit.hasGivenUp)
 exports('SearchRadius', FenixPursuit.searchRadius)
 
 -- { outfit, vehicle, voice } -- which parts of dispatch's description of the
