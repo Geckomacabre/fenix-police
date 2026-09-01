@@ -3609,6 +3609,22 @@ local function aftermathCfg() return Config.Aftermath or {} end
 -- there) so the cleanup watchdog thread, which runs before this section,
 -- can see it too.
 
+--- Drops one officer's hostility back to the same passive relationship group
+--- pursuit-only mode uses (ensurePassiveGroup(), see applyOfficerCombatProfile
+--- near the top of the file) and clears the AlwaysFight attribute so they
+--- stop being willing to open fire on their own. Shared by the medic and
+--- every held unit -- an officer that was mid-pursuit when the player went
+--- down is still flagged HATES_PLAYER and still combat-tasked at that
+--- moment, and neither the revive attempt nor holding position actually
+--- calms that down by itself.
+local function standDownOfficer(ped)
+    if not DoesEntityExist(ped) then return end
+    if not NetworkHasControlOfEntity(ped) then NetworkRequestControlOfEntity(ped) end
+    SetPedRelationshipGroupHash(ped, ensurePassiveGroup())
+    SetPedCombatAttributes(ped, 46, false) -- AlwaysFight off
+    SetPedFleeAttributes(ped, 0, false)
+end
+
 --- Nearest ground officer peds to `coords`, nearest first. Air/heli units are
 --- excluded -- nobody is landing a helicopter to perform CPR.
 local function nearbyGroundOfficers(coords, maxDist)
@@ -3644,9 +3660,7 @@ local function attemptFieldRevive(medicPed, playerCoords)
     Citizen.CreateThread(function()
         local c = aftermathCfg()
         if not DoesEntityExist(medicPed) then return end
-        if not NetworkHasControlOfEntity(medicPed) then
-            NetworkRequestControlOfEntity(medicPed)
-        end
+        standDownOfficer(medicPed)
         ClearPedTasks(medicPed)
         TaskSetBlockingOfNonTemporaryEvents(medicPed, true)
         TaskGoStraightToCoord(medicPed, playerCoords.x, playerCoords.y, playerCoords.z, 1.5, 8000, 0.0, 0.5)
@@ -3679,14 +3693,16 @@ local function attemptFieldRevive(medicPed, playerCoords)
     end)
 end
 
---- A nearby unit besides the medic holds position near the scene instead of
---- idling mid-road -- lights on, parked, ped standing by. Deliberately not
+--- A unit besides the medic holds position near the scene instead of idling
+--- mid-road -- lights on, parked, ped standing by. Deliberately not
 --- Config.Tactics' roadblock placement: that system finds a spot AHEAD of a
 --- moving pursuit along a route, and there is no route here, just a fixed
 --- point where the player went down.
 local function holdSceneWithOfficer(entry)
     local ped = entry.ped
     if not DoesEntityExist(ped) then return end
+    standDownOfficer(ped)
+
     local vehicle = GetVehiclePedIsIn(ped, false)
     if vehicle == 0 then return end
     if not NetworkHasControlOfEntity(vehicle) then NetworkRequestControlOfEntity(vehicle) end
@@ -3697,7 +3713,6 @@ local function holdSceneWithOfficer(entry)
     SetVehicleSiren(vehicle, true)
     SetSirenKeepOn(vehicle, true)
 
-    if not NetworkHasControlOfEntity(ped) then NetworkRequestControlOfEntity(ped) end
     ClearPedTasks(ped)
     TaskStartScenarioInPlace(ped, 'WORLD_HUMAN_GUARD_STAND', 0, true)
 end
@@ -3720,14 +3735,30 @@ local function beginAftermath(playerCoords)
     -- body someone is supposed to be reviving.
     TriggerServerEvent('fenix-police:aftermathState', true)
 
-    attemptFieldRevive(nearby[1].ped, playerCoords)
+    local medicPed = nearby[1].ped
+    attemptFieldRevive(medicPed, playerCoords)
 
-    for i = 2, math.min(#nearby, 3) do
-        holdSceneWithOfficer(nearby[i])
+    -- Every OTHER responding officer, not capped to the nearest few and not
+    -- limited to responseRange: a wanted level 4-5 response is commonly 6-10
+    -- units (Config.maxUnitsPerLevel), and a unit that wasn't in the first
+    -- handful found -- or was still a hundred metres out when the player went
+    -- down -- was still going to arrive fully hostile and ram whoever ends up
+    -- kneeling over the body. Calming down doesn't need them to be close the
+    -- way the medic's approach does, only reaching the scene does, so this
+    -- sweeps every officer currently tracked for this pursuit.
+    local held = 0
+    for _, vehicleData in pairs(spawnedVehicles) do
+        for pedNetID in pairs(vehicleData.officers or {}) do
+            local ped = NetToPed(pedNetID)
+            if ped and ped ~= 0 and DoesEntityExist(ped) and ped ~= medicPed then
+                holdSceneWithOfficer({ ped = ped })
+                held = held + 1
+            end
+        end
     end
 
     if Config.isDebug then
-        print(('[fenix-police] aftermath started: %d unit(s) responding'):format(#nearby))
+        print(('[fenix-police] aftermath started: 1 medic, %d unit(s) holding'):format(held))
     end
 end
 
