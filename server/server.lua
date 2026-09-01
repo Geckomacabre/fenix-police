@@ -51,6 +51,23 @@ local function getDistanceBetweenEntities(a, b)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- SET_PED_COMBAT_ATTRIBUTES, SET_PED_FLEE_ATTRIBUTES, SET_PED_ACCURACY,
+-- SET_PED_FIRING_PATTERN, SET_PED_RELATIONSHIP_GROUP_HASH, SET_DRIVER_ABILITY/
+-- AGGRESSIVENESS and the TASK_* natives are not registered in the server Lua
+-- environment -- calling them here throws "attempt to call a nil value".
+-- Dispatch them to the client that owns the ped instead (see
+-- client/combat_bridge.lua). Must target the owner only, not broadcast to -1:
+-- the vehicle-chase profile re-issues TASK_VEHICLE_DRIVE_TO_COORD every
+-- second, which is a real road-pathfinding request. Broadcasting it made
+-- every nearby client (not just the owner) re-request pathfinding for the
+-- same ped every tick, which blew through the engine's 20-slot
+-- CNetworkRoadNodeWorldStateData pool and froze the game.
+local function dispatchCombatProfile(pedNetID, profile)
+    local entity = NetworkGetEntityFromNetworkId(pedNetID)
+    local owner = DoesEntityExist(entity) and NetworkGetEntityOwner(entity) or -1
+    TriggerClientEvent('fenix-police:client:applyCombatProfile', owner, pedNetID, profile)
+end
+
 local function applyGroundPursuitTask(unit)
     local vehicle = NetworkGetEntityFromNetworkId(unit.vehNetID)
     local targetPed = GetPlayerPed(unit.target)
@@ -69,8 +86,10 @@ local function applyGroundPursuitTask(unit)
     for _, pedNetID in ipairs(unit.officers) do
         local officer = NetworkGetEntityFromNetworkId(pedNetID)
         if DoesEntityExist(officer) then
-            SetPedRelationshipGroupHash(officer, GetHashKey('HATES_PLAYER'))
-            SetPedFleeAttributes(officer, 0, false)
+            dispatchCombatProfile(pedNetID, {
+                relationshipGroup = 'HATES_PLAYER',
+                fleeAttributes = {0, false},
+            })
 
             if GetVehiclePedIsIn(officer, false) ~= vehicle then
                 -- No foot patrol behavior: if the car still exists, force officers back in.
@@ -94,26 +113,34 @@ local function applyGroundPursuitTask(unit)
         return
     end
 
-    SetPedCombatAttributes(driver, 3, false) -- Do not voluntarily leave vehicle
-    SetDriverAbility(driver, 1.0)
-    SetDriverAggressiveness(driver, 1.0)
+    dispatchCombatProfile(unit.driverNetID, {
+        combatAttributes = {{3, false}}, -- do not voluntarily leave vehicle
+        driverAbility = 1.0,
+        driverAggressiveness = 1.0,
+    })
 
     local distance = getDistanceBetweenEntities(driver, targetPed)
-    if distance > 45.0 and TaskVehicleDriveToCoord then
+    if distance > 45.0 then
         -- Direct response phase: drive to where the wanted player is now.
-        TaskVehicleDriveToCoord(driver, vehicle, targetCoords.x, targetCoords.y, targetCoords.z, 42.0, 1, GetEntityModel(vehicle), 6, 2.0, true)
-        if SetDriveTaskDrivingStyle then SetDriveTaskDrivingStyle(driver, 6) end
+        dispatchCombatProfile(unit.driverNetID, {
+            vehicleDriveTo = {
+                x = targetCoords.x, y = targetCoords.y, z = targetCoords.z,
+                speed = 42.0,
+                vehicleModelHash = GetEntityModel(vehicle),
+                drivingStyle = 6,
+                stopRange = 2.0,
+            },
+        })
     else
         -- Close phase: native GTA pursuit behavior, PIT/boxing/etc.
-        TaskVehicleChase(driver, targetPed)
-        SetTaskVehicleChaseBehaviorFlag(driver, 8, true)
+        dispatchCombatProfile(unit.driverNetID, { vehicleChase = unit.target })
     end
 
     for _, pedNetID in ipairs(unit.officers) do
         if pedNetID ~= unit.driverNetID then
             local officer = NetworkGetEntityFromNetworkId(pedNetID)
             if DoesEntityExist(officer) then
-                TaskCombatPed(officer, targetPed, 0, 16)
+                dispatchCombatProfile(pedNetID, { combatTarget = unit.target })
             end
         end
     end
@@ -399,11 +426,15 @@ end
 local function applyOfficerCombatProfile(officer, wantedLevel, role)
     if not DoesEntityExist(officer) then return false end
 
+    local pedNetID = NetworkGetNetworkIdFromEntity(officer)
+
     if not combatEnabled() then
-        SetPedAccuracy(officer, math.random(20, 40))
-        SetPedFiringPattern(officer, GetHashKey('FIRING_PATTERN_FULL_AUTO'))
-        SetPedCombatAttributes(officer, 2, true)
-        SetPedRelationshipGroupHash(officer, GetHashKey('HATES_PLAYER'))
+        dispatchCombatProfile(pedNetID, {
+            accuracy = math.random(20, 40),
+            firingPattern = 'FIRING_PATTERN_FULL_AUTO',
+            combatAttributes = {{2, true}},
+            relationshipGroup = 'HATES_PLAYER',
+        })
         return true
     end
 
@@ -411,44 +442,38 @@ local function applyOfficerCombatProfile(officer, wantedLevel, role)
     local hostile = math.random() < levelValue(cfg.engageChance, wantedLevel, 1.0)
         or wantedLevel >= (cfg.hostileFromLevel or 4)
 
+    local profile = {
+        shootRate = levelValue(cfg.shootRate, wantedLevel, 100),
+        combatAbility = levelValue(cfg.combatAbility, wantedLevel, 1),
+        combatAttributes = {
+            {24, false}, -- cleared wherever the base game sets an explicit shoot rate
+            {2, wantedLevel >= (cfg.drivebyFromLevel or 4)},
+            {46, hostile},
+            {3, false}, -- never bail out of the aircraft
+        },
+    }
+
     local accuracy = levelValue(cfg.accuracy, wantedLevel, nil)
     if accuracy then
-        SetPedAccuracy(officer, math.random(accuracy[1], accuracy[2]))
+        profile.accuracy = math.random(accuracy[1], accuracy[2])
     end
 
-    -- Not every PED native is exposed to the server runtime; these two are not
-    -- used anywhere else server-side in this resource, so check before calling
-    -- rather than risking a nil-call that would kill the whole script.
-    if SetPedShootRate then
-        SetPedShootRate(officer, levelValue(cfg.shootRate, wantedLevel, 100))
-    end
-    if SetPedCombatAbility then
-        SetPedCombatAbility(officer, levelValue(cfg.combatAbility, wantedLevel, 1))
-    end
-
-    local pattern
     if role == 'air' then
-        pattern = cfg.firingPatternHeli or 'FIRING_PATTERN_BURST_FIRE_HELI'
+        profile.firingPattern = cfg.firingPatternHeli or 'FIRING_PATTERN_BURST_FIRE_HELI'
     elseif wantedLevel >= (cfg.fullAutoFromLevel or 5) then
-        pattern = cfg.firingPatternAuto or 'FIRING_PATTERN_FULL_AUTO'
+        profile.firingPattern = cfg.firingPatternAuto or 'FIRING_PATTERN_FULL_AUTO'
     else
-        pattern = cfg.firingPatternBurst or 'FIRING_PATTERN_BURST_FIRE'
+        profile.firingPattern = cfg.firingPatternBurst or 'FIRING_PATTERN_BURST_FIRE'
     end
-    SetPedFiringPattern(officer, GetHashKey(pattern))
-
-    -- Cleared wherever the base game sets an explicit shoot rate.
-    SetPedCombatAttributes(officer, 24, false)
-
-    SetPedCombatAttributes(officer, 2, wantedLevel >= (cfg.drivebyFromLevel or 4))
-    SetPedCombatAttributes(officer, 46, hostile)
-    SetPedCombatAttributes(officer, 3, false) -- never bail out of the aircraft
 
     -- Only claim the hostile group here. The passive group is created client-side
     -- (AddRelationshipGroup / SetRelationshipBetweenGroups are client natives),
     -- so leaving the default group until the client's first cycle is correct.
     if hostile then
-        SetPedRelationshipGroupHash(officer, GetHashKey(cfg.relationshipHostile or 'HATES_PLAYER'))
+        profile.relationshipGroup = cfg.relationshipHostile or 'HATES_PLAYER'
     end
+
+    dispatchCombatProfile(pedNetID, profile)
 
     return hostile
 end
@@ -683,16 +708,15 @@ AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnP
                     -- the seating state cleared the active-weapon slot.
                     GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, true)
                     SetCurrentPedWeapon(officer, GetHashKey('weapon_combatpistol'), true)
-                    -- [Upstate Mafia] Server-side combat setup for heli pilot
-                    SetPedCombatAttributes(officer, 52, true)  -- Can vehicle attack
-                    SetPedCombatAttributes(officer, 53, true)  -- Can use mounted vehicle weapons
-                    SetPedFleeAttributes(officer, 0, false)
+                    -- Combat/task setup for heli pilot.
+                    dispatchCombatProfile(pedNetID, {
+                        combatAttributes = {{52, true}, {53, true}}, -- can vehicle attack / use mounted weapons
+                        fleeAttributes = {0, false},
+                        driverAbility = 1.0,
+                        heliChaseTarget = src,
+                    })
                     -- Accuracy / firing pattern / hostility scale with wanted level.
                     applyOfficerCombatProfile(officer, wantedLevel, 'air')
-                    -- Pilot: chase the player
-                    local targetPed = GetPlayerPed(src)
-                    TaskHeliChase(officer, targetPed, 0, 0, 120)
-                    SetDriverAbility(officer, 1.0)
                 end
                 table.insert(officers, pedNetID)
                 vehicleCrewed = true
@@ -756,14 +780,13 @@ AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnP
                     if Config.isDebug then print('NET crew ' ..pedModel .. ' SEATED with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. tostring(vehNetID)) end
                     -- Loadout already given before seating; re-apply to ensure active weapon is set
                     givePedLoadout(officer, Config.loadouts[selectedEntry.unit.loadout])
-                    -- [Upstate Mafia] Server-side combat setup for heli crew
-                    SetPedFleeAttributes(officer, 0, false)
+                    -- Combat/task setup for heli crew.
+                    dispatchCombatProfile(pedNetID, { fleeAttributes = {0, false} })
                     -- Crew only open fire once hostile for this wanted level; below
                     -- that they ride along and the heli just shadows the player.
                     local crewHostile = applyOfficerCombatProfile(officer, wantedLevel, 'air')
                     if crewHostile then
-                        local targetPed = GetPlayerPed(src)
-                        TaskCombatPed(officer, targetPed, 0, 16)
+                        dispatchCombatProfile(pedNetID, { combatTarget = src })
                     end
                     table.insert(officers, pedNetID)
                 end
@@ -892,20 +915,17 @@ AddEventHandler('spawnPoliceAirNet', function(wantedLevel, playerCoords, spawnPo
                     local pedNetID = NetworkGetNetworkIdFromEntity(officer)
                     if Config.isDebug then print('NET ped ' ..pedModel .. ' spawned with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. vehNetID) end
 
-                    -- [Upstate Mafia] Server-side combat setup for air pilot
+                    -- Combat/task setup for air pilot.
                     if DoesEntityExist(officer) then
                         GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, false)
-                        SetPedCombatAttributes(officer, 52, true) -- Can vehicle attack
-                        SetPedCombatAttributes(officer, 53, true) -- Can use mounted vehicle weapons
-                        SetPedCombatAttributes(officer, 85, true) -- Prefer air targets
-                        SetPedCombatAttributes(officer, 86, true) -- Allow dogfighting
-                        SetPedFleeAttributes(officer, 0, false)
+                        dispatchCombatProfile(pedNetID, {
+                            combatAttributes = {{52, true}, {53, true}, {85, true}, {86, true}}, -- vehicle attack / mounted weapons / prefer air targets / dogfighting
+                            fleeAttributes = {0, false},
+                            driverAbility = 1.0,
+                            planeChaseTarget = src,
+                        })
                         -- Accuracy / firing pattern / hostility scale with wanted level.
                         applyOfficerCombatProfile(officer, wantedLevel, 'air')
-                        -- Pilot: chase the player
-                        local targetPed = GetPlayerPed(src)
-                        TaskPlaneChase(officer, targetPed, 20, 20, 150)
-                        SetDriverAbility(officer, 1.0)
                     end
 
                     -- Add pilot to table to return

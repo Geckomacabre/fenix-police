@@ -25,6 +25,10 @@ dependencies {
 }
 
 client_scripts {
+    -- Applies ped combat/task natives on the server's behalf -- those natives
+    -- don't exist server-side. Self-contained, no ordering requirement.
+    'client/combat_bridge.lua',
+
     -- Shared road/lane/no-go-zone helper. Loaded first: both scripts below call
     -- into the FenixRoads global it defines.
     'client/roads.lua',
