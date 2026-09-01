@@ -700,7 +700,12 @@ Config.ArrestSystem = {
 -- (ps-dispatch's own automatic PlayerDowned alert already handles that): a
 -- failed field revive just holds the scene, it never calls anyone itself.
 Config.Aftermath = {
-    enabled = true,
+    -- [Upstate Mafia] Disabled: still fighting the pursuit AI after several
+    -- rounds of fixes (watchdog, server-side re-tasking, other units staying
+    -- hostile) rather than actually behaving. Turned off so death goes back
+    -- to the previous instant-despawn behaviour. The rest of the feature is
+    -- left in place, not deleted, in case it's worth debugging further later.
+    enabled = false,
 
     -- How far to look for ground officers to respond, in metres. Air/heli
     -- units never respond -- nobody lands a helicopter to perform CPR.
@@ -1179,6 +1184,16 @@ Config.Driving = {
 
     -- Speed while sweeping a search area. Slow: they are looking, not chasing.
     searchSpeed = 16.0,
+
+    -- [Upstate Mafia] Half of the units still in the direct-response phase
+    -- (see applyGroundPursuitTask in server/server.lua) drive to a point this
+    -- far ahead of the player's current velocity instead of their live
+    -- position, so a response reads as officers cutting you off rather than
+    -- every unit converging from the same direction. Ignored below
+    -- interceptMinSpeed (m/s) -- leading a target that isn't meaningfully
+    -- moving just means driving to nowhere.
+    interceptLeadDistance = 70.0,
+    interceptMinSpeed     = 4.0,
 
     -- An officer on foot beside their car is tasked to walk back and get in.
     -- After this many cycles, or beyond this distance, they are warped instead.
