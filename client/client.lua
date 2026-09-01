@@ -2363,6 +2363,32 @@ end
 -- of what the client was doing. Gating the function itself covers all three
 -- (and any future caller) in one place instead of relying on every call site
 -- remembering to check.
+
+--- Best-effort delete of a networked entity this client might not actually
+--- own yet. NetworkRequestControlOfEntity is a REQUEST, not an instant grant
+--- -- the transfer happens over subsequent network frames -- so calling
+--- DeleteEntity in the same tick can silently no-op if it hasn't landed yet.
+--- That is what a pursuit unit that "won't die" on cleanup actually is: not
+--- every entity below requested control at the same moment, and only the
+--- ones whose transfer happened to land before this ran got deleted, leaving
+--- the rest (a heli is a single entity with no second chance from the 5-pass
+--- watchdog's per-officer redundancy, which is why it tends to be the one
+--- that visibly survives). Waits up to 150ms for control to actually land;
+--- still attempts the delete either way, since an entity nobody else claims
+--- ownership of eventually falls to whichever client is left holding it.
+local function deleteNetworkedEntity(entity)
+    if not DoesEntityExist(entity) then return end
+    if not NetworkHasControlOfEntity(entity) then
+        NetworkRequestControlOfEntity(entity)
+        local waited = 0
+        while not NetworkHasControlOfEntity(entity) and waited < 150 do
+            Wait(25)
+            waited = waited + 25
+        end
+    end
+    DeleteEntity(entity)
+end
+
 local function handleEndWantedDelete()
     if aftermath.active then return end
 
@@ -2379,27 +2405,12 @@ local function handleEndWantedDelete()
             for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
             for _, pedNetID in ipairs(pedKeys) do
                 local ped = NetToPed(pedNetID)
-                if DoesEntityExist(ped) then
-                    -- DeleteEntity on a networked entity this client doesn't
-                    -- have control of can silently no-op -- the owning client
-                    -- just re-syncs it back. That is what a pursuit unit that
-                    -- "won't die" actually is, so take control before deleting
-                    -- rather than after the fact.
-                    if not NetworkHasControlOfEntity(ped) then
-                        NetworkRequestControlOfEntity(ped)
-                    end
-                    DeleteEntity(ped)
-                end
+                deleteNetworkedEntity(ped)
                 TriggerServerEvent('deleteSpawnedPed', pedNetID)
                 if Config.isDebug then print('Cleaned up police officer ' .. pedNetID) end
             end
             local vehicle = NetToVeh(vehNetID)
-            if DoesEntityExist(vehicle) then
-                if not NetworkHasControlOfEntity(vehicle) then
-                    NetworkRequestControlOfEntity(vehicle)
-                end
-                DeleteEntity(vehicle)
-            end
+            deleteNetworkedEntity(vehicle)
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
             if Config.isDebug then print('Cleaned up police vehicle ' .. vehNetID) end
             spawnedVehicles[vehNetID] = nil
@@ -2416,27 +2427,12 @@ local function handleEndWantedDelete()
             for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
             for _, pedNetID in ipairs(pedKeys) do
                 local ped = NetToPed(pedNetID)
-                if DoesEntityExist(ped) then
-                    -- DeleteEntity on a networked entity this client doesn't
-                    -- have control of can silently no-op -- the owning client
-                    -- just re-syncs it back. That is what a pursuit unit that
-                    -- "won't die" actually is, so take control before deleting
-                    -- rather than after the fact.
-                    if not NetworkHasControlOfEntity(ped) then
-                        NetworkRequestControlOfEntity(ped)
-                    end
-                    DeleteEntity(ped)
-                end
+                deleteNetworkedEntity(ped)
                 TriggerServerEvent('deleteSpawnedPed', pedNetID)
                 if Config.isDebug then print('Cleaned up heli officer ' .. pedNetID) end
             end
             local vehicle = NetToVeh(vehNetID)
-            if DoesEntityExist(vehicle) then
-                if not NetworkHasControlOfEntity(vehicle) then
-                    NetworkRequestControlOfEntity(vehicle)
-                end
-                DeleteEntity(vehicle)
-            end
+            deleteNetworkedEntity(vehicle)
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
             if Config.isDebug then print('Cleaned up heli unit ' .. vehNetID) end
             spawnedHeliUnits[vehNetID] = nil
@@ -2453,27 +2449,12 @@ local function handleEndWantedDelete()
             for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
             for _, pedNetID in ipairs(pedKeys) do
                 local ped = NetToPed(pedNetID)
-                if DoesEntityExist(ped) then
-                    -- DeleteEntity on a networked entity this client doesn't
-                    -- have control of can silently no-op -- the owning client
-                    -- just re-syncs it back. That is what a pursuit unit that
-                    -- "won't die" actually is, so take control before deleting
-                    -- rather than after the fact.
-                    if not NetworkHasControlOfEntity(ped) then
-                        NetworkRequestControlOfEntity(ped)
-                    end
-                    DeleteEntity(ped)
-                end
+                deleteNetworkedEntity(ped)
                 TriggerServerEvent('deleteSpawnedPed', pedNetID)
                 if Config.isDebug then print('Cleaned up air officer ' .. pedNetID) end
             end
             local vehicle = NetToVeh(vehNetID)
-            if DoesEntityExist(vehicle) then
-                if not NetworkHasControlOfEntity(vehicle) then
-                    NetworkRequestControlOfEntity(vehicle)
-                end
-                DeleteEntity(vehicle)
-            end
+            deleteNetworkedEntity(vehicle)
             TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
             if Config.isDebug then print('Cleaned up air unit ' .. vehNetID) end
             spawnedAirUnits[vehNetID] = nil
