@@ -41,8 +41,30 @@
 
 -- ****BEGIN CODE**** --
 
--- Get the QBCore object so we can do notifications, check for nearest vehicle using their improved call, and handle isDying and isLastStand situations for the player. 
+-- Get the QBCore object so we can do notifications, check for nearest vehicle using their improved call, and handle isDying and isLastStand situations for the player.
 QBCore = exports['qb-core']:GetCoreObject()
+
+-- [Upstate Mafia] qbx_core declares `provide 'qb-core'` (see its
+-- fxmanifest.lua), so the export above transparently resolves there -- but
+-- the object it returns is a snapshot from THAT resource's current script
+-- environment. Restarting qbx_core (for any reason -- it happened here while
+-- iterating on an unrelated admin command) invalidates every reference this
+-- resource is still holding, and every subsequent call into it throws
+-- "Execution of function reference in script host failed" every single tick
+-- forever, since nothing here ever re-fetches it. Live-fire confirmed: this
+-- is what filled a client's log with that exact error on a loop until the
+-- connection timed out and the game crashed. Re-fetch whenever the resource
+-- providing qb-core (co-core itself is never actually running here, only
+-- qbx_core is) restarts, so a future qbx_core restart heals instead of
+-- wedging every tick until this resource is also manually restarted.
+AddEventHandler('onClientResourceStart', function(resourceName)
+    if resourceName == 'qb-core' or resourceName == 'qbx_core' then
+        QBCore = exports['qb-core']:GetCoreObject()
+        if Config.isDebug then
+            print('[fenix-police] QBCore reference refreshed after ' .. resourceName .. ' restarted')
+        end
+    end
+end)
 
 -- [Upstate Mafia] Suppress policet (police transporter) globally on resource start
 Citizen.CreateThread(function()
