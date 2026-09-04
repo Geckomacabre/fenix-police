@@ -527,9 +527,46 @@ end
 -- Function to handle if the server tried to delete a vehicle and someone was in driver seat still. 
 RegisterNetEvent('deleteSpawnedVehicleResponseStolen')
 AddEventHandler('deleteSpawnedVehicleResponseStolen', function(vehNetID)
-    -- Add to stolen vehicle list to delete later. 
+    -- Add to stolen vehicle list to delete later.
     stolenVehicles[vehNetID] = vehNetID
     if Config.isDebug then print('Added vehicle/heli/air ID ' .. vehNetID .. ' to stolenVehicles table ') end
+end)
+
+-- [Upstate Mafia, 2026-09-03] Retry cleanup for stolen police vehicles.
+--
+-- Nothing previously read stolenVehicles back out after the line above added
+-- to it, so a vehicle stolen mid-chase stayed in the world forever, long
+-- after the player was done with it -- the "known issue" the README used to
+-- flag. This retries the same delete request once the vehicle is no longer
+-- occupied. Self-correcting: if the server finds it occupied again, it just
+-- re-fires deleteSpawnedVehicleResponseStolen above and the entry goes right
+-- back into the table for the next pass.
+local function checkStolenVehicles()
+    for vehNetID in pairs(stolenVehicles) do
+        if not NetworkDoesEntityExistWithNetworkId(vehNetID) then
+            -- Already gone -- naturally despawned, or cleaned up some other way.
+            stolenVehicles[vehNetID] = nil
+        else
+            local vehicle = NetworkGetEntityFromNetworkId(vehNetID)
+            if not DoesEntityExist(vehicle) then
+                stolenVehicles[vehNetID] = nil
+            elseif GetPedInVehicleSeat(vehicle, -1) == 0 then
+                -- Driver's seat empty -- the same "occupied" test the server
+                -- used when it first refused to delete this. Safe to retry.
+                if Config.isDebug then print('Retrying delete for abandoned stolen vehicle ID ' .. vehNetID) end
+                TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
+                stolenVehicles[vehNetID] = nil
+            end
+            -- Still occupied: leave it in the table, try again next sweep.
+        end
+    end
+end
+
+CreateThread(function()
+    while true do
+        Wait((Config.stolenVehicleRecheckSeconds or 60) * 1000)
+        checkStolenVehicles()
+    end
 end)
 
 
@@ -908,6 +945,7 @@ local function applyOfficerCombatProfile(officer, wantedLevel, engages, role)
         SetPedFiringPattern(officer, GetHashKey('FIRING_PATTERN_FULL_AUTO'))
         SetPedCombatAttributes(officer, 2, true)
         SetPedCombatAttributes(officer, 46, true)
+        SetPedCombatMovement(officer, 2) -- Offensive
         return true
     end
 
@@ -923,6 +961,10 @@ local function applyOfficerCombatProfile(officer, wantedLevel, engages, role)
     SetPedShootRate(officer, levelValue(cfg.shootRate, wantedLevel, 100))
     SetPedCombatAbility(officer, levelValue(cfg.combatAbility, wantedLevel, 1))
     SetPedCombatRange(officer, levelValue(cfg.combatRange, wantedLevel, 1))
+    -- Never called before this: officers took cover/positioning cues from
+    -- whatever the engine's default happened to be, not from anything this
+    -- resource set. See Config.Combat.combatMovement for the enum.
+    SetPedCombatMovement(officer, levelValue(cfg.combatMovement, wantedLevel, 1))
 
     -- Full auto only once things are serious. Burst fire keeps early chases
     -- survivable. Air crews get the base game's mounted-weapon pattern instead.
@@ -939,6 +981,17 @@ local function applyOfficerCombatProfile(officer, wantedLevel, engages, role)
     -- 24 off: the base game clears this attribute on every ped it gives an
     -- explicit SetPedShootRate to, so it doesn't fight the rate we just set.
     SetPedCombatAttributes(officer, 24, false)
+
+    -- 43 = SwitchToAdvanceIfCantFindCover. Rockstar's own police AI sets this
+    -- in the same block as the difficulty tiers §13 already anchors accuracy/
+    -- shootRate/combatAbility to (fm_content_vehrob_police, func_303). Without
+    -- it a Defensive officer with no reachable cover just stands there instead
+    -- of doing anything -- this is what stops that.
+    SetPedCombatAttributes(officer, 43, true)
+    -- 42 = CanFlank. Only meaningful once actually fighting; a passive unit
+    -- flanking the player it isn't shooting at would just look like it's
+    -- creeping up on them.
+    SetPedCombatAttributes(officer, 42, hostile)
 
     -- 2 = CanDoDrivebys. Held back until the shootout tiers.
     SetPedCombatAttributes(officer, 2, provoked or wantedLevel >= (cfg.drivebyFromLevel or 4))
@@ -1498,13 +1551,38 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                                 spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'ToLastKnown'
                             end
                         elseif distance > 45.0 or not inContact then
-                            TaskVehicleDriveToCoord(officer, polVehicle, target.x, target.y, target.z, profile.speed, 1, GetEntityModel(polVehicle), DRIVING_STYLE_PURSUIT, 2.0, true)
-                            SetDriveTaskDrivingStyle(officer, DRIVING_STYLE_PURSUIT)
-                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                            -- [Upstate Mafia] Was re-issued every single cycle for every
+                            -- officer beyond 45m, unconditionally -- each one a fresh
+                            -- GET_VEHICLE_NODE-style road-pathfinding request. That's the
+                            -- CNetworkRoadNodeWorldStateData Pool Full errors this server
+                            -- has been logging all night, live-fire confirmed: a heavy
+                            -- pursuit (10+ ground units) crashed a client outright with
+                            -- "Recursive-recursive error: ... Pool Full, Size == 20" --
+                            -- the engine's pool is a hard-capped 20 slots TOTAL, not per
+                            -- officer. Re-pathing for a target that moved half a metre
+                            -- since the last tick buys nothing; only actually re-request
+                            -- once the target has moved far enough that the old path is
+                            -- stale, same spacing logic the ambient system already uses
+                            -- elsewhere in this resource for "did this move enough to
+                            -- matter" checks.
+                            local lastTarget = profile.lastDriveTarget
+                            if taskStatus ~= 'DriveToCoord' or not lastTarget or #(target - lastTarget) > 15.0 then
+                                TaskVehicleDriveToCoord(officer, polVehicle, target.x, target.y, target.z, profile.speed, 1, GetEntityModel(polVehicle), DRIVING_STYLE_PURSUIT, 2.0, true)
+                                SetDriveTaskDrivingStyle(officer, DRIVING_STYLE_PURSUIT)
+                                profile.lastDriveTarget = target
+                                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'DriveToCoord'
+                            end
                         else
-                            TaskVehicleChase(officer, playerPed)
-                            SetTaskVehicleChaseBehaviorFlag(officer, 8, true)
-                            spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                            -- Gated on transition only, matching handleHeliChaseBehavior's
+                            -- TaskHeliChase: the native tracks playerPed itself once issued,
+                            -- so reissuing every cycle bought nothing but made the driving AI
+                            -- reconsider its approach every second -- visible as a stutter
+                            -- ground units had that the heli crews never did.
+                            if taskStatus ~= 'VehicleChase' then
+                                TaskVehicleChase(officer, playerPed)
+                                SetTaskVehicleChaseBehaviorFlag(officer, 8, true)
+                                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                            end
                         end
 
                         SetDriverAbility(officer, profile.ability)
@@ -2476,6 +2554,19 @@ end
 
 RegisterNetEvent('fenix-police:cleanupAllPolice')
 AddEventHandler('fenix-police:cleanupAllPolice', function()
+    handleEndWantedDelete()
+end)
+
+-- [Upstate Mafia] A `restart fenix-police` / crash / deploy mid-chase used to
+-- leave every ground/heli/air unit this client had spawned wandering the map
+-- forever: this file's Lua state (spawnedVehicles etc.) is wiped on stop, so
+-- nothing was left to call handleEndWantedDelete(), and it guards on
+-- aftermath.active which has no meaning once the resource is gone anyway.
+-- Force the gate open and run the same cleanup one last time before the
+-- tables holding the entity references disappear.
+AddEventHandler('onClientResourceStop', function(res)
+    if res ~= GetCurrentResourceName() then return end
+    aftermath.active = false
     handleEndWantedDelete()
 end)
 
@@ -3579,6 +3670,16 @@ end)
 --- before a field revive ever got a chance to start.
 local function isPlayerIncapacitated(playerPed)
     if IsEntityDead(playerPed) or IsPedFatallyInjured(playerPed) then return true end
+    -- [Upstate Mafia] Live-tested against this server's actual EMS
+    -- (wasabi_ambulance): neither native check above nor the metadata fallback
+    -- below ever trips during its last-stand -- confirmed both IsEntityDead/
+    -- IsPedFatallyInjured false AND wasabi never calls SetMetaData for isdead/
+    -- inlaststand anywhere in its own source. Aftermath silently never
+    -- triggered as a result. wasabi_ambulance/game/client/client.lua now mirrors
+    -- its own (otherwise unreadable -- the real death handling is escrowed)
+    -- isDead global onto this state bag; check it first since it is the one
+    -- signal actually proven to reflect this server's EMS state.
+    if LocalPlayer.state.wsbDeadOrLastStand == true then return true end
     local pd = QBCore and QBCore.Functions and QBCore.Functions.GetPlayerData and QBCore.Functions.GetPlayerData()
     local md = pd and pd.metadata or nil
     return md ~= nil and (md['isdead'] or md['inlaststand'] or md['dead']) == true
@@ -3716,6 +3817,22 @@ local function beginAftermath(playerCoords)
     -- body someone is supposed to be reviving.
     TriggerServerEvent('fenix-police:aftermathState', true)
 
+    -- [Upstate Mafia] Real police call it in the moment they find someone
+    -- down, they don't wait to see if their own first aid works. This used to
+    -- rely on ps-dispatch's own automatic CEventNetworkEntityDamage alert --
+    -- but that only fires on a genuine engine-level death, and wasabi_ambulance
+    -- (this server's EMS) deliberately keeps the ped alive during last-stand
+    -- so it CAN be revived. That alert never fired, so EMS was never actually
+    -- called and a failed field revive just left the player bleeding out with
+    -- nobody coming. Call it directly instead of assuming another resource's
+    -- side effect covers it.
+    if GetResourceState('ps-dispatch') == 'started' then
+        local ok, err = pcall(function() exports['ps-dispatch']:InjuriedPerson() end)
+        if not ok and Config.isDebug then
+            print('[fenix-police] ps-dispatch InjuriedPerson call failed: ' .. tostring(err))
+        end
+    end
+
     local medicPed = nearby[1].ped
     attemptFieldRevive(medicPed, playerCoords)
 
@@ -3733,6 +3850,35 @@ local function beginAftermath(playerCoords)
             local ped = NetToPed(pedNetID)
             if ped and ped ~= 0 and DoesEntityExist(ped) and ped ~= medicPed then
                 holdSceneWithOfficer({ ped = ped })
+                held = held + 1
+            end
+        end
+    end
+
+    -- [Upstate Mafia] Heli/plane gunners never get physically parked (nobody
+    -- lands a helicopter for this), and the per-tick handleHeliChaseBehavior /
+    -- handleAirChaseBehavior calls are skipped outright while the player is
+    -- incapacitated (see the main loop) -- but a TaskCombatPed issued before
+    -- the player went down keeps running regardless: the native AI target is
+    -- still alive (last-stand is a framework/metadata state, not
+    -- IsEntityDead), so an airborne gunner mid-attack kept strafing right
+    -- through a field-revive attempt. standDownOfficer() only touches
+    -- relationship group and combat attributes -- no ClearPedTasks -- so it is
+    -- safe to call on a ped still mid-flight-task.
+    for _, vehicleData in pairs(spawnedHeliUnits) do
+        for pedNetID in pairs(vehicleData.officers or {}) do
+            local ped = NetToPed(pedNetID)
+            if ped and ped ~= 0 and DoesEntityExist(ped) then
+                standDownOfficer(ped)
+                held = held + 1
+            end
+        end
+    end
+    for _, vehicleData in pairs(spawnedAirUnits) do
+        for pedNetID in pairs(vehicleData.officers or {}) do
+            local ped = NetToPed(pedNetID)
+            if ped and ped ~= 0 and DoesEntityExist(ped) then
+                standDownOfficer(ped)
                 held = held + 1
             end
         end

@@ -168,6 +168,19 @@ function FenixGuard.release(netID)
     if netID then owned[netID] = nil end
 end
 
+--- Snapshot of every currently-owned net ID, for a resource-stop sweep that
+--- has to find everything this resource ever spawned without keeping its own
+--- second copy of the same registry. Returns {netID, kind} pairs; callers
+--- resolve the entity themselves since a netID can go stale between the
+--- snapshot and the delete attempt.
+function FenixGuard.allOwned()
+    local list = {}
+    for netID, rec in pairs(owned) do
+        list[#list + 1] = { netID = netID, kind = rec.kind }
+    end
+    return list
+end
+
 --- How many entities this player currently has on the books. The cap this feeds
 --- is the backstop against a client that passes every other check and simply
 --- asks for units forever.

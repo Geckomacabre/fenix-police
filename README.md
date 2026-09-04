@@ -389,9 +389,17 @@ Honest assessment, because it affects what you should expect:
 If ambient feels too sparse, loosen in this order: `radarFallbackToRoadNodes` →
 `minSceneSpacing` → `maxNearbyCops`.
 
-Known limits: NPC detection is position-only rather than path-swept (academic
-below ~80 mph); "any cop" means any officer *this* system spawned, not police
+Known limits: "any cop" means any officer *this* system spawned, not police
 peds from other resources.
+
+**[Upstate Mafia, 2026-09-03]** NPC radar detection is now path-swept, same as
+the player check — it used to be position-only (a car could tunnel through an
+aimed trap's cone between two scans undetected above roughly 80 mph). Also
+fixed: a police vehicle stolen and then abandoned now gets cleaned up once
+vacated. Previously `deleteSpawnedVehicleResponseStolen` only ever added the
+vehicle to a "delete later" table and nothing ever read it back out, so it
+stayed in the world forever even long after the player was done with it — see
+`Config.stolenVehicleRecheckSeconds`.
 
 ---
 
@@ -422,8 +430,12 @@ Inherited from upstream, all configurable:
 - **Player police protection** — officers can be exempted from wanted levels,
   optionally only while on duty. *(Fixed in this fork; see above.)*
 
-**Known issue (upstream):** a police vehicle stolen by a player never despawns if
-occupied at the moment the script would normally remove it.
+**Fixed in this fork (2026-09-03):** a police vehicle stolen by a player used to
+never despawn once occupied at the moment the script tried to remove it — the
+skip was permanent, with nothing ever retrying the deletion afterward. It now
+retries once the vehicle is empty again (`Config.stolenVehicleRecheckSeconds`),
+so the "keep it for the rest of the chase" behaviour above is unaffected, but an
+abandoned stolen cruiser no longer sits in the world forever.
 
 ---
 

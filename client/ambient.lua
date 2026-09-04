@@ -1054,6 +1054,7 @@ local MPS_TO_MPH = 2.236936
 local radarCooldown = {}  -- entity -> timer value it may be clocked again at
 local npcScanTick = 0
 local lastPlayerPos = nil -- previous sample, so fast cars can't tunnel the cone
+local lastNpcPos = {} -- vehicle handle -> previous scan's coords, same reason
 
 local function radarCfg() return cfg().radar or {} end
 
@@ -1142,6 +1143,24 @@ local function witnessed(scene, from, to)
     end
     return crossedRadarCone(observer, from, to, c.copDetectRange or 45.0, 360.0)
 end
+
+--- Generalized version of the check above, for callers outside this file that
+--- have nothing to do with speed -- see client/violations.lua. Any active
+--- scene's observer (trap cruiser, patrol car, or foot officer) counts, tested
+--- as a plain radius since these aren't things an officer is aimed at.
+local function isWitnessed(pos, range)
+    for _, scene in pairs(scenes) do
+        local observer = observerOf(scene)
+        if observer and inRadarCone(observer, pos, range or 45.0, 360.0) then
+            return true
+        end
+    end
+    return false
+end
+
+exports('IsWitnessed', function(x, y, z, range)
+    return isWitnessed(vector3(x, y, z), range)
+end)
 
 --- Is the local player on duty as police? Checked before enforcing so ambient
 --- officers never pull over a player who is themselves policing — that job
@@ -1471,6 +1490,18 @@ end
 --- no pool walk at all, and the NPC pool is fetched once per scan (not per
 --- scene) on a slower cadence than the player check.
 local function radarTick()
+    -- [Upstate Mafia] Road-enforcement makes no sense indoors anyway, but the
+    -- real reason for this guard is CNetworkRoadNodeWorldStateData Pool Full:
+    -- postedThreshold() below calls GetClosestVehicleNodeWithHeading every
+    -- tick regardless of where the player is, and from inside an interior
+    -- there is no nearby road graph for it to resolve against. That churns
+    -- (or retries) instead of returning cleanly, and this runs on every
+    -- connected client continuously -- not just during pursuits -- which is
+    -- why the pool errors were showing up with zero wanted level and nobody
+    -- being chased. Confirmed live: reproduced while a player was simply
+    -- standing in an apartment MLO.
+    if GetInteriorFromEntity(PlayerPedId()) ~= 0 then return end
+
     local c = radarCfg()
     pruneCooldowns()
 
@@ -1553,16 +1584,29 @@ local function radarTick()
         if t < lowest then lowest = t end
     end
 
+    -- Rebuilt fresh every scan from whatever's currently in the pool, which
+    -- doubles as pruning: a vehicle that despawned since the last scan simply
+    -- isn't carried forward into this table.
+    local newNpcPos = {}
+
     for _, veh in ipairs(GetGamePool('CVehicle')) do
         if not onCooldown(veh) then
             local speed = GetEntitySpeed(veh) * MPS_TO_MPH
+            local pos = GetEntityCoords(veh)
+            -- Tracked for every vehicle, not just ones currently over
+            -- threshold -- otherwise a car that accelerates past the limit
+            -- between two scans has no "from" to sweep against and is judged
+            -- on its arrival point alone, same tunnelling problem the player
+            -- check already solved below.
+            newNpcPos[veh] = pos
+
             if speed >= lowest then
                 local driver = GetPedInVehicleSeat(veh, -1)
                 if driver ~= 0 and DoesEntityExist(driver) and not IsPedAPlayer(driver) then
-                    local pos = GetEntityCoords(veh)
+                    local prev = lastNpcPos[veh]
                     for _, scene in ipairs(npcCatchers) do
                         if not scene.chase and speed >= thresholdFor(scene)
-                            and witnessed(scene, nil, pos) then
+                            and witnessed(scene, prev, pos) then
                             catchNpc(scene, veh, driver, speed)
                             break
                         end
@@ -1571,6 +1615,8 @@ local function radarTick()
             end
         end
     end
+
+    lastNpcPos = newNpcPos
 end
 
 CreateThread(function()
@@ -1754,9 +1800,14 @@ RegisterCommand('ambientpolice', function(_, args)
     local cops = 0
     for _, scene in pairs(scenes) do cops = cops + scene.cops end
 
+    local toolkitCount = 0
+    if toolkitPoints then
+        for _, list in pairs(toolkitPoints) do toolkitCount = toolkitCount + #list end
+    end
+
     print(('[FENIX-AMBIENT] %s — %d/%d scene(s), %d/%d officer(s) nearby, %d toolkit point set(s)')
         :format(runtimeEnabled and 'ON' or 'OFF', sceneCount(), cfg().maxScenes or 4,
-            cops, cfg().maxNearbyCops or 6, toolkitPoints and 1 or 0))
+            cops, cfg().maxNearbyCops or 6, toolkitCount))
 
     -- Which scenes are actually live, so "I drove past a cop and nothing
     -- happened" can be answered: only `radar` scenes read speed at all.

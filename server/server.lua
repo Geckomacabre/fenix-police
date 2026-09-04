@@ -697,7 +697,15 @@ AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnP
         end
         vehNetID = NetworkGetNetworkIdFromEntity(vehicle)
 
-        SetEntityDistanceCullingRadius(vehicle, 10000.0)
+        -- [Upstate Mafia] Was SetEntityDistanceCullingRadius(vehicle, 10000.0).
+        -- citizenfx/fivem#1828: a large culling radius on a server-created
+        -- entity, combined with a client-issued task (exactly this heli's
+        -- TaskHeliChase), is the reported trigger for OneSync silently
+        -- teleporting the entity back to its spawn point or dropping its task
+        -- once another player comes near it. A CitizenFX contributor's answer
+        -- in that thread is blunt: "you should not ever use that option."
+        -- Default culling is already enough to keep a heli loaded for the one
+        -- player it's actively chasing.
 
         -- [Upstate Mafia patch] Unlock doors + set statebag so qbx_vehiclekeys skips auto-lock
         SetVehicleDoorsLocked(vehicle, 1)  -- 1 = unlocked
@@ -725,7 +733,8 @@ AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnP
                 if Config.isDebug then print('Spawning pilot '..pedModel.. ' failed.') end
                 return
             end
-            SetEntityDistanceCullingRadius(officer, 10000.0)
+            -- SetEntityDistanceCullingRadius removed -- see the note above the
+            -- heli's own creation, same citizenfx/fivem#1828 concern.
             Wait(200)
 
             -- Give weapon BEFORE seating so it persists through vehicle-entry state changes.
@@ -807,7 +816,8 @@ AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnP
                     if Config.isDebug then print('Spawning crew '..pedModel.. ' failed.') end
                     return
                 end
-                SetEntityDistanceCullingRadius(officer, 10000.0)
+                -- SetEntityDistanceCullingRadius removed -- see the note above the
+                -- heli's own creation, same citizenfx/fivem#1828 concern.
                 Wait(200)
 
                 -- Give loadout BEFORE seating so weapons persist through vehicle-entry state.
@@ -922,8 +932,8 @@ AddEventHandler('spawnPoliceAirNet', function(wantedLevel, playerCoords, spawnPo
         end
         vehNetID = NetworkGetNetworkIdFromEntity(vehicle)
 
-        SetEntityDistanceCullingRadius(vehicle, 10000.0)
-        
+        -- SetEntityDistanceCullingRadius removed -- see the note in
+        -- spawnPoliceHeliNet above, same citizenfx/fivem#1828 concern.
 
         officers = {}
 
@@ -949,7 +959,8 @@ AddEventHandler('spawnPoliceAirNet', function(wantedLevel, playerCoords, spawnPo
                     if Config.isDebug then print('Spawning '..pedModel.. ' failed.') end
                     return
                 end
-                SetEntityDistanceCullingRadius(officer, 10000.0)
+                -- SetEntityDistanceCullingRadius removed -- see the note in
+                -- spawnPoliceHeliNet above, same citizenfx/fivem#1828 concern.
                 Wait(50)
                 TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
                 Wait(50)
@@ -1267,5 +1278,31 @@ AddEventHandler('fenix:server:trigger', function(pdata, alertData)
             print(('[fenix-police]   applying wanted %d to %s'):format(wantedlevel, tostring(playerId)))
         end
         TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
+    end
+end)
+
+-- [Upstate Mafia] Resource-stop sweep. Heli and plane units are created
+-- server-side (see spawnPoliceHeliNet / spawnPoliceAirNet above), so a
+-- `restart fenix-police` / crash / deploy mid-chase leaves that vehicle and
+-- its crew behind with nothing left to delete them -- client.lua's own
+-- onClientResourceStop cleanup only knows about entities it spawned itself,
+-- and the client-side ground units it does track go down with the same
+-- restart before their own cleanup can run. FenixGuard.allOwned() is the one
+-- registry that already covers every entity this resource has claimed,
+-- ground or air, so sweeping it here on server stop is a single catch-all
+-- rather than a second bespoke tracking table to keep in sync.
+AddEventHandler('onResourceStop', function(res)
+    if res ~= GetCurrentResourceName() then return end
+
+    local swept = 0
+    for _, rec in ipairs(FenixGuard.allOwned()) do
+        local entity = NetworkGetEntityFromNetworkId(rec.netID)
+        if entity and entity ~= 0 and DoesEntityExist(entity) then
+            DeleteEntity(entity)
+            swept = swept + 1
+        end
+    end
+    if Config.isDebug then
+        print(('[fenix-police] resource stop: swept %d leftover entit%s'):format(swept, swept == 1 and 'y' or 'ies'))
     end
 end)

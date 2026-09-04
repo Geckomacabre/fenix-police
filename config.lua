@@ -202,6 +202,28 @@ Config.Combat = {
         [5] = 2,
     },
 
+    -- SetPedCombatMovement (native SET_PED_COMBAT_MOVEMENT, eCombatMovement):
+    --   0 Stationary        stands in place
+    --   1 Defensive         finds cover, likely to blind fire
+    --   2 Offensive         pushes toward the player, still uses cover
+    --   3 Suicidal Offensive tries to flank in a suicidal attack
+    -- Was never called anywhere in this resource — every officer defaulted to
+    -- whatever the game last left it at (usually Stationary), so hostile cops
+    -- plant and shoot from wherever TaskCombatPed put them instead of taking
+    -- cover or closing distance. This is most of the difference between "cops
+    -- that duck behind cars" and "cops that stand in the open".
+    -- 1-3 stay Defensive to match the pursuit-first philosophy above (cover,
+    -- not a firefight); 4-5 go Offensive once it's a real shootout. Never 3 —
+    -- Rockstar's own difficulty tiers top out at "hard", not suicidal, and a
+    -- cop that charges blindly reads as broken, not dangerous.
+    combatMovement = {
+        [1] = 1,
+        [2] = 1,
+        [3] = 1,
+        [4] = 2,
+        [5] = 2,
+    },
+
     -- Wanted level from which officers may fire out of vehicle windows.
     -- Drive-bys are the single biggest source of "shot through the windshield
     -- while doing 90" complaints, so they're held back to the shootout tiers.
@@ -469,11 +491,11 @@ Config.Ambient = {
         -- is only walked every npcScanEveryTicks passes, so at these numbers
         -- traffic is scanned a little over once a second.
         --
-        -- The player check walks the path travelled since the last sample rather
-        -- than just the current position, so this rate does NOT set a speed
-        -- ceiling on detection — a car at 150 mph covers ~40m between samples
-        -- here and is still picked up. NPCs are tested on position only, so a
-        -- genuinely flying NPC can still slip through.
+        -- Both the player and NPC checks walk the path travelled since the
+        -- last sample rather than just the current position (see lastNpcPos
+        -- in ambient.lua -- [Upstate Mafia] 2026-09-03), so this rate does NOT
+        -- set a speed ceiling on detection: a car at 150 mph covers ~50m
+        -- between scans at npcScanEveryTicks=2 and is still picked up.
         tickMs = 600,
         npcScanEveryTicks = 2,
 
@@ -657,6 +679,81 @@ Config.Ambient = {
 }
 
 
+-- MOVING VIOLATIONS --
+-- [Upstate Mafia] Non-speed traffic offences: wrong-way driving, riding a
+-- motorcycle without a helmet, wheelies/stoppies, and phone use while driving.
+-- Modeled on inspiration from the "Pull Me Over" singleplayer mod, reimplemented
+-- from scratch against this resource's own witness/wanted pipeline rather than
+-- ported (that mod is a ScriptHookVDotNet plugin; nothing in it runs on FiveM).
+--
+-- Every check requires an ambient officer to actually be able to see the
+-- player first (client/violations.lua calls exports('fenix-police'):IsWitnessed,
+-- the same cone/radius test radar enforcement uses) -- "the police only know
+-- what they can see" applies here too, not just to pursuits. A hit calls the
+-- same ApplyWantedLevel() radar enforcement uses, so dispatch, the pursuit
+-- stack and the roadside-citation flow all pick it up with no extra wiring.
+--
+-- Deliberately NOT covered: running red lights, stop-sign violations, and
+-- driving on the sidewalk. FiveM has no native that reports a traffic light's
+-- current colour at an arbitrary junction, and there is no stop-sign
+-- coordinate data anywhere on this server (checked: Pull Me Over's own
+-- Streets.xml is a street-name-to-region list for speed limits, not sign
+-- locations). Those three would need a hand-surveyed intersection dataset
+-- before they could be built without constant false positives -- a separate
+-- task, not attempted here.
+Config.Violations = {
+    -- How far / wide an ambient officer can notice one of these from, same
+    -- shape as Config.Ambient.radar.copDetectRange (a plain radius, not an
+    -- aimed cone -- these aren't things a trap is pointed at, they're things
+    -- an officer who's simply looking around would notice).
+    witnessRange = 35.0,
+
+    tickMs = 750,
+
+    wrongWay = {
+        enabled = true,
+        -- Below this the car could just be turning, parking, or nosing out of
+        -- a driveway -- not yet "driving" against traffic.
+        minSpeedMph = 15,
+        -- FenixRoads.roadInfoAt() is trusted only when it found a real
+        -- GET_CLOSEST_ROAD segment (road.approximate == false) AND that
+        -- segment is genuinely one-directional (one of fwdLanes/bwdLanes is
+        -- zero) -- an ordinary two-way street can't be "wrong way" by this
+        -- check, only a one-way street or one carriageway of a divided road.
+        wantedLevel = 1,
+        cooldownSeconds = 60,
+    },
+
+    noHelmet = {
+        enabled = true,
+        -- GetVehicleClass(veh) == 8 is motorcycles.
+        minSpeedMph = 5,
+        wantedLevel = 1,
+        cooldownSeconds = 90,
+    },
+
+    wheelie = {
+        enabled = true,
+        -- GET_VEHICLE_WHEELIE_STATE == 129 ("doing wheelie") per FiveM's own
+        -- native docs. Covers stoppies too -- GTA V doesn't expose a separate
+        -- state for one vs. the other.
+        wantedLevel = 1,
+        cooldownSeconds = 90,
+    },
+
+    phone = {
+        enabled = true,
+        -- Reads LocalPlayer.state.phoneOpen, the state bag lb-phone itself
+        -- sets (see [phone]/lb-phone/client/custom/functions/entities.lua) --
+        -- no lb-phone export needed, and this is a no-op if lb-phone isn't
+        -- running (the state key is simply never set).
+        minSpeedMph = 5,
+        wantedLevel = 1,
+        cooldownSeconds = 60,
+    },
+}
+
+
 -- ARREST / BUSTED SYSTEM --
 -- When a wanted player presses the surrender key (default H), they put their hands up.
 -- Nearby officers will approach with weapons aimed. Once close enough, the player is
@@ -700,12 +797,15 @@ Config.ArrestSystem = {
 -- (ps-dispatch's own automatic PlayerDowned alert already handles that): a
 -- failed field revive just holds the scene, it never calls anyone itself.
 Config.Aftermath = {
-    -- [Upstate Mafia] Disabled: still fighting the pursuit AI after several
-    -- rounds of fixes (watchdog, server-side re-tasking, other units staying
-    -- hostile) rather than actually behaving. Turned off so death goes back
-    -- to the previous instant-despawn behaviour. The rest of the feature is
-    -- left in place, not deleted, in case it's worth debugging further later.
-    enabled = false,
+    -- [Upstate Mafia] Re-enabled: beginAftermath() only stood down GROUND
+    -- officers (spawnedVehicles), leaving heli/plane gunners still mid a
+    -- previously-issued TaskCombatPed -- a "last stand" player is not
+    -- IsEntityDead natively, so an airborne unit kept strafing straight
+    -- through a field-revive attempt regardless of the ground fixes already
+    -- landed (watchdog, server-side re-tasking). Fixed by standing down
+    -- spawnedHeliUnits/spawnedAirUnits the same way. Re-test if units still
+    -- stay hostile.
+    enabled = true,
 
     -- How far to look for ground officers to respond, in metres. Air/heli
     -- units never respond -- nobody lands a helicopter to perform CPR.
@@ -1161,12 +1261,20 @@ Config.Driving = {
         [5] = { 0.85, 1.00 },
     },
 
+    -- [Upstate Mafia] Pulled back a full tier across the board after a live
+    -- test at 3 stars: two units closed to a point-blank box-in almost
+    -- immediately. GTA's own TASK_VEHICLE_CHASE already leans toward PIT/
+    -- blocking behavior once an officer is close, so even the old level-3
+    -- range (0.50-0.75) read as a demolition derby in practice, not "a
+    -- pursuit that's starting to get serious." Real pursuits tail and box in
+    -- only once they've decided you're not stopping -- that should still be
+    -- true at 5 stars, but 1-2 stars should mostly just be someone following.
     aggression = {
-        [1] = { 0.25, 0.50 },   -- a pursuit, not a demolition derby
-        [2] = { 0.35, 0.60 },
-        [3] = { 0.50, 0.75 },
-        [4] = { 0.70, 0.95 },
-        [5] = { 0.85, 1.00 },
+        [1] = { 0.10, 0.25 },
+        [2] = { 0.20, 0.35 },
+        [3] = { 0.30, 0.50 },
+        [4] = { 0.50, 0.70 },
+        [5] = { 0.65, 0.85 },
     },
 
     -- Commanded pursuit speed in m/s. 42 is roughly 94 mph.
@@ -1498,9 +1606,19 @@ Config.footChaseDistance = 30.0
 
 -- NOTE: Police vehicles will not be cleaned up if a player is currently occupying them at the time the script attempts to remove them.
 -- However it will remove the vehicle from the script's tracking at this time so the currently spawned count is decreased and a replacement can spawn. 
--- This means the vehicle will never be deleted after this.
 -- This is to allow the player to steal a police vehicle and not have it disappear mid chase. Or to keep it and use it for any length of time
--- after the chase. If too many vehicles are left in the world it could cause performance issues. 
+-- after the chase. If too many vehicles are left in the world it could cause performance issues.
+
+-- [Upstate Mafia, 2026-09-03] The line above used to end "This means the vehicle
+-- will never be deleted after this" -- that was a real bug, not the intended
+-- behaviour: deleteSpawnedVehicleResponseStolen only ever added the vehicle to
+-- a "delete later" table, and nothing ever read that table back out. This is
+-- the recheck that now does: once the vehicle sits empty again, deletion is
+-- retried. If a player is back in it when the retry runs, the server's own
+-- occupied-check refuses again and the vehicle just goes right back in the
+-- table for the next pass -- the "keep it as long as you're using it" feature
+-- above is unaffected.
+Config.stolenVehicleRecheckSeconds = 60
 
 -- This is the number of seconds that must pass after an officer has died before they are deleted. Officers are tied to their vehicles.
 -- A vehicle will only be deleted if all officers assigned to that vehicle are removed. 

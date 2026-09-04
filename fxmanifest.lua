@@ -45,7 +45,13 @@ client_scripts {
     'client/tactics.lua',
 
     'client/client.lua',
-    'client/ambient.lua'
+    'client/ambient.lua',
+
+    -- Moving violations (wrong-way, no helmet, wheelie, phone use). Loaded
+    -- last: reads the FenixRoads global from roads.lua, ApplyWantedLevel from
+    -- client.lua, and calls exports('fenix-police'):IsWitnessed, added in
+    -- ambient.lua.
+    'client/violations.lua'
 }
 
 server_scripts {
