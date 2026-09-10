@@ -118,6 +118,23 @@ local function buildAllowlist()
     for _, model in ipairs(cfg().extraVehicles or {}) do allowVehicle(model) end
     for _, model in ipairs(cfg().extraPeds or {}) do allowPed(model) end
 
+    -- [Upstate Mafia] Ambient scene models (client/ambient.lua) -- a patrol or
+    -- convoy scene promoted into a real pursuit unit (PromoteAmbientUnit,
+    -- client.lua) registers through the same fenix-police:registerSpawnedUnit
+    -- path as a fresh spawn, which checks this allowlist. Config.Ambient's
+    -- pools happen to already be a subset of Config.vehiclesByRegion's today,
+    -- but that's not guaranteed to stay true, and an unlisted model here means
+    -- a promoted unit's later delete/rearm calls get silently refused forever.
+    local ambientCfg = Config.Ambient or {}
+    for _, pool in ipairs({ ambientCfg.vehicles, ambientCfg.vehicleFallback }) do
+        for _, list in pairs(pool or {}) do
+            for _, model in ipairs(list) do allowVehicle(model) end
+        end
+    end
+    for _, list in pairs(ambientCfg.peds or {}) do
+        for _, model in ipairs(list) do allowPed(model) end
+    end
+
     local v, p = 0, 0
     for _ in pairs(allowedVehicles) do v = v + 1 end
     for _ in pairs(allowedPeds) do p = p + 1 end

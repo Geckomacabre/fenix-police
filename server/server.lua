@@ -656,6 +656,27 @@ AddEventHandler('spawnPoliceUnitNet', function(wantedLevel, playerCoords, region
 end)
 
 
+-- [Upstate Mafia] Ambient-to-pursuit promotion. A patrol/convoy scene the
+-- client already spawned (client/ambient.lua) is client-local and
+-- non-networked -- it isn't a pursuit unit, and FenixGuard has no record of
+-- it. When the player goes wanted near one, the client networks it in place
+-- (NetworkRegisterEntityAsNetworked, see PromoteAmbientUnit in client.lua)
+-- rather than deleting it and spawning a fresh unit, then needs the same
+-- ticket handshake spawnPoliceUnitNet above uses so the existing
+-- fenix-police:registerSpawnedUnit handler (server/guard.lua) will actually
+-- claim it. No vehicle/ped selection here -- unlike a fresh spawn, the
+-- entities already exist; this only proves the request came from a real
+-- client under the resource's own rate limit.
+RegisterNetEvent('fenix-police:server:promoteAmbientUnit')
+AddEventHandler('fenix-police:server:promoteAmbientUnit', function()
+    local src = source
+    if not FenixGuard.allow(src, 'spawn') then return end
+
+    local ticket = FenixGuard.issueTicket(src)
+    TriggerClientEvent('fenix-police:promoteAmbientUnitTicket', src, ticket)
+end)
+
+
 
 
 -- HELI UNITS --
@@ -1154,6 +1175,13 @@ AddEventHandler('fenix-police:server:issueTicket', function(level)
             :format(GetPlayerName(src) or src, amount, level, tostring(paid)))
     end
 
+    -- qbx_honor: pulling over for a ticket instead of running or fighting is
+    -- the "complied" half of the shootout-vs-comply distinction (see
+    -- qbx_honor/config.lua's Config.Hooks.complied_with_police). Not a
+    -- dependency -- pcall degrades to no honor change if qbx_honor isn't
+    -- running, same pattern every other resource hooking into it uses.
+    pcall(function() exports.qbx_honor:ApplyHook(src, 'complied_with_police') end)
+
     TriggerClientEvent('fenix-police:client:ticketIssued', src, amount, paid == true)
 end)
 
@@ -1304,5 +1332,23 @@ AddEventHandler('onResourceStop', function(res)
     end
     if Config.isDebug then
         print(('[fenix-police] resource stop: swept %d leftover entit%s'):format(swept, swept == 1 and 'y' or 'ies'))
+    end
+end)
+
+-- Field revive: the "aftermath" system (client.lua) can pick a downed
+-- player back up on its own after a chase, without EMS ever showing up.
+-- Server-side only because qbx_medical:Revive is a server export, not
+-- something the client can trigger on itself -- see client.lua's own
+-- fieldRevive TriggerServerEvent for the fuller story (this used to be a
+-- bare 'wasabi_ambulance:revive' client event before the wasabi_ambulance ->
+-- qbx_medical migration, 2026-09-09).
+RegisterServerEvent('fenix-police:server:fieldRevive')
+AddEventHandler('fenix-police:server:fieldRevive', function()
+    local src = source
+    local ok, err = pcall(function()
+        exports.qbx_medical:Revive(src)
+    end)
+    if not ok and Config.isDebug then
+        print(('[fenix-police] field revive export failed for %s: %s'):format(src, tostring(err)))
     end
 end)

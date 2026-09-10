@@ -501,13 +501,22 @@ CreateThread(function()
             -- side street drives around a block and steps over a strip.
             if speed < (c.minSpeed or 12.0) then goto continue end
 
+            -- A pursuit that's been running a while unlocks road tactics even
+            -- below roadblockFromLevel/spikeFromLevel -- see the comment on
+            -- durationFallbackMs above. Never below durationFallbackMinLevel
+            -- regardless of how long it's run.
+            local elapsedMs = FenixPursuit.pursuitElapsedMs and FenixPursuit.pursuitElapsedMs() or 0
+            local durationUnlocked = (c.durationFallbackMs or 0) > 0
+                and wanted >= (c.durationFallbackMinLevel or 2)
+                and elapsedMs >= c.durationFallbackMs
+
             if #placements < (c.maxConcurrent or 2) then
-                if wanted >= (c.roadblockFromLevel or 3)
+                if (wanted >= (c.roadblockFromLevel or 3) or durationUnlocked)
                     and (now - lastRoadblock) > ((c.roadblockCooldown or 45) * 1000)
                     and math.random() < (c.roadblockChance or 0.5) then
                     if buildRoadblock() then lastRoadblock = now end
 
-                elseif wanted >= (c.spikeFromLevel or 3)
+                elseif (wanted >= (c.spikeFromLevel or 3) or durationUnlocked)
                     and (now - lastSpikes) > ((c.spikeCooldown or 35) * 1000)
                     and math.random() < (c.spikeChance or 0.5) then
                     if layStrips() then lastSpikes = now end

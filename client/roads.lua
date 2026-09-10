@@ -163,13 +163,46 @@ end
 -- to vehicle pathfinding, for police and ambient traffic alike — which is the
 -- behaviour you want, because airside has no civilian traffic either.
 --
--- The call has to be repeated: the engine restores node state when a region
--- streams back in, so one call at resource start survives only until the player
--- leaves and comes back.
+-- Two things about the call matter, and both used to be wrong here.
+--
+-- FIRST, it is made ONCE and then left alone. An earlier version re-issued it
+-- every 5 seconds on the assumption that node state gets restored when a region
+-- streams back in -- it doesn't. The engine remembers the change and re-applies
+-- it on stream-in by itself.
+--
+-- SECOND, the last argument is whether the change is broadcast to the session.
+-- A broadcast change takes a slot in CNetworkRoadNodeWorldStateData, a pool of
+-- TWENTY for the entire session shared with every other script that touches
+-- road nodes. Combined with the timer above, two
+-- zones exhausted it in under a minute and the client then spammed
+-- "CNetworkRoadNodeWorldStateData Pool Full, Size == 20" for the rest of the
+-- session, with everything else locked out behind it. Slots also do not appear
+-- to come back cleanly across a resource restart, so even one call per start
+-- adds up for anyone iterating on this file.
+--
+-- Local is the right answer regardless: every player runs this client script,
+-- so every player suppresses the same zones for themselves, and pathfinding is
+-- decided by whichever client owns the vehicle. Config.Roads.
+-- networkRoadSuppression exists to put it back if that assumption ever breaks.
+--
+-- 2026-09-06: an earlier version of this note also named
+-- BigDaddy-TrafficControl as a competitor for the pool. That was wrong --
+-- scanning its DLLs for the SET_ROADS_* native hashes turns up nothing, and it
+-- works via ADD_ROAD_NODE_SPEED_ZONE, which is a separate mechanism. A sweep of
+-- every .lua plus 656 binaries under resources/ found only this file and
+-- bob74_ipl's North Yankton toggle, and both are now local, so nothing on this
+-- server consumes the pool at all.
 
 local roadsSuppressed = false
 
-local function applyRoadSuppression(enabled)
+--- The natives' final argument: broadcast the change to the session, or keep it
+--- on this client. See the note above -- this is the pool question.
+local function networked()
+    return cfg().networkRoadSuppression == true
+end
+
+---@param fn fun(minX: number, minY: number, zMin: number, maxX: number, maxY: number, zMax: number, zone: table)
+local function forEachSuppressedZone(fn)
     local zones = cfg().exclusionZones
     if type(zones) ~= 'table' then return end
 
@@ -177,18 +210,41 @@ local function applyRoadSuppression(enabled)
         if zone.enabled ~= false and zone.disableAiRoads ~= false then
             local minX, minY, maxX, maxY = zoneBounds(zone)
             if minX then
-                local zMin = zone.zMin or -200.0
-                local zMax = zone.zMax or 500.0
-                -- Args 7/8: the node state to apply, and an "unknown" that every
-                -- known caller passes as true.
-                SetRoadsInArea(minX, minY, zMin, maxX, maxY, zMax, enabled, true)
-                if zone.disablePedPaths then
-                    SetPedPathsInArea(minX, minY, zMin, maxX, maxY, zMax, enabled, true)
-                end
+                fn(minX, minY, zone.zMin or -200.0, maxX, maxY, zone.zMax or 500.0, zone)
             end
         end
     end
-    roadsSuppressed = not enabled
+end
+
+local function suppressRoads()
+    if roadsSuppressed then return end
+
+    local network = networked()
+
+    forEachSuppressedZone(function(minX, minY, zMin, maxX, maxY, zMax, zone)
+        -- Arg 7 is the node state to apply; arg 8 is the broadcast flag.
+        SetRoadsInArea(minX, minY, zMin, maxX, maxY, zMax, false, network)
+        if zone.disablePedPaths then
+            SetPedPathsInArea(minX, minY, zMin, maxX, maxY, zMax, false, network)
+        end
+    end)
+
+    roadsSuppressed = true
+end
+
+local function restoreRoads()
+    if not roadsSuppressed then return end
+
+    local network = networked()
+
+    forEachSuppressedZone(function(minX, minY, zMin, maxX, maxY, zMax, zone)
+        SetRoadsBackToOriginal(minX, minY, zMin, maxX, maxY, zMax, network)
+        if zone.disablePedPaths then
+            SetPedPathsBackToOriginal(minX, minY, zMin, maxX, maxY, zMax, network)
+        end
+    end)
+
+    roadsSuppressed = false
 end
 
 CreateThread(function()
@@ -196,10 +252,10 @@ CreateThread(function()
         if cfg().disableAiRoads == false then
             -- Switched off at runtime after having been applied: hand the nodes
             -- back rather than leaving the map permanently altered.
-            if roadsSuppressed then applyRoadSuppression(true) end
+            restoreRoads()
             Wait(5000)
-        elseif anyZoneNear(GetEntityCoords(PlayerPedId()), cfg().suppressionRadius or 2000.0) then
-            applyRoadSuppression(false)
+        elseif not roadsSuppressed and anyZoneNear(GetEntityCoords(PlayerPedId()), cfg().suppressionRadius or 2000.0) then
+            suppressRoads()
             Wait(5000)
         else
             Wait(15000)
@@ -209,7 +265,7 @@ end)
 
 AddEventHandler('onResourceStop', function(res)
     if res ~= GetCurrentResourceName() then return end
-    if roadsSuppressed then applyRoadSuppression(true) end
+    restoreRoads()
 end)
 
 -------------------------------------------------------------------------------

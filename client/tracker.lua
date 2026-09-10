@@ -58,7 +58,19 @@ CreateThread(buildTrackedModels)
 function FenixTracker.hasTracker(vehicle)
     if not cfg().enabled then return false end
     if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return false end
-    if not trackedModels[GetEntityModel(vehicle)] then return false end
+
+    -- [Upstate Mafia] This runs for every vehicle in range, every tick --
+    -- ox_target's global vehicle scan below calls it as a canInteract check.
+    -- DoesEntityExist above isn't a hard guarantee: a vehicle can pass it in
+    -- the single frame it's actually being torn down (the game's own traffic
+    -- despawn, or a pursuit cleanup sweep elsewhere in this resource) and
+    -- still crash a native reading its streamed data. Confirmed live --
+    -- GetEntityModel threw inside gta-streaming-five.dll here. pcall doesn't
+    -- stop every possible hard crash, but it does catch the exception
+    -- FXServer's own native-call wrapper raises for this one, instead of that
+    -- exception propagating up through ox_target's tick.
+    local ok, model = pcall(GetEntityModel, vehicle)
+    if not ok or not model or not trackedModels[model] then return false end
 
     return Entity(vehicle).state.trackerRemoved ~= true
 end
@@ -145,6 +157,12 @@ CreateThread(function()
             icon = 'fas fa-satellite-dish',
             label = 'Remove GPS Tracker',
             distance = 2.0,
+            -- Ambient/global ox_target audit (2026-09-07): addGlobalVehicle
+            -- fires on every tracked-fleet vehicle on the map, so this showed
+            -- as an always-on prompt just walking past a parked cruiser.
+            -- thirdEyeOnly requires holding the third-eye keybind (LMENU)
+            -- before it shows at all -- see ox_target/client/main.lua.
+            thirdEyeOnly = true,
             canInteract = function(entity) return FenixTracker.hasTracker(entity) end,
             onSelect = function(data) removeTracker(data.entity) end,
         },
