@@ -146,6 +146,16 @@ local isPullingOver   = false
 local isBeingTicketed = false
 local ticketWrapUp    = false
 
+-- [Upstate Mafia] Global K9 trigger state. Separate from vehicleData.k9 (the
+-- per-unit dog handleK9Backup can still release from an officer already
+-- foot-chasing) -- this one isn't tied to any unit having actually caught up
+-- yet, so a dog can show up the moment the wanted level rises rather than
+-- waiting on a car to arrive and close the exit distance. See
+-- releaseGlobalK9/spawnGlobalK9/watchForGlobalK9Trigger further down.
+local activeGlobalK9 = nil
+local globalK9CooldownUntil = 0
+local lastWantedLevelForK9 = 0
+
 
 -- [Upstate Mafia patch] Forward declaration. isPlayerPoliceOfficer is defined
 -- ~2250 lines below as a file-scope local, so every reference above its
@@ -239,24 +249,10 @@ end)
 
 -- SPAWNING --
 
--- Get player zone for determining spawn tables
-local function getPlayerZoneCode()
-    local playerPed = PlayerPedId()
-    local playerCoords = GetEntityCoords(playerPed)
-
-    -- Get the zone name from the player's coordinates
-    local zoneName = GetNameOfZone(playerCoords.x, playerCoords.y, playerCoords.z)
-    
-    return zoneName
-end
-
-
-
-
--- Function to get the formatted zone key
-local function getZoneKey(zoneName)
-    return Config.ZoneEnum[zoneName] or zoneName  -- Return the mapped key or the original zoneName if not found
-end
+-- Zone/region lookup now lives in client/jurisdiction.lua
+-- (FenixJurisdiction.currentRegion()), which does what getPlayerZoneCode() +
+-- getZoneKey() used to do inline here, plus crossing detection for
+-- jurisdiction handoff. See spawnPoliceUnitNet below for the call site.
 
 
 
@@ -391,13 +387,29 @@ function MonitorVehicle(vehNetID)
         local playerPed = PlayerPedId()
 
         while GetPlayerWantedLevel(PlayerId()) > 0 and stuckAttempts[vehNetID] ~= 999 do
-            local vehicle = NetToVeh(vehNetID) 
-            
-            -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
+            -- Stop monitoring a unit that no longer exists, rather than
+            -- re-probing it forever.
+            --
+            -- NetToVeh on a network ID whose entity is gone makes the engine
+            -- log "Warning: [entity] GetNetworkObject: no object by ID N" on
+            -- EVERY call. Once a police vehicle was destroyed this loop kept
+            -- running for the rest of the pursuit, burning 1 + controlWaitCount
+            -- (= 7) of those warnings every 5 seconds, per dead unit, forever.
+            -- Three destroyed units produced ~280 warnings in a single session.
+            -- NetworkDoesEntityExistWithNetworkId is the existence test that
+            -- does NOT warn, so it is safe to ask first.
+            if not NetworkDoesEntityExistWithNetworkId(vehNetID) then return end
+
+            local vehicle = NetToVeh(vehNetID)
+
+            -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn.
             local waitCount = 0
             while (not vehicle or vehicle == 0) and waitCount < Config.controlWaitCount do
-                vehicle = NetToVeh(vehNetID)
                 Wait(Config.netWaitTime)
+                -- It can also go away mid-retry -- bail instead of spending the
+                -- rest of the budget warning about it.
+                if not NetworkDoesEntityExistWithNetworkId(vehNetID) then return end
+                vehicle = NetToVeh(vehNetID)
                 waitCount = waitCount + 1
             end
 
@@ -662,6 +674,14 @@ AddEventHandler('spawnPoliceHeliNetResponse', function(vehNetID, officers)
 
         spawnedHeliUnits[vehNetID] = {vehicle = vehicle, officers = {}, officerTasks = {} }
 
+        -- Nightsun on for the life of the pursuit. AI-controlled (2nd arg true)
+        -- so the pilot points it at whatever the crew is currently tasked
+        -- against on its own -- the live target while chasing, the search
+        -- point while circling one (see handleHeliChaseBehavior below).
+        if DoesVehicleHaveSearchlight(vehicle) then
+            SetVehicleSearchlight(vehicle, true, true)
+        end
+
         for i, pedNetID in ipairs(officers) do 
             local officer = NetToPed(pedNetID)
 
@@ -814,19 +834,21 @@ end)
 
 -- This function will tell the server to spawn a police unit, and the server will pass back the Network ID of the vehicle + officers spawned so the client can handle them. 
 local function spawnPoliceUnitNet(wantedLevel)
-    print(('[FENIX-SPAWN] spawnPoliceUnitNet called, wantedLevel=%d'):format(wantedLevel))
+    if Config.isDebug then
+        print(('[FENIX-SPAWN] spawnPoliceUnitNet called, wantedLevel=%d'):format(wantedLevel))
+    end
     local playerPed = PlayerPedId()
     local playerCoords = GetEntityCoords(playerPed)
-    local zoneCode = getPlayerZoneCode() -- Zone for determining spawnlists
-    local zone = Config.zones[zoneCode]
-    local regionCode = nil
-    if zone then
-        regionCode = getZoneKey(zone.location)
-    else
-        print(('[FENIX-SPAWN] WARNING: no zone for code=%s, defaulting losSantos'):format(tostring(zoneCode)))
-        regionCode = 'losSantos'
+    -- Region for spawnlist selection AND agency ownership -- see
+    -- client/jurisdiction.lua. FenixJurisdiction.currentRegion() walks the
+    -- exact same Config.zones -> Config.ZoneEnum chain getPlayerZoneCode/
+    -- getZoneKey used to do inline here, but checks Config.Jurisdiction.zones
+    -- first for servers that want a boundary finer than GTA's own named
+    -- zones, and is what maintainPoliceUnits() watches for a crossing.
+    local regionCode = FenixJurisdiction and FenixJurisdiction.currentRegion() or 'losSantos'
+    if Config.isDebug then
+        print(('[FENIX-SPAWN] region=%s'):format(tostring(regionCode)))
     end
-    print(('[FENIX-SPAWN] zone=%s region=%s'):format(tostring(zoneCode), tostring(regionCode)))
 
     -- Get a safe spawn point
     local spawnPoint, spawnHeading = getSafeSpawnPoint(playerCoords, Config.minPoliceSpawnDistance, Config.maxPoliceSpawnDistance, GetEntityForwardVector(playerPed))
@@ -841,7 +863,9 @@ local function spawnPoliceUnitNet(wantedLevel)
         if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
         return
     end
-    print(('[FENIX-SPAWN] sending server event, spawnPoint=%.1f,%.1f,%.1f'):format(spawnPoint.x, spawnPoint.y, spawnPoint.z))
+    if Config.isDebug then
+        print(('[FENIX-SPAWN] sending server event, spawnPoint=%.1f,%.1f,%.1f'):format(spawnPoint.x, spawnPoint.y, spawnPoint.z))
+    end
 
     TriggerServerEvent('spawnPoliceUnitNet', wantedLevel, playerCoords, regionCode, spawnPoint, spawnHeading)
 
@@ -1138,7 +1162,9 @@ AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedM
 
     local driver = GetPedInVehicleSeat(vehicle, -1)
     if not DoesEntityExist(driver) or driver == 0 then
-        print(('[FENIX-SPAWN] deleting driverless client police vehicle %s'):format(tostring(vehicleInfo.model)))
+        if Config.isDebug then
+            print(('[FENIX-SPAWN] deleting driverless client police vehicle %s'):format(tostring(vehicleInfo.model)))
+        end
         for _, pedNetID in ipairs(officers) do
             local ped = NetToPed(pedNetID)
             if DoesEntityExist(ped) then DeleteEntity(ped) end
@@ -1187,10 +1213,167 @@ AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedM
 end)
 
 
--- This handles the response from the server after a vehicle and officers are spawned, so they can be tasked and otherwise handled by the client. 
+-- ============================================================================
+-- AMBIENT -> PURSUIT PROMOTION (Upstate Mafia)
+--
+-- Called from client/ambient.lua when the player goes wanted near a patrol/
+-- convoy scene it already spawned. Ambient scene entities are client-local
+-- and non-networked (see ambient.lua's createPed/createVehicle) -- purely
+-- decorative, not real pursuit units -- so the old behaviour, on any wanted
+-- level, was to delete every one of them near the player and let the pursuit
+-- system spawn brand new networked units to replace them. That reads as "the
+-- cops patrolling around just vanished and were swapped for new ones",
+-- because that is exactly what happened.
+--
+-- This networks the existing vehicle and officer(s) in place
+-- (NetworkRegisterEntityAsNetworked) and folds them into spawnedVehicles as a
+-- real pursuit unit instead, so it's the same car and the same cop that turns
+-- and joins the chase. Registers through the same ticket handshake and
+-- fenix-police:registerSpawnedUnit path a fresh spawn uses (see
+-- server/server.lua's promoteAmbientUnit handler and server/guard.lua),
+-- rather than skipping FenixGuard's ownership bookkeeping.
+-- ============================================================================
+
+-- Single-slot ticket handshake: ambient.lua only ever promotes one scene at a
+-- time (see the promotion loop in ambient.lua's wanted-onset sweep), so there
+-- is never a second PromoteAmbientUnit call in flight to race this against.
+local promotionTicketResult = nil
+local awaitingPromotionTicket = false
+
+RegisterNetEvent('fenix-police:promoteAmbientUnitTicket')
+AddEventHandler('fenix-police:promoteAmbientUnitTicket', function(ticket)
+    if awaitingPromotionTicket then promotionTicketResult = ticket end
+end)
+
+--- Networks an entity that was created locally with isNetwork=false (every
+--- ambient scene entity). Returns true once the transfer has actually landed.
+local function networkizeEntity(entity)
+    if not DoesEntityExist(entity) then return false end
+    if not NetworkGetEntityIsNetworked(entity) then
+        NetworkRegisterEntityAsNetworked(entity)
+        local waited = 0
+        while not NetworkGetEntityIsNetworked(entity) and waited < 500 do
+            Wait(10)
+            waited = waited + 10
+        end
+        if not NetworkGetEntityIsNetworked(entity) then return false end
+    end
+    SetEntityAsMissionEntity(entity, true, true)
+    return true
+end
+
+--- Promotes an already-spawned ambient patrol/convoy scene into a real
+--- pursuit unit. `vehicle` and `driverPed` are required; `passengerPeds` is an
+--- optional list of any other officers riding along.
+---@return boolean success -- false leaves the scene untouched; the caller
+--- (ambient.lua) is expected to fall back to its normal despawn on failure.
+function PromoteAmbientUnit(vehicle, driverPed, passengerPeds, loadoutName)
+    if not DoesEntityExist(vehicle) or not DoesEntityExist(driverPed) then return false end
+    if GetPedInVehicleSeat(vehicle, -1) ~= driverPed then return false end
+    if not networkizeEntity(vehicle) or not networkizeEntity(driverPed) then return false end
+
+    local vehNetID = VehToNet(vehicle)
+    NetworkSetNetworkIdDynamic(vehNetID, false)
+    SetNetworkIdCanMigrate(vehNetID, false)
+    SetNetworkIdExistsOnAllMachines(vehNetID, true)
+
+    local officers, officerPeds = {}, {}
+    local driverNetID = PedToNet(driverPed)
+    NetworkSetNetworkIdDynamic(driverNetID, false)
+    SetNetworkIdCanMigrate(driverNetID, false)
+    SetNetworkIdExistsOnAllMachines(driverNetID, true)
+    officers[1] = driverNetID
+    officerPeds[driverNetID] = driverPed
+
+    for _, ped in ipairs(passengerPeds or {}) do
+        if DoesEntityExist(ped) and networkizeEntity(ped) then
+            local pedNetID = PedToNet(ped)
+            NetworkSetNetworkIdDynamic(pedNetID, false)
+            SetNetworkIdCanMigrate(pedNetID, false)
+            SetNetworkIdExistsOnAllMachines(pedNetID, true)
+            officers[#officers + 1] = pedNetID
+            officerPeds[pedNetID] = ped
+        end
+    end
+
+    promotionTicketResult = nil
+    awaitingPromotionTicket = true
+    TriggerServerEvent('fenix-police:server:promoteAmbientUnit')
+    local waited = 0
+    while promotionTicketResult == nil and waited < 5000 do
+        Wait(10)
+        waited = waited + 10
+    end
+    awaitingPromotionTicket = false
+    local ticket = promotionTicketResult
+    promotionTicketResult = nil
+    if not ticket then return false end
+
+    TriggerServerEvent('fenix-police:registerSpawnedUnit', ticket, vehNetID, officers)
+
+    local playerPed = PlayerPedId()
+    local playerCoords = GetEntityCoords(playerPed)
+    local wantedLevel = GetPlayerWantedLevel(PlayerId())
+    local engageFlags = {}
+    loadoutName = loadoutName or 'patrol'
+
+    spawnedVehicles[vehNetID] = {
+        vehicle = vehicle,
+        officers = {},
+        officerTasks = {},
+        officerEngage = engageFlags,
+        clientOwned = true,
+        loadout = loadoutName,
+    }
+
+    for i, pedNetID in ipairs(officers) do
+        spawnedVehicles[vehNetID].officers[pedNetID] = officerPeds[pedNetID]
+        spawnedVehicles[vehNetID].officerTasks[pedNetID] = i == 1 and 'VehicleChase' or 'Standby'
+    end
+
+    SetVehicleSiren(vehicle, true)
+    SetSirenKeepOn(vehicle, true)
+
+    -- Ambient officers were unarmed/pistol-only set dressing (Config.Ambient.
+    -- weapon) at neutral relationship. Re-arm and re-profile them exactly like
+    -- a freshly spawned unit's crew, same order the spawn handler above uses:
+    -- loadout while still easy to reach, then the wanted-level combat profile.
+    local driverEngages = rollEngage(wantedLevel)
+    engageFlags[driverNetID] = driverEngages
+    giveClientPedLoadout(driverPed, Config.loadouts[loadoutName])
+    applyOfficerCombatProfile(driverPed, wantedLevel, driverEngages)
+    ClearPedTasks(driverPed)
+    TaskVehicleDriveToCoord(driverPed, vehicle, playerCoords.x, playerCoords.y, playerCoords.z, 42.0, 1, GetEntityModel(vehicle), 6, 2.0, true)
+    SetDriveTaskDrivingStyle(driverPed, 6)
+    SetDriverAbility(driverPed, 1.0)
+    SetDriverAggressiveness(driverPed, 1.0)
+
+    for i = 2, #officers do
+        local pedNetID = officers[i]
+        local officer = officerPeds[pedNetID]
+        if DoesEntityExist(officer) then
+            local engages = rollEngage(wantedLevel)
+            engageFlags[pedNetID] = engages
+            giveClientPedLoadout(officer, Config.loadouts[loadoutName])
+            local hostile = applyOfficerCombatProfile(officer, wantedLevel, engages)
+            if hostile then
+                TaskCombatPed(officer, playerPed, 0, 16)
+                spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'CombatPed'
+            end
+        end
+    end
+
+    MonitorVehicle(vehNetID)
+    return true
+end
+
+
+-- This handles the response from the server after a vehicle and officers are spawned, so they can be tasked and otherwise handled by the client.
 RegisterNetEvent('spawnPoliceUnitNetResponse')
 AddEventHandler('spawnPoliceUnitNetResponse', function(vehNetID, officers)
-    print(('[FENIX-SPAWN] got server response: vehNetID=%s officers=%s'):format(tostring(vehNetID), tostring(officers and #officers or 'nil')))
+    if Config.isDebug then
+        print(('[FENIX-SPAWN] got server response: vehNetID=%s officers=%s'):format(tostring(vehNetID), tostring(officers and #officers or 'nil')))
+    end
 
     local playerPed = PlayerPedId()
     local playerCoords = GetEntityCoords(playerPed)
@@ -1264,15 +1447,93 @@ end)
 
 
 
+--- Extra units on top of Config.maxUnitsPerLevel/maxHeliUnitsPerLevel, the
+--- longer the player has been under contact (see FenixPursuit.pursuitElapsedMs
+--- in client/pursuit.lua). This is what makes dispatch keep piling on units
+--- against a suspect who's been spotted and is still running, instead of the
+--- response flatlining at whatever the wanted level called for the moment it
+--- was raised. See Config.Reinforcement.
+local function reinforcementBonus(kind)
+    local rc = Config.Reinforcement
+    if not rc or rc.enabled == false then return 0 end
+    if not FenixPursuit or not FenixPursuit.pursuitElapsedMs then return 0 end
+
+    local elapsed = FenixPursuit.pursuitElapsedMs()
+    if elapsed <= 0 then return 0 end
+
+    if kind == 'heli' then
+        local interval = rc.heliIntervalMs or 90000
+        local per = rc.heliUnitsPerInterval or 1
+        local cap = rc.maxBonusHeli or 1
+        return math.min(cap, math.floor(elapsed / interval) * per)
+    end
+
+    local interval = rc.contactIntervalMs or 45000
+    local per = rc.unitsPerInterval or 1
+    local cap = rc.maxBonusUnits or 4
+    return math.min(cap, math.floor(elapsed / interval) * per)
+end
+
+-- Highest ground reinforcement bonus already called in over the radio this
+-- pursuit. Drops back to 0 the moment the bonus itself does (pursuit over, or
+-- contact never made), so the next pursuit announces fresh from its own first
+-- threshold instead of staying silent because "4" was already said once
+-- tonight.
+local lastAnnouncedReinforcement = 0
+
+local function maybeAnnounceReinforcement(groundBonus)
+    if groundBonus <= 0 then
+        lastAnnouncedReinforcement = 0
+        return
+    end
+    if groundBonus > lastAnnouncedReinforcement then
+        lastAnnouncedReinforcement = groundBonus
+        if FenixPursuit and FenixPursuit.announceReinforcement then
+            FenixPursuit.announceReinforcement(groundBonus)
+        end
+    end
+end
+
 -- Function to maintain the desired number of police units
 local function maintainPoliceUnits(wantedLevel)
     local playerPed = PlayerPedId()
     local playerVeh = GetVehiclePedIsIn(playerPed, false)
 
-    local maxUnits = Config.maxUnitsPerLevel[wantedLevel] or 0
+    -- Jurisdiction crossing check -- once per pass, same cadence this
+    -- function already runs at. A non-nil return means units currently on
+    -- scene belong to the region being LEFT; hand them to FenixMorale's
+    -- retreat/regroup machinery exactly like a casualty-driven retreat, just
+    -- with a different reason string for the debug command.
+    if FenixJurisdiction then
+        local fromRegion, toRegion = FenixJurisdiction.checkCrossing(wantedLevel > 0)
+        if fromRegion and FenixMorale then
+            for vehNetID, vehicleData in pairs(spawnedVehicles) do
+                if not FenixMorale.isRetreating(vehNetID) then
+                    local liveOfficers = {}
+                    for pedNetID, _ in pairs(vehicleData.officers or {}) do
+                        local ped = NetToPed(pedNetID)
+                        if ped and ped ~= 0 and DoesEntityExist(ped) then
+                            liveOfficers[#liveOfficers + 1] = { pedNetID = pedNetID, ped = ped,
+                                health = GetEntityHealth(ped), maxHealth = GetEntityMaxHealth(ped) }
+                        end
+                    end
+                    FenixMorale.beginRetreat(vehNetID, vehicleData, liveOfficers, 'jurisdiction')
+                end
+            end
+        end
+    end
+
+    local groundBonus = reinforcementBonus('ground')
+    maybeAnnounceReinforcement(groundBonus)
+
+    local backupGroundBonus = FenixBackup and FenixBackup.bonusUnits('ground') or 0
+    local backupHeliBonus = FenixBackup and FenixBackup.bonusUnits('heli') or 0
+    if FenixBackup then FenixBackup.maybeAnnounce() end
+
+    local maxUnits = (Config.maxUnitsPerLevel[wantedLevel] or 0) + groundBonus + backupGroundBonus
     local currentUnits = 0
 
-    local maxHeliUnits = Config.maxHeliUnitsPerLevel[wantedLevel] or 0
+    local maxHeliUnits = (Config.maxHeliUnitsPerLevel[wantedLevel] or 0) + reinforcementBonus('heli') + backupHeliBonus
     local currentHeliUnits = 0
 
     local maxAirUnits = Config.maxAirUnitsPerLevel[wantedLevel] or 0
@@ -1453,6 +1714,9 @@ end
 -- have to be reachable from the chase loop here.
 local handleSurrenderApproach
 local handleTicketApproach
+local handleFootChase
+local handleK9Backup
+local releaseK9
 
 -- Function to handle police foot chase and vehicle retrieval
 local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
@@ -1469,9 +1733,36 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
 
     -- [Upstate Mafia] Hands up: stop chasing, start arresting. Returning early
     -- leaves every combat and driving task below unassigned for this unit, which
-    -- is what stops officers shooting a surrendering player.
+    -- is what stops officers shooting a surrendering player -- and, if this unit
+    -- had a K9 out, calls it off too. A dog isn't in vehicleData.officers, so
+    -- nothing in handleSurrenderApproach's own arrester search would otherwise
+    -- ever touch it, and it would just keep biting a suspect who's already
+    -- given up.
     if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then
+        if vehicleData.k9 then releaseK9(vehicleData) end
         if handleSurrenderApproach(vehicleData, playerPed, vehNetID) then return end
+    end
+
+    -- [Upstate Mafia] On foot, or gone somewhere a car can't follow: send one
+    -- officer after the player on foot instead of the driver endlessly trying
+    -- (and failing) to path a cruiser through a doorway. See handleFootChase
+    -- for the exit/commit logic; it owns this unit's tick entirely once an
+    -- officer has committed to the chase.
+    if Config.FootChase and Config.FootChase.enabled then
+        if handleFootChase(vehicleData, playerPed, vehNetID, GetPlayerWantedLevel(PlayerId())) then
+            -- [Upstate Mafia] handleK9Backup's per-unit, 25s-delayed release is
+            -- superseded by the global trigger (watchForGlobalK9Trigger,
+            -- further down) -- that one fires the moment the wanted level
+            -- rises while on foot, rather than waiting on this specific unit
+            -- to both catch up AND keep chasing for releaseAfterFootChaseMs.
+            -- Left uncalled rather than deleted in case the "dog belongs to
+            -- the unit that's actually engaged" behaviour is ever preferred
+            -- back over "dog is a reliable, immediate consequence of running".
+            -- if Config.K9 and Config.K9.enabled then
+            --     handleK9Backup(vehicleData, playerPed, vehNetID)
+            -- end
+            return
+        end
     end
 
     local playerCoords = GetEntityCoords(playerPed)
@@ -1491,6 +1782,34 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
         return
     end
 
+    -- Morale / retreat check -- once per UNIT per cycle, not per officer. See
+    -- client/morale.lua: a unit that has taken enough losses or is badly
+    -- enough outnumbered disengages here, and once it has, this whole
+    -- function leaves its officers alone (client/morale.lua's own thread owns
+    -- their tasking) until they regroup and moraleRetreating goes false again.
+    local moraleRetreating = false
+    if FenixMorale then
+        moraleRetreating = FenixMorale.isRetreating(vehNetID)
+        if not moraleRetreating then
+            local liveOfficers = {}
+            for livePedNetID in pairs(vehicleData.officers) do
+                local liveOfficer = NetToPed(livePedNetID)
+                if liveOfficer and liveOfficer ~= 0 and DoesEntityExist(liveOfficer) then
+                    liveOfficers[#liveOfficers + 1] = { pedNetID = livePedNetID, ped = liveOfficer,
+                        health = GetEntityHealth(liveOfficer), maxHealth = GetEntityMaxHealth(liveOfficer) }
+                end
+            end
+
+            if FenixBackup then FenixBackup.reportSuspectArmed(wantedLevel) end
+
+            local shouldRetreat, reason = FenixMorale.assess(vehNetID, vehicleData, liveOfficers, wantedLevel)
+            if shouldRetreat then
+                FenixMorale.beginRetreat(vehNetID, vehicleData, liveOfficers, reason)
+                moraleRetreating = true
+            end
+        end
+    end
+
     for pedNetID, officerData in pairs(vehicleData.officers) do
         local officer = NetToPed(pedNetID)
 
@@ -1499,6 +1818,21 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
             officer = NetToPed(pedNetID)
             Wait(Config.netWaitTime)
             waitCount = waitCount + 1
+        end
+
+        -- Reporting still happens for a retreating unit's officers (a
+        -- casualty score should keep reflecting reality), but tasking itself
+        -- is left to client/morale.lua entirely -- re-issuing combat/chase
+        -- tasks here would fight it for control of the same ped.
+        if moraleRetreating then
+            if officer and officer ~= 0 and DoesEntityExist(officer) then
+                if IsPedDeadOrDying(officer, true) then
+                    if FenixBackup then FenixBackup.reportOfficerDown(pedNetID) end
+                elseif FenixBackup then
+                    FenixBackup.reportOfficerHealth(pedNetID, GetEntityHealth(officer))
+                end
+            end
+            goto continueGroundOfficer
         end
 
         if not DoesEntityExist(officer) or officer == 0 then
@@ -1513,6 +1847,17 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
             -- cycle is also how a deleted officer leaves the set -- pursuit.lua
             -- prunes anything that stops being refreshed.
             FenixPursuit.noteObserver(officer, 'ground')
+
+            -- Feed this officer's condition into the event-driven backup
+            -- score (client/backup.lua) before this cycle's tasking -- a
+            -- death or a drop in health here is what lets FenixBackup.
+            -- bonusUnits() call in real reinforcements, distinct from
+            -- Config.Reinforcement's plain sustained-contact clock.
+            if IsPedDeadOrDying(officer, true) then
+                if FenixBackup then FenixBackup.reportOfficerDown(pedNetID) end
+            elseif FenixBackup then
+                FenixBackup.reportOfficerHealth(pedNetID, GetEntityHealth(officer))
+            end
 
             -- Re-apply the wanted-level combat profile every cycle: GTA's combat AI
             -- resets accuracy/attributes on task changes, and the wanted level (or
@@ -1713,13 +2058,16 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                     TriggerServerEvent('deleteSpawnedPed', pedNetID)
                     spawnedVehicles[vehNetID].officers[pedNetID] = nil
                     spawnedVehicles[vehNetID].officerTasks[pedNetID] = nil
+                    if FenixBackup then FenixBackup.clearOfficer(pedNetID) end
                     if not next(spawnedVehicles[vehNetID].officers) then
                         TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
                         spawnedVehicles[vehNetID] = nil
+                        if FenixMorale then FenixMorale.clearUnit(vehNetID) end
                     end
                 end
             end
         end
+        ::continueGroundOfficer::
     end
 end
 
@@ -1781,6 +2129,17 @@ local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerH
             local officerCoords = GetEntityCoords(officer)
             local distance = Vdist(playerCoords.x, playerCoords.y, playerCoords.z, officerCoords.x, officerCoords.y, officerCoords.z)
 
+            -- Feed the event-driven backup score -- see client/backup.lua. A
+            -- heli/plane gunner going down or taking fire is just as real an
+            -- incident as a ground officer's. (No FenixMorale retreat here:
+            -- an aircraft disengaging mid-air is a different, riskier problem
+            -- than a ground unit driving off, and isn't attempted by this pass.)
+            if IsPedDeadOrDying(officer, true) then
+                if FenixBackup then FenixBackup.reportOfficerDown(pedNetID) end
+            elseif FenixBackup then
+                FenixBackup.reportOfficerHealth(pedNetID, GetEntityHealth(officer))
+            end
+
             -- Wanted-level combat profile. Below the hostile threshold the crew
             -- shadow the player with the spotlight instead of shooting.
             checkOfficerProvocation(officer, playerPed)
@@ -1805,11 +2164,36 @@ local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerH
             -- [Upstate Mafia patch] Heli always pursues aggressively — no playerHasShot gate
             if IsPedInAnyVehicle(officer, false) then
                 if GetPedInVehicleSeat(GetVehiclePedIsIn(officer), -1) == officer then
-                    -- Pilot — chase
+                    -- Pilot — chase while there's real contact; circle the last
+                    -- known position while searching instead of flying straight
+                    -- at the player's actual live position regardless of whether
+                    -- anyone can currently see them. Ground units already read
+                    -- FenixPursuit's contact model this way (client/pursuit.lua);
+                    -- the heli used to be the one unit that stayed omniscient.
                     local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
-                    if taskStatus ~= 'HeliChase' then
-                        TaskHeliChase(officer, playerPed, 0, 0, 120)
-                        spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'HeliChase'
+
+                    if FenixPursuit.hasContact() then
+                        if taskStatus ~= 'HeliChase' then
+                            TaskHeliChase(officer, playerPed, 0, 0, 120)
+                            spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'HeliChase'
+                        end
+                    elseif vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) then
+                        local center = FenixPursuit.targetCoords(playerCoords)
+                        -- Only re-issued when the search centre actually changes
+                        -- (a fresh lost-contact point) -- lastKnown holds steady
+                        -- for the whole search otherwise, same as the ground
+                        -- units' sweep target.
+                        local key = ('%.0f:%.0f'):format(center.x, center.y)
+                        if taskStatus ~= 'HeliSearch' or spawnedHeliUnits[vehNetID].searchKey ~= key then
+                            -- Mission type 9 = Circle. Orbits the point instead
+                            -- of beelining to and landing on it, which reads as
+                            -- "searching the area" rather than "already knows
+                            -- exactly where you went".
+                            TaskHeliMission(officer, vehicle, 0, 0, center.x, center.y, center.z,
+                                9, 25.0, 15.0, -1.0, 60, 30, -1.0, 0)
+                            spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'HeliSearch'
+                            spawnedHeliUnits[vehNetID].searchKey = key
+                        end
                     end
                 else
                     -- Crew — shoot only once hostile for this wanted level
@@ -1898,6 +2282,13 @@ local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID, playerHa
         else
             local officerCoords = GetEntityCoords(officer)
             local distance = Vdist(playerCoords.x, playerCoords.y, playerCoords.z, officerCoords.x, officerCoords.y, officerCoords.z)
+
+            -- Feed the event-driven backup score -- see client/backup.lua.
+            if IsPedDeadOrDying(officer, true) then
+                if FenixBackup then FenixBackup.reportOfficerDown(pedNetID) end
+            elseif FenixBackup then
+                FenixBackup.reportOfficerHealth(pedNetID, GetEntityHealth(officer))
+            end
 
             -- Wanted-level combat profile (air units only spawn at 4-5, so this is
             -- mostly an accuracy/rate-of-fire cap rather than a hold-fire gate).
@@ -2489,8 +2880,34 @@ local function deleteNetworkedEntity(entity)
     DeleteEntity(entity)
 end
 
-local function handleEndWantedDelete()
+local function handleEndWantedDelete(force)
     if aftermath.active then return end
+    -- [Upstate Mafia] Don't let a stray/global cleanup (the watchdog below, or
+    -- the server's cleanupAllPolice broadcast reacting to another player's
+    -- wanted status) delete the officer that's mid-approach to arrest you.
+    -- Without this, a brief wanted-level blip while you're surrendering wipes
+    -- the responding unit before it ever reaches arrestDistance -- the cop
+    -- "disappears" and isSurrendering never gets a wanted-level-cleared tick
+    -- to release the control lock, so you're stuck. triggerArrest() passes
+    -- force=true for its own end-of-cinematic cleanup, which must run even
+    -- while isBeingArrested is still true.
+    if not force and isSurrendering then return end
+
+    -- [Upstate Mafia] Every officer is about to be wiped below regardless of
+    -- which unit/task they belonged to, so any outstanding breach shield
+    -- (client.lua's escalation section) goes with them in one pass here
+    -- rather than relying on each unit's own foot-chase cleanup path to have
+    -- caught its own -- ReleaseAllBreachShields is safe to call even when
+    -- nothing is outstanding.
+    ReleaseAllBreachShields()
+
+    -- Everything below is about to be wiped regardless of per-unit state, so
+    -- the event-driven backup score and any in-progress retreat/regroup
+    -- bookkeeping go with it -- the next pursuit starts clean rather than
+    -- inheriting a decaying score or a phantom "unit X is retreating" record
+    -- for a unit that no longer exists.
+    if FenixBackup then FenixBackup.reset() end
+    if FenixMorale then FenixMorale.resetAll() end
 
     -- Collect keys BEFORE iterating so that nilling entries mid-loop (which Lua's
     -- pairs iterator can silently skip) doesn't leave orphan units behind.
@@ -2501,6 +2918,12 @@ local function handleEndWantedDelete()
     for _, vehNetID in ipairs(groundKeys) do
         local vehicleData = spawnedVehicles[vehNetID]
         if vehicleData then
+            -- K9s are client-local (not networked, not server-owned), so this
+            -- is the one entity in the whole sweep that's a plain DeleteEntity
+            -- rather than deleteNetworkedEntity/deleteSpawnedPed -- see
+            -- releaseK9 and Config.K9's header comment.
+            if vehicleData.k9 then releaseK9(vehicleData) end
+
             local pedKeys = {}
             for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
             for _, pedNetID in ipairs(pedKeys) do
@@ -2589,7 +3012,7 @@ end)
 AddEventHandler('onClientResourceStop', function(res)
     if res ~= GetCurrentResourceName() then return end
     aftermath.active = false
-    handleEndWantedDelete()
+    handleEndWantedDelete(true)
 end)
 
 -- ============================================================================
@@ -2797,6 +3220,27 @@ exports('IsPlayerPoliceOfficer', function() return isPlayerPoliceOfficer() end)
 -- SURRENDER & ARREST SYSTEM (Upstate Mafia)   --
 -------------------------------------------------
 
+-- Shared by the BUSTED (triggerArrest, below) and WASTED (near the bottom of
+-- this file) title cards. Draws the bare word in FONT_STYLE_PRICEDOWN (font
+-- id 7 -- GTA's own logo/title font, confirmed against FiveM's font id list)
+-- with no background band -- see triggerArrest's own comment for why a
+-- scaleform (the only thing that could draw a real band) was dropped
+-- entirely: MP_BIG_MESSAGE_FREEMODE's band is baked into its compiled
+-- sprite and nothing in its exposed arguments can hide it, and the actual
+-- reference for this look (a screenshot of vanilla GTA's own WASTED screen)
+-- has no band at all.
+local function drawBigWord(word, r, g, b)
+    SetTextFont(7)
+    SetTextScale(1.35, 1.35)
+    SetTextColour(r, g, b, 255)
+    SetTextCentre(true)
+    SetTextDropShadow()
+    SetTextEdge(2, 0, 0, 0, 160)
+    SetTextEntry('STRING')
+    AddTextComponentString(word)
+    DrawText(0.5, 0.44)
+end
+
 local HANDS_UP_DICT = 'random@mugging3'
 local HANDS_UP_ANIM = 'handsup_standing_base'
 local KNEEL_DICT    = 'random@arrests@busted'
@@ -2876,12 +3320,19 @@ RegisterCommand('surrendertopolice', function()
         -- and doesn't slide out of the pose.
         TaskPlayAnim(playerPed, HANDS_UP_DICT, HANDS_UP_ANIM, 8.0, -8.0, -1, 49, 0, false, false, false)
 
-        -- Hold the pose until arrested, cancelled, or the wanted level clears.
+        -- Hold the pose until arrested or cancelled (H again).
+        --
+        -- [Upstate Mafia] Used to also bail out here the instant
+        -- GetPlayerWantedLevel() read 0 -- but the star decays on its own while
+        -- you stand still surrendering, and that natural decay was cancelling
+        -- the surrender out from under an officer who was already walking over
+        -- to arrest you. Re-pin the level instead: you're still "wanted" until
+        -- triggerArrest() actually clears it (or you cancel manually), same as
+        -- how being pulled over already works.
         while isSurrendering and not isBeingArrested do
             if GetPlayerWantedLevel(PlayerId()) < 1 then
-                isSurrendering = false
-                ClearPedTasks(PlayerPedId())
-                break
+                SetPlayerWantedLevel(PlayerId(), 1, false)
+                SetPlayerWantedLevelNow(PlayerId(), false)
             end
             if not IsEntityPlayingAnim(PlayerPedId(), HANDS_UP_DICT, HANDS_UP_ANIM, 3) then
                 TaskPlayAnim(PlayerPedId(), HANDS_UP_DICT, HANDS_UP_ANIM, 8.0, -8.0, -1, 49, 0, false, false, false)
@@ -2953,6 +3404,27 @@ function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
     local unitDist = #(playerCoords - GetEntityCoords(vehicle))
     local isArrestingUnit = unitDist <= (Config.ArrestSystem.approachDistance or 35.0)
 
+    -- A foot chaser already out of the car also qualifies this unit, even if
+    -- their now-parked cruiser is far behind them. handleFootChase can walk/
+    -- run an officer well past approachDistance from the vehicle while
+    -- chasing on foot (see Config.FootChase.giveUpDistance = 80.0), and the
+    -- moment a player is most likely to surrender is exactly when that
+    -- chaser has caught up to them -- not when their car happens to also be
+    -- close. Without this, surrendering next to a chaser did nothing until
+    -- the parked car itself drifted (or the player walked back) into range.
+    if not isArrestingUnit then
+        for pedNetID in pairs(vehicleData.officers) do
+            local officer = NetToPed(pedNetID)
+            if DoesEntityExist(officer) and officer ~= 0 and not IsPedDeadOrDying(officer, true)
+                and not IsPedInAnyVehicle(officer, false)
+                and #(playerCoords - GetEntityCoords(officer)) <= (Config.ArrestSystem.approachDistance or 35.0)
+            then
+                isArrestingUnit = true
+                break
+            end
+        end
+    end
+
     -- Bring this unit to a stop first. Pulling a ped out of a moving car is what
     -- produced the ragdolling officers that got this feature switched off.
     if isArrestingUnit and GetEntitySpeed(vehicle) > 1.0 then
@@ -3000,13 +3472,652 @@ function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
             tasks[arrester] = 'ApproachArrest'
         end
 
+        if Config.isDebug then
+            print(('[FENIX-ARREST] arrester=%s dist=%.2f speed=%.2f')
+                :format(tostring(arrester), arresterDist, GetEntitySpeed(officer)))
+        end
+
         if arresterDist <= (Config.ArrestSystem.arrestDistance or 2.0) then
             triggerArrest(officer)
         end
+    elseif Config.isDebug then
+        print(('[FENIX-ARREST] unit=%s isArrestingUnit=%s no arrester yet'):format(tostring(vehNetID), tostring(isArrestingUnit)))
     end
 
     return isArrestingUnit
 end
+
+-- ============================================================================
+-- FOOT CHASE (Upstate Mafia)
+--
+-- Until this existed, a unit's driver would just keep trying (and failing) to
+-- path a cruiser at the player once they were on foot, and a player who ran
+-- into any interior lost every unit outright -- a car cannot follow through a
+-- doorway, and nothing here ever told an officer to get out and go in after
+-- them on foot. This is what actually does that, plus an escalation ladder
+-- for players who fight back and a stack-up beat before entering a building.
+-- ============================================================================
+
+-- ---- Escalation -------------------------------------------------------------
+-- How much resistance the player has put up against a foot chase/breach
+-- recently. Global, not per-unit — shooting the officer at your door should
+-- make the next one more careful too, not just that one. Decays back to 0
+-- after a stretch with no further resistance (see breachTier), so it reflects
+-- "how hot is this right now" rather than a permanent record for the session.
+local breachResistance = 0
+local lastBreachResistanceAt = 0
+
+--- Current escalation tier's tuning table (armor / loadout / a wanted level
+--- floor for the NEXT unit spawned / whether a shield is warranted). Never
+--- retroactively reskins an officer already in the field — "reinforcement"
+--- means the next spawn favours the same wantedLevel-5 riot/SWAT pool
+--- Config.vehiclesByRegion already defines, not a second one built here.
+local function breachTier()
+    local esc = Config.FootChase.escalation
+    local tiers = esc and esc.tiers or {}
+    local fallback = tiers[0] or { armor = 25, loadout = 'patrol' }
+    if not esc or esc.enabled == false then return fallback end
+
+    if breachResistance > 0 and GetGameTimer() - lastBreachResistanceAt > (esc.resistanceDecayMs or 90000) then
+        breachResistance = 0
+    end
+
+    local level = breachResistance
+    while level > 0 and not tiers[level] do level = level - 1 end
+    return tiers[level] or fallback
+end
+
+--- Call whenever the player damages an officer who is actively foot-chasing/
+--- breaching. Raises the tier and resets the decay clock.
+local function registerBreachResistance()
+    breachResistance = breachResistance + 1
+    lastBreachResistanceAt = GetGameTimer()
+    if Config.isDebug then
+        print(('[FENIX-FOOTCHASE] resistance escalated to %d'):format(breachResistance))
+    end
+end
+
+--- Folds the current breach tier into the wanted level used to pick WHICH
+--- unit gets spawned next (maintainPoliceUnits' only caller, in the main
+--- loop) — never lower than the player's real wanted level, only ever raised
+--- by an active tier's forceWantedLevel. This is deliberately the ONLY hook:
+--- it reuses spawnPoliceUnitNet's existing wantedLevel-tiered vehicle/ped
+--- selection unchanged rather than growing a parallel spawn path.
+function EffectiveSpawnWantedLevel(wantedLevel)
+    local tier = breachTier()
+    if tier.forceWantedLevel then
+        return math.max(wantedLevel, tier.forceWantedLevel)
+    end
+    return wantedLevel
+end
+
+-- ---- Shields ------------------------------------------------------------
+-- pedNetID -> object handle. Purely decorative — GTA has no vanilla "block
+-- bullets with a held prop" mechanic for AI peds, so this is cover in
+-- appearance only, not in effect. Created client-local/non-networked, the
+-- same precedent client/ambient.lua sets for anything that's just dressing:
+-- another client watching the same officer won't see it.
+--
+-- UNVERIFIED: the attach bone/offset/rotation below is a reasonable guess at
+-- how Rockstar's own FIB/SWAT mission peds carry prop_riot_shield /
+-- prop_ballistic_shield, not something checked against this build in game.
+-- If it clips through the arm or floats, this is the block to retune.
+local breachShields = {}
+
+local function attachBreachShield(officer, pedNetID)
+    if breachShields[pedNetID] then return end
+    local model = GetHashKey(Config.FootChase.shieldObject or 'prop_riot_shield')
+    RequestModel(model)
+    local waited = 0
+    while not HasModelLoaded(model) and waited < 200 do
+        Wait(10)
+        waited = waited + 10
+    end
+    if not HasModelLoaded(model) then return end
+
+    local shield = CreateObject(model, 0.0, 0.0, 0.0, false, false, false)
+    SetModelAsNoLongerNeeded(model)
+    if not DoesEntityExist(shield) then return end
+
+    local boneIndex = GetPedBoneIndex(officer, 0x49D9) -- SKEL_L_Hand
+    AttachEntityToEntity(shield, officer, boneIndex, 0.0, 0.05, 0.0, 0.0, 0.0, 0.0, false, false, false, true, 0, true, 0)
+    SetEntityCollision(shield, false, false)
+
+    breachShields[pedNetID] = shield
+end
+
+local function releaseBreachShield(pedNetID)
+    local shield = breachShields[pedNetID]
+    if shield then
+        if DoesEntityExist(shield) then DeleteEntity(shield) end
+        breachShields[pedNetID] = nil
+    end
+end
+
+--- Called from handleEndWantedDelete's own cleanup sweep (see the call added
+--- there) — a wanted-clear wipes every officer regardless of which unit they
+--- belonged to, so every outstanding shield goes with it in one pass rather
+--- than relying on each unit's own cleanup path to have caught its own.
+function ReleaseAllBreachShields()
+    for pedNetID in pairs(breachShields) do releaseBreachShield(pedNetID) end
+end
+
+--- Re-gears a committing officer to the current tier: armor, loadout weapon,
+--- and a shield prop if the tier calls for one. Run once, at the moment they
+--- commit to the chase — not every cycle, so escalation reflects the tier at
+--- the moment each officer went in, not a rubber-band that changes an
+--- officer's loadout mid-chase because someone else drew fire five seconds
+--- later.
+local function outfitForBreach(officer, pedNetID)
+    local tier = breachTier()
+    SetPedArmour(officer, tier.armor or 25)
+    if tier.loadout and Config.loadouts[tier.loadout] then
+        giveClientPedLoadout(officer, Config.loadouts[tier.loadout])
+    end
+    if tier.shield then
+        attachBreachShield(officer, pedNetID)
+    else
+        releaseBreachShield(pedNetID)
+    end
+end
+
+-- ---- Stack-up staging -----------------------------------------------------
+-- Only used for an interior entry (see handleFootChase below) — pausing
+-- outside on open ground reads as an officer just standing there, not a
+-- deliberate beat. No specific "stacking" animation clip is verified against
+-- this build (see config.lua's own warning about clips that silently no-op
+-- on TaskPlayAnim), so this uses TaskAimGunAtCoord — a documented native,
+-- guaranteed to actually do something — to read as "covering the door"
+-- instead.
+local function advanceStaging(chaser, chaserPedNetID, tasks, vehicleData, playerCoords)
+    local point = vehicleData.stagingPoint
+    if not point then
+        -- Shouldn't happen (set alongside the 'Staging' task below), but fall
+        -- straight through to a normal chase rather than getting stuck.
+        tasks[chaserPedNetID] = nil
+        return
+    end
+
+    local atPoint = #(GetEntityCoords(chaser) - point) <= 2.0
+    if not atPoint then
+        if not vehicleData.stagingMoving then
+            TaskGoToCoordAnyMeans(chaser, point.x, point.y, point.z, 2.0, 0, false, 786603, 0xbf800000)
+            vehicleData.stagingMoving = true
+        end
+        return
+    end
+
+    if vehicleData.stagingMoving then
+        -- Just arrived — face and "cover" the door for the rest of the beat.
+        TaskAimGunAtCoord(chaser, point.x, point.y, point.z, -1, false, false)
+        vehicleData.stagingMoving = false
+    end
+
+    if GetGameTimer() >= (vehicleData.stagingUntil or 0) then
+        ClearPedTasks(chaser)
+        tasks[chaserPedNetID] = nil -- falls through to a normal FootChase assignment below on this same tick
+        vehicleData.stagingPoint = nil
+        vehicleData.stagingUntil = nil
+    end
+end
+
+--- One officer per unit commits to a foot chase (matches handleSurrenderApproach's
+--- "exactly one, not the whole crew" reasoning above -- emptying every seat the
+--- moment the player steps out of a car would gut the rest of the pursuit).
+--- Whoever is closest gets out; everyone else stays seated, so the car is
+--- still a threat if the player gets back in and drives off.
+---@return boolean handled — true if this unit's tick was fully handled here
+function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
+    local vehicle = NetToVeh(vehNetID)
+    if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return false end
+
+    local tasks = vehicleData.officerTasks
+    if not tasks then return false end
+
+    local cfg = Config.FootChase
+
+    -- Already have a chaser committed for this unit?
+    local chaser, chaserPedNetID = nil, nil
+    for pedNetID, task in pairs(tasks) do
+        if task == 'Exiting' or task == 'FootChase' or task == 'FootCombat' or task == 'Staging' then
+            local officer = NetToPed(pedNetID)
+            if DoesEntityExist(officer) and not IsPedDeadOrDying(officer, true) then
+                chaser, chaserPedNetID = officer, pedNetID
+            else
+                tasks[pedNetID] = nil -- chaser died/despawned, free the slot up
+                releaseBreachShield(pedNetID)
+            end
+            break
+        end
+    end
+
+    local playerCoords = GetEntityCoords(playerPed)
+
+    if not chaser then
+        -- Nothing committed yet — decide whether this unit should send one.
+        if IsPedInAnyVehicle(playerPed, false) then return false end
+
+        local vehicleCoords = GetEntityCoords(vehicle)
+        local dist = #(playerCoords - vehicleCoords)
+        local inInterior = GetInteriorFromEntity(playerPed) ~= 0
+
+        -- A car can't follow through a doorway at all, so an interior gets a
+        -- more generous radius than "close enough to bother getting out on
+        -- open ground" — the whole point of chasing a suspect who just ran
+        -- inside is that the alternative is losing them outright.
+        local triggerRange = inInterior and (cfg.interiorExitDistance or 40.0) or (cfg.exitDistance or 20.0)
+        if dist > triggerRange then return false end
+
+        -- Whoever can actually reach the player fastest, not always the
+        -- driver — reads as "the nearest cop gets out", not "the driver
+        -- always does".
+        local best, bestDist, bestNetID = nil, 9999.0, nil
+        for pedNetID in pairs(vehicleData.officers) do
+            local officer = NetToPed(pedNetID)
+            if DoesEntityExist(officer) and not IsPedDeadOrDying(officer, true) and IsPedInAnyVehicle(officer, false) then
+                local d = #(GetEntityCoords(officer) - playerCoords)
+                if d < bestDist then best, bestDist, bestNetID = officer, d, pedNetID end
+            end
+        end
+        if not best then return false end
+
+        -- First officer this unit has ever sent after the player on foot --
+        -- read by handleK9Backup below to decide when a chase has been
+        -- running long enough to call a dog in. Only set once; a second
+        -- exit later this same pursuit (previous chaser lost/died) doesn't
+        -- restart the clock.
+        vehicleData.footChaseStartedAt = vehicleData.footChaseStartedAt or GetGameTimer()
+
+        if not NetworkHasControlOfEntity(best) then NetworkRequestControlOfEntity(best) end
+        TaskLeaveVehicle(best, vehicle, 0)
+        outfitForBreach(best, bestNetID)
+
+        -- Interior entries get the stack-up beat; open ground goes straight
+        -- to the chase. Either way this is just "left the vehicle, nothing
+        -- assigned yet" -- 'FootChase' is NOT set here even for the open-
+        -- ground case, because the actual TaskGoToEntity below only fires
+        -- when tasks[chaserPedNetID] ~= 'FootChase'. Marking it 'FootChase'
+        -- immediately used to make that check pass on the very first tick
+        -- the officer was ever seen as "already chasing", so the chase task
+        -- was never actually issued and the officer just stood next to the
+        -- car once TaskLeaveVehicle finished.
+        if inInterior and cfg.staging and cfg.staging.enabled ~= false then
+            tasks[bestNetID] = 'Staging'
+            vehicleData.stagingPoint = playerCoords
+            vehicleData.stagingUntil = GetGameTimer() + (cfg.staging.durationMs or 2500)
+            vehicleData.stagingMoving = false
+            vehicleData.stagedForInterior = GetInteriorFromEntity(playerPed)
+        else
+            tasks[bestNetID] = 'Exiting'
+        end
+        return true
+    end
+
+    -- Chaser committed. Bail out of the whole pursuit for this officer if
+    -- they've fallen hopelessly behind (player got back in a car and drove
+    -- off) — chasing a vehicle on foot forever just leaves a straggling ped.
+    local dist = #(GetEntityCoords(chaser) - playerCoords)
+    if dist > (cfg.giveUpDistance or 80.0) then
+        ClearPedTasks(chaser)
+        releaseBreachShield(chaserPedNetID)
+        TriggerServerEvent('deleteSpawnedPed', chaserPedNetID)
+        vehicleData.officers[chaserPedNetID] = nil
+        tasks[chaserPedNetID] = nil
+        if not next(vehicleData.officers) then
+            TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
+            spawnedVehicles[vehNetID] = nil
+        end
+        return true
+    end
+
+    if IsPedInAnyVehicle(chaser, false) then
+        -- Still finishing the TaskLeaveVehicle animation.
+        return true
+    end
+
+    if not NetworkHasControlOfEntity(chaser) then NetworkRequestControlOfEntity(chaser) end
+
+    -- Resistance check, before anything else touches this officer's task this
+    -- cycle — being shot mid-stage should still count even though staging can
+    -- return early below, before checkOfficerProvocation's own damage check
+    -- further down would otherwise get a turn. Self-contained on purpose: it
+    -- clears the damage flag and calls provokePolice() itself rather than
+    -- relying on checkOfficerProvocation to run afterward, since a staging
+    -- early-return means it might not this cycle. Left unconsumed, the flag
+    -- would still read true next tick and double-count the same hit.
+    if HasEntityBeenDamagedByEntity(chaser, playerPed, true) then
+        registerBreachResistance()
+        provokePolice()
+        ClearEntityLastDamageEntity(chaser)
+    end
+
+    -- [Upstate Mafia] Reactive staging: the initial commit above only stages
+    -- when the player is ALREADY inside the instant an officer gets out --
+    -- the far more common case is they're still outside at that moment (mid
+    -- chase across open ground) and only duck into a building afterward.
+    -- Without this, that chaser would just walk straight in with no stack-up
+    -- beat at all, which reads exactly like "no cinematic happened".
+    -- stagedForInterior guards against re-triggering every tick once already
+    -- staged for THIS interior (or once the officer has actually caught up
+    -- and is inside it too).
+    if cfg.staging and cfg.staging.enabled ~= false
+        and tasks[chaserPedNetID] ~= 'Staging'
+        and GetInteriorFromEntity(playerPed) ~= 0
+        and GetInteriorFromEntity(playerPed) ~= vehicleData.stagedForInterior
+        and GetInteriorFromEntity(chaser) ~= GetInteriorFromEntity(playerPed)
+    then
+        tasks[chaserPedNetID] = 'Staging'
+        vehicleData.stagingPoint = playerCoords
+        vehicleData.stagingUntil = GetGameTimer() + (cfg.staging.durationMs or 2500)
+        vehicleData.stagingMoving = false
+        vehicleData.stagedForInterior = GetInteriorFromEntity(playerPed)
+    end
+
+    if tasks[chaserPedNetID] == 'Staging' then
+        advanceStaging(chaser, chaserPedNetID, tasks, vehicleData, playerCoords)
+        if tasks[chaserPedNetID] == 'Staging' then return true end
+        -- Staging just ended (advanceStaging cleared the task) — fall through
+        -- to the normal chase assignment below on this same tick instead of
+        -- waiting a full cycle to notice.
+    end
+
+    checkOfficerProvocation(chaser, playerPed)
+    vehicleData.officerEngage = vehicleData.officerEngage or {}
+    if vehicleData.officerEngage[chaserPedNetID] == nil then
+        vehicleData.officerEngage[chaserPedNetID] = rollEngage(wantedLevel)
+    end
+    local hostile = applyOfficerCombatProfile(chaser, wantedLevel, vehicleData.officerEngage[chaserPedNetID])
+
+    if hostile and dist <= (cfg.combatRange or 20.0) and FenixPursuit.hasContact() then
+        if tasks[chaserPedNetID] ~= 'FootCombat' then
+            TaskCombatPed(chaser, playerPed, 0, 16)
+            tasks[chaserPedNetID] = 'FootCombat'
+        end
+    else
+        -- TaskGoToEntity tracks the live entity on its own once issued, same
+        -- as TaskVehicleChase above — only (re-)issued on an actual state
+        -- change, not every cycle.
+        if tasks[chaserPedNetID] ~= 'FootChase' then
+            TaskGoToEntity(chaser, playerPed, -1, 1.0, 3.0, 1073741824, 0)
+            tasks[chaserPedNetID] = 'FootChase'
+        end
+    end
+
+    return true
+end
+
+-- ============================================================================
+-- K9 BACKUP (Upstate Mafia)
+--
+-- Released from a unit already committed to a foot chase once that chase has
+-- run long enough (Config.K9.releaseAfterFootChaseMs) -- a dog is the answer
+-- to "the player can just keep outrunning a jogging officer forever", which
+-- Config.FootChase.giveUpDistance otherwise has no real counter to. See
+-- Config.K9's own header comment for why this needs no bespoke bite/arrest
+-- logic: TASK_COMBAT_PED on an animal ped is already the melee attack, and a
+-- suspect it brings down falls straight into the existing Aftermath system.
+--
+-- Client-local/non-networked, the same precedent client/tactics.lua's
+-- roadblock and spike-strip peds already set for AI helpers that don't need
+-- to survive this client disconnecting.
+-- ============================================================================
+
+--- Deletes this unit's dog (if any) and starts its release cooldown. Safe to
+--- call with no dog out. Cooldown is set even when releasing for a reason
+--- that isn't "the dog died" (surrender, arrest, pursuit ending) -- a fresh
+--- pursuit against the same unit shouldn't be able to call in a second dog
+--- within seconds of the last one being pulled off.
+function releaseK9(vehicleData)
+    local k9 = vehicleData.k9
+    if not k9 then return end
+
+    -- No network control dance needed -- unlike every other officer in this
+    -- file, the dog was created local-only (CreatePed's isNetwork=false), so
+    -- this client always owns it outright.
+    if k9.ped and DoesEntityExist(k9.ped) then
+        DeleteEntity(k9.ped)
+    end
+
+    vehicleData.k9 = nil
+    vehicleData.k9CooldownUntil = GetGameTimer() + (Config.K9.cooldownMs or 60000)
+end
+
+--- Creates the dog behind the player and sets it on the target. Assigns
+--- straight into vehicleData.k9 -- callers don't get the ped handle back,
+--- they just check vehicleData.k9 on the next tick same as every other
+--- officer-task field in this file.
+local function spawnK9(vehicleData, playerPed)
+    local kc = Config.K9
+    local hash = GetHashKey(kc.dogModel or 'a_c_shepherd')
+    if not requestModelLoaded(hash) then return end
+
+    local playerCoords = GetEntityCoords(playerPed)
+    local heading = GetEntityHeading(playerPed)
+    local rad = math.rad(heading)
+    -- Forward vector of the player's current heading, then spawn behind it
+    -- (negated) -- same convention as client/tactics.lua's forwardOf().
+    local fx, fy = -math.sin(rad), math.cos(rad)
+    local dist = kc.spawnDistance or 18.0
+    local x = playerCoords.x - (fx * dist)
+    local y = playerCoords.y - (fy * dist)
+
+    local okGround, groundZ = GetGroundZFor_3dCoord(x, y, playerCoords.z + 5.0, false)
+    local z = (okGround and math.abs(groundZ - playerCoords.z) < 8.0) and groundZ or playerCoords.z
+
+    -- false, false: local only, no network object -- see this block's header
+    -- comment on why a K9 is client-local like tactics.lua's other AI helpers.
+    local dog = CreatePed(4, hash, x, y, z, heading, false, false)
+    SetModelAsNoLongerNeeded(hash)
+    if not DoesEntityExist(dog) then return end
+
+    SetEntityAsMissionEntity(dog, true, true)
+    SetEntityMaxHealth(dog, kc.health or 200)
+    SetEntityHealth(dog, kc.health or 200)
+    SetPedFleeAttributes(dog, 0, false)
+    SetPedCombatAttributes(dog, 46, true) -- AlwaysFight
+    SetPedRelationshipGroupHash(dog, GetHashKey('HATES_PLAYER'))
+    TaskCombatPed(dog, playerPed, 0, 16)
+
+    vehicleData.k9 = { ped = dog, task = 'Combat' }
+
+    if Config.isDebug then print('[FENIX-K9] released behind player') end
+    if FenixPursuit and FenixPursuit.announceK9 then FenixPursuit.announceK9() end
+end
+
+--- Runs once per unit per tick while handleFootChase owns that unit's tick
+--- (called from handleChaseBehavior right after a successful handleFootChase
+--- call, so it never runs on a unit that isn't actually foot-chasing).
+function handleK9Backup(vehicleData, playerPed, vehNetID)
+    local kc = Config.K9
+    if GetPlayerWantedLevel(PlayerId()) < (kc.minWantedLevel or 2) then
+        if vehicleData.k9 then releaseK9(vehicleData) end
+        return
+    end
+
+    local k9 = vehicleData.k9
+    if k9 then
+        local dog = k9.ped
+        if not DoesEntityExist(dog) or IsPedDeadOrDying(dog, true) then
+            releaseK9(vehicleData)
+            return
+        end
+
+        local playerCoords = GetEntityCoords(playerPed)
+        if #(GetEntityCoords(dog) - playerCoords) > (kc.giveUpDistance or 60.0) then
+            releaseK9(vehicleData)
+            return
+        end
+
+        -- TaskCombatPed tracks the live ped on its own once issued, same as
+        -- every other combat task in this file -- only re-issued if it was
+        -- ever cleared (it isn't, currently, but this keeps the pattern
+        -- consistent with handleFootChase/handleHeliChaseBehavior rather
+        -- than special-casing the one task that never changes).
+        if k9.task ~= 'Combat' then
+            TaskCombatPed(dog, playerPed, 0, 16)
+            k9.task = 'Combat'
+        end
+        return
+    end
+
+    if vehicleData.k9CooldownUntil and GetGameTimer() < vehicleData.k9CooldownUntil then return end
+    if not vehicleData.footChaseStartedAt then return end
+    if (GetGameTimer() - vehicleData.footChaseStartedAt) < (kc.releaseAfterFootChaseMs or 25000) then return end
+
+    spawnK9(vehicleData, playerPed)
+end
+
+-- ============================================================================
+-- GLOBAL K9 TRIGGER (Upstate Mafia)
+--
+-- Fires on the wanted level rising while the player is on foot, independent
+-- of any unit's own foot-chase progress -- handleK9Backup above only ever
+-- releases a dog from an officer who has already caught up and started
+-- chasing on foot, which can take a while (or never happen, if nothing gets
+-- within Config.FootChase.exitDistance). This is what makes a dog a reliable
+-- consequence of fleeing on foot rather than something that only sometimes
+-- shows up once a chase is already well underway.
+-- ============================================================================
+
+--- Deletes the globally-triggered dog (if any) and starts its cooldown. Same
+--- shape as releaseK9 above -- client-local ped, no network handshake needed.
+local function releaseGlobalK9()
+    if not activeGlobalK9 then return end
+    if activeGlobalK9.ped and DoesEntityExist(activeGlobalK9.ped) then
+        DeleteEntity(activeGlobalK9.ped)
+    end
+    activeGlobalK9 = nil
+    globalK9CooldownUntil = GetGameTimer() + (Config.K9.cooldownMs or 60000)
+end
+
+--- Creates the dog behind the player and sets it hunting. Same placement/
+--- setup as spawnK9 above, just not tied to any vehicleData unit.
+local function spawnGlobalK9(playerPed)
+    local kc = Config.K9
+    local hash = GetHashKey(kc.dogModel or 'a_c_shepherd')
+    if not requestModelLoaded(hash) then return end
+
+    local playerCoords = GetEntityCoords(playerPed)
+    local heading = GetEntityHeading(playerPed)
+    local rad = math.rad(heading)
+    local fx, fy = -math.sin(rad), math.cos(rad)
+    local dist = kc.spawnDistance or 18.0
+    local x = playerCoords.x - (fx * dist)
+    local y = playerCoords.y - (fy * dist)
+
+    local okGround, groundZ = GetGroundZFor_3dCoord(x, y, playerCoords.z + 5.0, false)
+    local z = (okGround and math.abs(groundZ - playerCoords.z) < 8.0) and groundZ or playerCoords.z
+
+    local dog = CreatePed(4, hash, x, y, z, heading, false, false)
+    SetModelAsNoLongerNeeded(hash)
+    if not DoesEntityExist(dog) then return end
+
+    SetEntityAsMissionEntity(dog, true, true)
+    SetEntityMaxHealth(dog, kc.health or 200)
+    SetEntityHealth(dog, kc.health or 200)
+    SetPedFleeAttributes(dog, 0, false)
+    SetPedCombatAttributes(dog, 46, true) -- AlwaysFight
+    SetPedRelationshipGroupHash(dog, GetHashKey('HATES_PLAYER'))
+    TaskCombatPed(dog, playerPed, 0, 16)
+
+    activeGlobalK9 = { ped = dog }
+
+    if Config.isDebug then print('[FENIX-K9] global trigger released a dog') end
+    if FenixPursuit and FenixPursuit.announceK9 then FenixPursuit.announceK9() end
+end
+
+--- Polls wanted level + on-foot state and drives the single global dog's
+--- lifecycle. Runs independently of handleChaseBehavior's per-unit loop, so
+--- it works even before any unit is close enough to have started its own
+--- foot chase.
+Citizen.CreateThread(function()
+    while true do
+        Citizen.Wait(500)
+
+        if not (Config.K9 and Config.K9.enabled) then
+            lastWantedLevelForK9 = GetPlayerWantedLevel(PlayerId())
+            goto continue
+        end
+
+        local playerPed = PlayerPedId()
+        local wantedLevel = GetPlayerWantedLevel(PlayerId())
+
+        if activeGlobalK9 then
+            local dog = activeGlobalK9.ped
+            local playerCoords = GetEntityCoords(playerPed)
+            if not DoesEntityExist(dog) or IsPedDeadOrDying(dog, true) or wantedLevel < 1 then
+                releaseGlobalK9()
+            elseif #(GetEntityCoords(dog) - playerCoords) > (Config.K9.giveUpDistance or 60.0) then
+                -- Same reasoning as handleK9Backup's own giveUpDistance check:
+                -- the player got back in a car (or otherwise pulled away) and
+                -- a dog chasing that forever is just a straggling ped.
+                releaseGlobalK9()
+            end
+        elseif wantedLevel > lastWantedLevelForK9
+            and wantedLevel >= (Config.K9.minWantedLevel or 2)
+            and not IsPedInAnyVehicle(playerPed, false)
+            and not (isSurrendering or isBeingArrested or isPullingOver or isBeingTicketed or ticketWrapUp)
+            and not disableAIPolice
+            and GetGameTimer() >= globalK9CooldownUntil
+            and not isPlayerPoliceOfficer()
+        then
+            spawnGlobalK9(playerPed)
+        end
+
+        lastWantedLevelForK9 = wantedLevel
+
+        ::continue::
+    end
+end)
+
+-- ============================================================================
+-- /fenixk9test - TEMPORARY: force-spawns a K9 next to the player to check the
+-- model/behaviour without setting up a real foot chase. Delete this block
+-- (and the RegisterCommand below) once confirmed working -- it bypasses
+-- Config.K9.minWantedLevel and every other gate spawnK9 normally goes
+-- through, so it has no place in a real pursuit.
+-- ============================================================================
+local testK9Ped = nil
+RegisterCommand('fenixk9test', function()
+    if testK9Ped and DoesEntityExist(testK9Ped) then
+        DeleteEntity(testK9Ped)
+        testK9Ped = nil
+        print('[FENIX-K9-TEST] removed')
+        return
+    end
+
+    local kc = Config.K9 or {}
+    local hash = GetHashKey(kc.dogModel or 'a_c_shepherd')
+    if not requestModelLoaded(hash) then
+        print('[FENIX-K9-TEST] model failed to load: ' .. tostring(kc.dogModel))
+        return
+    end
+
+    local playerPed = PlayerPedId()
+    local coords = GetEntityCoords(playerPed)
+    local heading = GetEntityHeading(playerPed)
+    local rad = math.rad(heading)
+    local fx, fy = -math.sin(rad), math.cos(rad)
+    local x, y = coords.x - (fx * 4.0), coords.y - (fy * 4.0)
+
+    local dog = CreatePed(4, hash, x, y, coords.z, heading, false, false)
+    SetModelAsNoLongerNeeded(hash)
+    if not DoesEntityExist(dog) then
+        print('[FENIX-K9-TEST] CreatePed failed')
+        return
+    end
+
+    SetEntityAsMissionEntity(dog, true, true)
+    SetEntityMaxHealth(dog, kc.health or 200)
+    SetEntityHealth(dog, kc.health or 200)
+    SetPedFleeAttributes(dog, 0, false)
+    SetPedCombatAttributes(dog, 46, true) -- AlwaysFight
+    SetPedRelationshipGroupHash(dog, GetHashKey('HATES_PLAYER'))
+    TaskCombatPed(dog, playerPed, 0, 16)
+
+    testK9Ped = dog
+    print('[FENIX-K9-TEST] spawned -- run /fenixk9test again to remove it')
+end, false)
 
 -- Helis hover overhead during surrender (stop shooting, keep circling)
 --- Superseded and never called. Air units now hold fire via an early return in
@@ -3069,20 +4180,157 @@ function triggerArrest(arrestingCop)
 
         Wait(800)
 
+        -- ---- ESCORT TO VEHICLE ----
+        --
+        -- Used to go straight from the kneel to the BUSTED fade -- no cuffing,
+        -- no car, just a jump cut to waking up at the station. This is the one
+        -- place in the whole flow that puts anyone in the back of a car: stand
+        -- the player up cuffed (SetEnableHandcuffs -- the game's own cuffed
+        -- walk/idle anim, not a hand-authored one), have nearby officers
+        -- converge for a beat, walk to the nearest responding vehicle and
+        -- TaskEnterVehicle into whichever rear seat is actually free.
+        --
+        -- Deliberately NOT a scripted drive to the station afterwards -- the
+        -- BUSTED fade already reads as "the ride happens off-screen", and a
+        -- real drive on every single arrest would turn a payoff into a chore.
+        if Config.ArrestSystem.escortToVehicle ~= false then
+            local escortOfficers = {}
+            if DoesEntityExist(arrestingCop) and not IsPedDeadOrDying(arrestingCop, true) then
+                table.insert(escortOfficers, arrestingCop)
+            end
+
+            local wantCount = Config.ArrestSystem.escortOfficerCount or 2
+            for _, vehicleData in pairs(spawnedVehicles) do
+                if #escortOfficers >= wantCount then break end
+                for pedNetID in pairs(vehicleData.officers or {}) do
+                    if #escortOfficers >= wantCount then break end
+                    local ped = NetToPed(pedNetID)
+                    if ped and ped ~= 0 and DoesEntityExist(ped) and ped ~= arrestingCop
+                        and not IsPedDeadOrDying(ped, true)
+                        and #(GetEntityCoords(ped) - arrestCoords) < 20.0 then
+                        table.insert(escortOfficers, ped)
+                    end
+                end
+            end
+
+            -- Nearest vehicle belonging to any responding unit -- same
+            -- spawnedVehicles registry every other loop in this file reads,
+            -- not a new search.
+            local escortVehicle, escortVehicleDist
+            for vehNetID in pairs(spawnedVehicles) do
+                local veh = NetToVeh(vehNetID)
+                if veh and veh ~= 0 and DoesEntityExist(veh) then
+                    local d = #(GetEntityCoords(veh) - arrestCoords)
+                    if not escortVehicleDist or d < escortVehicleDist then
+                        escortVehicle, escortVehicleDist = veh, d
+                    end
+                end
+            end
+
+            if escortVehicle and escortVehicleDist
+                and escortVehicleDist <= (Config.ArrestSystem.escortMaxVehicleDistance or 40.0) then
+                ClearPedTasks(playerPed)
+                FreezeEntityPosition(playerPed, false)
+                SetEnableHandcuffs(playerPed, true)
+
+                -- Officers converge and stand around the player -- the
+                -- "surrounded" beat -- before anyone starts walking.
+                local officerCount = math.max(1, #escortOfficers)
+                for i, cop in ipairs(escortOfficers) do
+                    if DoesEntityExist(cop) and not IsPedDeadOrDying(cop, true) then
+                        local ang = math.rad((i - 1) * (360.0 / officerCount))
+                        local px = arrestCoords.x + (math.sin(ang) * 2.2)
+                        local py = arrestCoords.y + (math.cos(ang) * 2.2)
+                        TaskGoStraightToCoord(cop, px, py, arrestCoords.z, 1.0, -1, 0.0, 0.0)
+                    end
+                end
+                Wait(1500)
+                for _, cop in ipairs(escortOfficers) do
+                    if DoesEntityExist(cop) and not IsPedDeadOrDying(cop, true) then
+                        TaskTurnPedToFaceEntity(cop, playerPed, 1000)
+                    end
+                end
+                Wait(500)
+
+                -- Walk to the car, one officer following a step behind.
+                local vc = GetEntityCoords(escortVehicle)
+                local vHeading = GetEntityHeading(escortVehicle)
+                TaskGoStraightToCoord(playerPed, vc.x, vc.y, vc.z,
+                    Config.ArrestSystem.escortWalkSpeed or 1.0, -1, vHeading, 1.0)
+
+                local escort = escortOfficers[1]
+                if escort and DoesEntityExist(escort) then
+                    TaskGoToEntity(escort, playerPed, -1, 1.5, 1.0, 1073741824, 0)
+                end
+
+                -- Time budget rather than polling distance forever -- a
+                -- blocked path (traffic, a wall) shouldn't hold the whole
+                -- cinematic hostage.
+                local walkDeadline = GetGameTimer() + (Config.ArrestSystem.escortWalkTimeoutMs or 6000)
+                while GetGameTimer() < walkDeadline
+                    and #(GetEntityCoords(playerPed) - vc) > 3.0 do
+                    Wait(100)
+                end
+
+                -- Into whichever rear seat is actually free.
+                local seat = IsVehicleSeatFree(escortVehicle, 2) and 2
+                    or (IsVehicleSeatFree(escortVehicle, 1) and 1) or 2
+                SetVehicleDoorsLocked(escortVehicle, 1) -- unlocked, so the enter task can open it
+                TaskEnterVehicle(playerPed, escortVehicle, 5000, seat, 1.0, 1, 0)
+
+                local enterDeadline = GetGameTimer() + 5000
+                while GetGameTimer() < enterDeadline and not IsPedInVehicle(playerPed, escortVehicle, false) do
+                    Wait(100)
+                end
+
+                SetEnableHandcuffs(playerPed, false)
+                UncuffPed(playerPed)
+                FreezeEntityPosition(playerPed, true)
+
+                -- The BUSTED cinematic below revolves its camera around
+                -- arrestCoords -- re-centre it on wherever the player actually
+                -- ended up (in the car) rather than the empty pavement they
+                -- were kneeling on a few seconds ago.
+                arrestCoords = GetEntityCoords(playerPed)
+            end
+        end
+
         -- ---- BUSTED CINEMATIC ----
 
-        -- 1. Load scaleform
-        local sf = RequestScaleformMovie('MP_BIG_MESSAGE_FREEMODE')
-        while not HasScaleformMovieLoaded(sf) do Wait(0) end
+        local duration = math.min(Config.ArrestSystem.bustedDuration or 6000,
+                                  (Config.ArrestSystem.bustedMaxDuration or 30000))
+        local skippable = Config.ArrestSystem.bustedSkippable ~= false
 
-        BeginScaleformMovieMethod(sf, 'SHOW_SHARD_WASTED_MP_MESSAGE')
-        BeginTextCommandScaleformString('STRING')
-        AddTextComponentSubstringPlayerName('~r~BUSTED')
-        EndTextCommandScaleformString()
-        BeginTextCommandScaleformString('STRING')
-        AddTextComponentSubstringPlayerName(Config.ArrestSystem.bustedSubtitle or '')
-        EndTextCommandScaleformString()
-        EndScaleformMovieMethod()
+        -- 1. The BUSTED word itself.
+        --
+        -- [Fix history] This went through several scaleform-based attempts --
+        -- SHOW_SHARD_WASTED_MP_MESSAGE (wrong method entirely, decompiles to
+        -- the small MP kill-feed toast), then the movie's real
+        -- SHOW_BUSTED_MP_MESSAGE (right method, but its band is baked into
+        -- the compiled sprite -- see _tools/gtav_scaleforms_decompiled,
+        -- MP_BIG_MESSAGE_FREEMODE.as -- and nothing in its exposed arguments
+        -- can hide it). The actual reference look (a screenshot of vanilla
+        -- GTA's own WASTED screen) has no band at all -- just the bare word.
+        -- Since that band can't be removed from the scaleform, this drops
+        -- the scaleform entirely and draws the word as plain native text:
+        -- FONT_STYLE_PRICEDOWN (font id 7 -- GTA's own logo/title font,
+        -- confirmed against FiveM's font id list) is the actual font this
+        -- screen uses, so there's no styling compromise from going this
+        -- route -- if anything it's a closer match than the scaleform ever
+        -- was, and it sidesteps the scaleform-pool reliability issues this
+        -- screen hit entirely (see server.cfg's ScaleformStore pool-size
+        -- increase for that whole saga).
+        local function drawBigWord(word, r, g, b)
+            SetTextFont(7)
+            SetTextScale(1.35, 1.35)
+            SetTextColour(r, g, b, 255)
+            SetTextCentre(true)
+            SetTextDropShadow()
+            SetTextEdge(2, 0, 0, 0, 160)
+            SetTextEntry('STRING')
+            AddTextComponentString(word)
+            DrawText(0.5, 0.44)
+        end
 
         -- 2. Screen effect + sound
         StartScreenEffect('DeathFailOut', 0, false)
@@ -3102,18 +4350,15 @@ function triggerArrest(arrestingCop)
         SetCamActive(cam, true)
         RenderScriptCams(true, true, 800, true, true)
 
-        -- 4. Draw loop — render scaleform and animate camera
+        -- 4. Draw loop — render the BUSTED word, red wash, and camera.
         --
         -- [Upstate Mafia patch] Timed off GetNetworkTime(), NOT GetGameTimer().
         -- SetTimeScale(0.15) above slows game time to 15%, and GetGameTimer
         -- advances with it — so a 6000ms window took ~40 SECONDS of real time,
         -- and the cinematic appeared to hang. GetNetworkTime is real time and is
         -- unaffected by the local time scale.
-        local t0       = GetNetworkTime()
-        local duration = math.min(Config.ArrestSystem.bustedDuration or 6000,
-                                  (Config.ArrestSystem.bustedMaxDuration or 30000))
-        local skippable = Config.ArrestSystem.bustedSkippable ~= false
-        local skipped  = false
+        local t0      = GetNetworkTime()
+        local skipped = false
 
         while (GetNetworkTime() - t0) < duration and not skipped do
             local progress = (GetNetworkTime() - t0) / duration
@@ -3144,7 +4389,15 @@ function triggerArrest(arrestingCop)
 
             SetCamCoord(cam, camPos.x, camPos.y, camPos.z)
             PointCamAtCoord(cam, arrestCoords.x, arrestCoords.y, arrestCoords.z + 0.3)
-            DrawScaleformMovieFullscreen(sf, 255, 255, 255, 255, 0)
+
+            -- DeathFailOut (started below) is a fixed built-in postFX with no
+            -- colour parameter -- there's no native way to make IT red. Drawn
+            -- ourselves instead: a translucent red wash under the word, so
+            -- the whole screen reads red-hued, matching the reference.
+            DrawRect(0.5, 0.5, 1.0, 1.0, 160, 20, 20, 70)
+
+            drawBigWord('busted', 70, 140, 230)
+
             DisableAllControlActions(0)
             Wait(0)
         end
@@ -3157,11 +4410,10 @@ function triggerArrest(arrestingCop)
         DoScreenFadeOut(1500)
         while not IsScreenFadedOut() do Wait(50) end
 
-        -- 7. Cleanup camera & scaleform
+        -- 7. Cleanup camera
         SetCamActive(cam, false)
         RenderScriptCams(false, false, 0, true, true)
         DestroyCam(cam, false)
-        SetScaleformMovieAsNoLongerNeeded(sf)
 
         -- 8. Clear wanted & teleport to nearest station
         ClearPlayerWantedLevel(PlayerId())
@@ -3190,7 +4442,7 @@ function triggerArrest(arrestingCop)
         SetEntityHeading(playerPed, station.w)
 
         -- 9. Clean up all spawned units (same as end-of-wanted)
-        handleEndWantedDelete()
+        handleEndWantedDelete(true)
 
         Wait(2000)
 
@@ -3201,6 +4453,119 @@ function triggerArrest(arrestingCop)
         isBeingArrested = false
     end)
 end
+
+
+-------------------------------------------------
+-- WASTED SCREEN (qbx_medical)                 --
+-------------------------------------------------
+-- [Added, 2026-09-09] Fires on qbx_medical's own confirmed-death signal --
+-- 'qbx_medical:client:onPlayerDied', a LOCAL client event
+-- qbx_medical/client/dead.lua's OnDeath() fires only once a death is truly
+-- final, never on a revivable last-stand knockdown (checked its source: the
+-- gameEventTriggered handler only calls OnDeath on the SECOND fatal hit,
+-- after EndLastStand()). This is exactly the reliable "confirmed dead, not
+-- just downed" signal wasabi_ambulance's escrow made impossible to get --
+-- see server.cfg's own comments for why wasabi_ambulance was replaced with
+-- qbx_medical + qbx_ambulancejob at all.
+--
+-- Deliberately does NOT freeze position, disable controls, or teleport --
+-- qbx_medical already owns all of that itself (OnDeath disables controls
+-- and plays a dead animation for as long as DeathState stays DEAD, and
+-- CheckForRespawn handles the actual hold-to-respawn flow). This only adds
+-- the camera pull-back + red wash + WASTED word on top, then gets out of
+-- the way. qbx_medical has no screen fade of its own (checked
+-- client/dead.lua) -- this fades back in itself at the end rather than
+-- leaving the screen black through qbx_medical's own respawn flow.
+local WASTED_DURATION = 4000
+
+local function runWasted()
+    local playerPed   = PlayerPedId()
+    local deathCoords = GetEntityCoords(playerPed)
+
+    StartScreenEffect('DeathFailOut', 0, false)
+    PlaySoundFrontend(-1, 'ScreenFlash', 'MissionFailedSounds', true)
+    SetTimeScale(0.15)
+
+    local heading = GetEntityHeading(playerPed)
+    local rad = math.rad(heading + 160.0)
+    local startDist, endDist = 2.0, 6.0
+    local startZ,   endZ    = 0.8, 3.0
+
+    local cam = CreateCam('DEFAULT_SCRIPTED_CAMERA', true)
+    local startPos = deathCoords + vector3(math.sin(rad) * startDist, math.cos(rad) * startDist, startZ)
+    SetCamCoord(cam, startPos.x, startPos.y, startPos.z)
+    PointCamAtCoord(cam, deathCoords.x, deathCoords.y, deathCoords.z + 0.4)
+    SetCamActive(cam, true)
+    RenderScriptCams(true, true, 800, true, true)
+
+    -- GetNetworkTime, not GetGameTimer -- SetTimeScale(0.15) above would
+    -- stretch a GetGameTimer-based window by ~6.5x, same reasoning as
+    -- the BUSTED cinematic's own draw loop.
+    local t0 = GetNetworkTime()
+    while (GetNetworkTime() - t0) < WASTED_DURATION do
+        local progress = (GetNetworkTime() - t0) / WASTED_DURATION
+        local ease = 1.0 - (1.0 - progress) * (1.0 - progress)
+
+        local curDist = startDist + (endDist - startDist) * ease
+        local curZ    = startZ   + (endZ   - startZ)   * ease
+        local curRad  = rad + math.rad(15.0 * ease)
+        local camPos  = deathCoords + vector3(math.sin(curRad) * curDist, math.cos(curRad) * curDist, curZ)
+
+        SetCamCoord(cam, camPos.x, camPos.y, camPos.z)
+        PointCamAtCoord(cam, deathCoords.x, deathCoords.y, deathCoords.z + 0.3)
+
+        DrawRect(0.5, 0.5, 1.0, 1.0, 160, 20, 20, 70)
+        drawBigWord('wasted', 220, 40, 40)
+
+        Wait(0)
+    end
+
+    SetTimeScale(1.0)
+    StopScreenEffect('DeathFailOut')
+
+    DoScreenFadeOut(1000)
+    while not IsScreenFadedOut() do Wait(50) end
+
+    -- [Re-added, 2026-09-09] qbx_medical waits for this before resurrecting/
+    -- posing the player, so that snap happens with the screen already
+    -- black instead of before/during the cinematic. (This was added once
+    -- before and reverted when it appeared to break death handling --
+    -- the actual cause was an unrelated bug in qbx_medical's own file, since
+    -- fixed, not this event.)
+    TriggerEvent('fenix-police:client:wastedScreenFadedOut')
+
+    SetCamActive(cam, false)
+    RenderScriptCams(false, false, 0, true, true)
+    DestroyCam(cam, false)
+
+    DoScreenFadeIn(1000)
+    while not IsScreenFadedIn() do Wait(50) end
+end
+
+local function triggerWasted()
+    Citizen.CreateThread(function()
+        -- pcall wraps the actual cinematic body (runWasted), not just this
+        -- CreateThread call -- CreateThread returns immediately, before the
+        -- thread body ever runs, so a pcall around triggerWasted() itself
+        -- (as the qbx_medical:client:onPlayerDied handler below used to do)
+        -- can never catch an error that happens later inside the thread.
+        local ok, err = pcall(runWasted)
+        if not ok then
+            print(('[fenix-police] WASTED cinematic errored: %s'):format(tostring(err)))
+        end
+    end)
+end
+
+-- Unconditional print (not gated behind Config.isDebug) -- fires at most
+-- once per death, kept to nail down whether the qbx_medical event itself
+-- fires at all vs. something inside the cinematic silently failing (first
+-- live report, 2026-09-09: no WASTED screen, nothing to tell the two apart
+-- after the fact). The cinematic's own error reporting lives in
+-- triggerWasted itself, above.
+AddEventHandler('qbx_medical:client:onPlayerDied', function()
+    print('[fenix-police] qbx_medical:client:onPlayerDied received -- starting WASTED')
+    triggerWasted()
+end)
 
 
 -------------------------------------------------
@@ -3789,7 +5154,13 @@ local function attemptFieldRevive(medicPed, playerCoords)
         local stillDown = isPlayerIncapacitated(cache.ped)
         if stillDown and math.random() < (c.reviveChance or 0.35) then
             if Config.isDebug then print('[fenix-police] field revive succeeded') end
-            TriggerEvent('wasabi_ambulance:revive')
+            -- [Fix, 2026-09-09] wasabi_ambulance's own client-side
+            -- 'wasabi_ambulance:revive' event doesn't exist under
+            -- qbx_medical -- Revive there is a SERVER export
+            -- (exports.qbx_medical:Revive(src)), not something the client
+            -- can trigger on itself. Routed through server/server.lua's own
+            -- fieldRevive handler instead.
+            TriggerServerEvent('fenix-police:server:fieldRevive')
             endAftermath()
         elseif Config.isDebug then
             print('[fenix-police] field revive failed, holding scene for EMS')
@@ -3875,6 +5246,13 @@ local function beginAftermath(playerCoords)
                 held = held + 1
             end
         end
+        -- A K9 mid-attack has the same problem heli/air gunners do below: the
+        -- native AI target is still alive (last-stand isn't IsEntityDead), so
+        -- it would keep biting straight through a field-revive attempt.
+        -- Pulled off entirely rather than just stood down -- there's no
+        -- "guard the downed suspect" pose for a dog the way there is for an
+        -- officer.
+        if vehicleData.k9 then releaseK9(vehicleData) end
     end
 
     -- [Upstate Mafia] Heli/plane gunners never get physically parked (nobody
@@ -3969,8 +5347,22 @@ Citizen.CreateThread(function()
         -- depends on one event's timing/logic ever landing correctly.
         SetMaxWantedLevel(Config.MaxWantedLevel or 5)
 
-        if wantedLevel > 0 then
-            print(('[FENIX-LOOP] wanted=%d disableAI=%s pendingGround=%d'):format(wantedLevel, tostring(disableAIPolice), pendingGroundSpawns))
+        -- [Upstate Mafia] Keep running the chase/arrest loop through a surrender
+        -- or an in-progress arrest even if the star has already decayed to 0.
+        -- Without this, natural wanted-level decay while you stand still with
+        -- your hands up stops handleChaseBehavior from ever being called again,
+        -- which means handleSurrenderApproach's arrestDistance check stops
+        -- running too -- the officer can be standing right next to you and the
+        -- BUSTED cinematic still never triggers.
+        if wantedLevel > 0 or isSurrendering or isBeingArrested then
+            -- Diagnostic left over from tracing the SetMaxWantedLevel bug above.
+            -- This branch runs on every loop cycle for as long as the player is
+            -- wanted, so unguarded it floods the client console during any
+            -- pursuit (222 lines in one session log). Gated behind Config.isDebug
+            -- like the rest of the resource's tracing.
+            if Config.isDebug then
+                print(('[FENIX-LOOP] wanted=%d disableAI=%s pendingGround=%d'):format(wantedLevel, tostring(disableAIPolice), pendingGroundSpawns))
+            end
             -- Open spawn gate so new spawns are accepted for this chase.
             spawnGate = true
 
@@ -4051,9 +5443,16 @@ Citizen.CreateThread(function()
                 -- level is only still on to hold the delete sweep off, and a
                 -- fresh cruiser spawning into a finished stop reads as a bug.
                 -- isPullingOver is deliberately not included: before anyone is at
-                -- the window a stop still needs a unit sent to work it.
-                if not (isBeingTicketed or ticketWrapUp) then
-                    maintainPoliceUnits(wantedLevel) -- Checks if we need to spawn more units, or remove excess units.
+                -- the window a stop still needs a unit sent to work it. Surrender/
+                -- arrest follows the same rule -- don't let unit-count reconciliation
+                -- touch the responding unit while it's mid-approach or mid-cinematic.
+                if not (isBeingTicketed or ticketWrapUp or isSurrendering or isBeingArrested) then
+                    -- [Upstate Mafia] EffectiveSpawnWantedLevel folds in the
+                    -- current breach-resistance tier, so a player who's been
+                    -- fighting a foot chase gets heavier reinforcements sent
+                    -- next, on top of whatever their actual star count calls
+                    -- for. See client/client.lua's escalation section.
+                    maintainPoliceUnits(EffectiveSpawnWantedLevel(wantedLevel)) -- Checks if we need to spawn more units, or remove excess units.
                 end
                 checkDeadPeds() -- Check for dead peds
                 handleDeadPeds() -- Handle the deletion of dead peds.
@@ -4076,6 +5475,17 @@ Citizen.CreateThread(function()
             playerHasShot = false
             provokedUntil = 0
             isSurrendering = false
+            -- [Fix, 2026-09-09] isBeingArrested had no equivalent safety net
+            -- -- if an arrest cinematic (triggerArrest, ~line 3642) never
+            -- reached its normal completion at ~line 3818 (resource
+            -- restart, disconnect, or any other interruption mid-arrest),
+            -- this flag stayed stuck true for the rest of the session,
+            -- silently skipping handleFootChase (and normal combat
+            -- response) in handleChaseBehavior for every future pursuit --
+            -- reads exactly like "cops just stand next to their car" with
+            -- no error anywhere. Reset here alongside isSurrendering, which
+            -- already gets this same treatment.
+            isBeingArrested = false
 
             -- Pursuit over: drop the AI blips and forget the last known
             -- position, so the next one starts from no knowledge instead of

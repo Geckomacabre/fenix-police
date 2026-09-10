@@ -133,10 +133,15 @@ Config.Combat = {
     -- wanted level. Rolled once per officer when they spawn and kept for their
     -- lifetime, so a unit doesn't flicker between shooting and not shooting.
     -- 0.0 = pure pursuit, nobody shoots unless provoked (see provokedDuration).
+    -- [Raised, 2026-09-09] 1-3 were far too passive in practice -- 0.0 at
+    -- levels 1-2 meant almost nobody would ever open fire without being shot
+    -- at first. Raised across the low tiers so officers are noticeably more
+    -- willing to engage, while keeping the tiered pursuit-vs-shootout feel
+    -- (still well under 4-5's near-certain engagement).
     engageChance = {
-        [1] = 0.0,
-        [2] = 0.0,
-        [3] = 0.25,  -- roughly one officer in four starts taking shots
+        [1] = 0.15,
+        [2] = 0.30,
+        [3] = 0.50,  -- roughly one officer in two starts taking shots
         [4] = 0.8,
         [5] = 1.0,
     },
@@ -275,6 +280,22 @@ Config.Ambient = {
     -- a wanted level appears, so they never get tangled up in a real pursuit.
     despawnWhenWanted = true,
 
+    -- [Upstate Mafia] Before a scene is torn down by despawnWhenWanted, a
+    -- patrol/convoy scene close enough is instead handed off to the pursuit
+    -- system as a real unit (see client/ambient.lua's tryPromoteScene /
+    -- client.lua's PromoteAmbientUnit) — the cop that was already patrolling
+    -- turns and joins the chase, rather than vanishing and being replaced by
+    -- a freshly spawned one. Radar traps, static posts and traffic stops are
+    -- never promoted, only despawned as before.
+    promoteOnWanted = true,
+    -- How close (metres) a patrol/convoy scene has to be to the player the
+    -- moment a wanted level appears to be a candidate for promotion.
+    promoteRadius = 100.0,
+    -- Cap on how many vehicles get promoted per wanted-level onset (not per
+    -- tick — see wasWanted in client/ambient.lua), so going wanted next to a
+    -- three-car convoy doesn't deputise the whole thing at once.
+    maxPromotedPerOnset = 2,
+
     -- How many ambient scenes may exist at once. Each scene is 1-3 vehicles and
     -- 1-4 peds, so keep this low.
     --
@@ -340,6 +361,13 @@ Config.Ambient = {
 
     -- How long the cuffed-at-gunpoint tableau holds before everyone is released.
     pursuitHoldSeconds = 20,
+
+    -- After the tableau holds, walk the suspect to the nearest scene vehicle
+    -- and put them in the back seat before the scene tears down/drives off,
+    -- instead of the suspect just standing there until the whole thing blinks
+    -- out of existence. false reverts to the old instant-teardown ending.
+    pursuitEscortToVehicle = true,
+    pursuitEscortSeconds = 6,      -- time budget for the walk-and-enter beat
 
     -- How long a traffic stop runs before the officer wraps up and walks back to
     -- the car, and how long the scene is then kept alive so both vehicles can
@@ -754,6 +782,126 @@ Config.Violations = {
 }
 
 
+-- FOOT CHASE (Upstate Mafia) --
+-- Officers exit their vehicle and pursue on foot once the player is on foot
+-- and either close enough or somewhere a car flatly cannot follow (an
+-- interior). Without this, a unit's driver just kept trying to path a
+-- cruiser at the player, and running into any building lost every unit
+-- outright. See handleFootChase in client/client.lua.
+Config.FootChase = {
+    enabled = true,
+
+    -- How close (metres) the unit's vehicle has to be to the player before it
+    -- sends an officer out on open ground.
+    exitDistance = 20.0,
+    -- Same, but for when the player has gone inside an interior — more
+    -- generous, since the alternative there is losing the unit outright
+    -- rather than just continuing to drive.
+    interiorExitDistance = 40.0,
+
+    -- Once out and pursuing, how close the officer has to be (and hostile,
+    -- and actually have contact — see FenixPursuit.hasContact) before they
+    -- stop closing the distance and open fire instead.
+    combatRange = 20.0,
+
+    -- If the player gets back in a vehicle and outruns the chaser by this
+    -- much, the officer gives up rather than jogging after a car forever.
+    giveUpDistance = 80.0,
+
+    -- [Upstate Mafia] Escalation: force used against a foot chase/breach
+    -- rises the more the player fights back. Nothing here changes an
+    -- existing officer's ped MODEL mid-pursuit -- "reinforcement" means the
+    -- next unit spawned (client.lua's EffectiveSpawnWantedLevel, folded into
+    -- maintainPoliceUnits) favours the same wantedLevel-5 riot/SWAT vehicle
+    -- pool Config.vehiclesByRegion already defines, not a second one built
+    -- here. Tiers are keyed by resistance count, missing levels fall back to
+    -- the nearest one below.
+    escalation = {
+        enabled = true,
+        -- How long (ms) a hit against a foot-chase/breach officer keeps
+        -- counting toward escalation before it's forgotten and the tier can
+        -- drop back down on its own.
+        resistanceDecayMs = 90000,
+        tiers = {
+            [0] = { armor = 25,  loadout = 'patrol' },
+            [1] = { armor = 100, loadout = 'patrol' },
+            [2] = { armor = 100, loadout = 'riot', forceWantedLevel = 5 },
+            [3] = { armor = 150, loadout = 'riot', forceWantedLevel = 5, shield = true },
+        },
+    },
+
+    -- The prop a tier-3 officer visibly carries. Cosmetic only -- see the
+    -- UNVERIFIED warning on attachBreachShield in client.lua; GTA has no
+    -- vanilla mechanic for a held prop to actually stop bullets either way.
+    shieldObject = 'prop_riot_shield',
+
+    -- [Upstate Mafia] Stack-up cinematic before pushing into an interior (not
+    -- used on open ground -- see interiorExitDistance above). See
+    -- advanceStaging in client.lua.
+    staging = {
+        enabled = true,
+        durationMs = 2500,
+    },
+}
+
+
+-- K9 BACKUP (Upstate Mafia) --
+-- A dog closes distance a human officer never can, which is exactly what a
+-- foot chase that's been running a while is missing -- see
+-- Config.FootChase.giveUpDistance: without this, a player who can simply
+-- outrun a jogging officer for 80m gets away for free, every time.
+--
+-- Triggered globally (client.lua's watchForGlobalK9Trigger thread): the
+-- moment the wanted level rises while the player is on foot, past
+-- minWantedLevel and the cooldown below, a dog is released -- not tied to
+-- any specific unit having caught up and started its own foot chase first
+-- (that older path, handleK9Backup, is still in client.lua but no longer
+-- called -- see the comment where handleChaseBehavior used to invoke it).
+-- It's client-local/non-networked the same way client/tactics.lua's
+-- roadblock and spike-strip peds are -- see that file's header for why
+-- that's the established pattern here.
+--
+-- The dog itself needs no bespoke "bite and arrest" scripting: TASK_COMBAT_PED
+-- on an animal ped is already GTA's own K9 attack (melee, no weapon), and a
+-- suspect it brings down just falls into Config.Aftermath the same as any
+-- other takedown -- field revive or a normal arrest once they're on the
+-- ground. dogModel below is the add-on 'dwxunit' ped (see its own comment),
+-- not a base-game model, so this one isn't in _tools/gtav_reference.
+Config.K9 = {
+    enabled = true,
+
+    -- 'dwxunit' is an add-on ped from the free DWX K9-Unit Rework
+    -- (forum.cfx.re/t/5349193, resources/[standalone]/dwx_k9) -- a new model
+    -- name, not an override of the base-game a_c_shepherd, so it needs that
+    -- resource ensured or this falls back to nothing (bad model = no dog).
+    dogModel = 'dwxunit',
+
+    -- A real department doesn't send a dog after a level-1 jaywalker.
+    minWantedLevel = 2,
+
+    -- Vestigial: only read by the disabled legacy path (handleK9Backup in
+    -- client.lua, no longer called). The active global trigger releases a
+    -- dog immediately on the wanted-level rise, not after a delay.
+    releaseAfterFootChaseMs = 25000,
+
+    -- Spawned this far behind the player along their current heading, so it
+    -- isn't just standing there in view the instant it's released.
+    spawnDistance = 18.0,
+
+    -- Give up (and delete) if the player somehow pulls back ahead of it by
+    -- this much -- got back in a car and drove off, mainly. A dog chasing a
+    -- car forever is a straggling ped, same reasoning as
+    -- Config.FootChase.giveUpDistance.
+    giveUpDistance = 60.0,
+
+    -- Cooldown (ms) before another dog can be released after the last one is
+    -- lost, killed or given up on.
+    cooldownMs = 60000,
+
+    health = 200,
+}
+
+
 -- ARREST / BUSTED SYSTEM --
 -- When a wanted player presses the surrender key (default H), they put their hands up.
 -- Nearby officers will approach with weapons aimed. Once close enough, the player is
@@ -786,6 +934,20 @@ Config.ArrestSystem = {
         vector4(360.6, -1584.8, 29.3, 320.0),     -- Davis Sheriff
         vector4(-561.8, -131.0, 38.0, 200.0),     -- Rockford Hills PD
     },
+
+    -- The arrest used to go straight from the kneel to the BUSTED fade -- no
+    -- cuffing, no car, just a jump cut to the station. With this on, officers
+    -- converge and stand the player up cuffed, walk them to the nearest
+    -- responding vehicle and put them in the back seat, THEN the BUSTED fade
+    -- and station teleport happen exactly as before -- the ride itself still
+    -- happens off-screen (a real scripted drive would make every arrest a
+    -- repeated chore, not a payoff). false reverts to the old instant-fade
+    -- behaviour.
+    escortToVehicle = true,
+    escortOfficerCount = 2,        -- officers that converge, up to how many are nearby
+    escortWalkSpeed = 1.0,         -- move-rate override for the cuffed walk cycle
+    escortMaxVehicleDistance = 40.0, -- give up on the car beat past this range and go straight to the fade
+    escortWalkTimeoutMs = 6000,    -- time budget for the walk to the car before giving up and boarding from wherever
 }
 
 
@@ -1000,6 +1162,119 @@ Config.spawnGroundUnitsInHeli = true
 Config.spawnGroundUnitsInPlane = true
 
 
+-- REINFORCEMENT (sustained pursuit) --
+-- Real dispatch doesn't just hold a pursuit at whatever the wanted level
+-- called for at the start -- the longer a spotted suspect stays out, the more
+-- units get sent to close it out. Config.maxUnitsPerLevel above is a flat cap
+-- per star count; this adds units ON TOP of that cap the longer the player
+-- has been under contact (see FenixPursuit.pursuitElapsedMs in
+-- client/pursuit.lua, which is "since a cop first laid eyes on you", and
+-- keeps counting through a lost-contact search rather than resetting -- the
+-- incident is still live even while nobody currently has eyes on you).
+-- maintainPoliceUnits() in client.lua reads this alongside
+-- Config.maxUnitsPerLevel/maxHeliUnitsPerLevel every cycle.
+Config.Reinforcement = {
+    enabled = true,
+
+    -- Ground: one extra unit for every full interval of sustained contact,
+    -- capped so a very long pursuit doesn't turn into an unbroken wall of cars.
+    contactIntervalMs = 45000,  -- 45s of contact = +1 unit
+    unitsPerInterval  = 1,
+    maxBonusUnits     = 4,
+
+    -- Air support is a much bigger commitment than another cruiser, so it
+    -- escalates slower and caps lower -- a second helicopter, never more.
+    heliIntervalMs      = 90000, -- 90s of contact = +1 heli
+    heliUnitsPerInterval = 1,
+    maxBonusHeli         = 1,
+}
+
+
+-- BACKUP REQUESTS (event-driven) --
+-- Read by client/backup.lua. Config.Reinforcement above answers "how long has
+-- this pursuit run" -- a clock. This answers "what is actually happening to
+-- the units on scene": an officer going down, an officer taking fire, a
+-- suspect who's shooting, each add a decaying incident score that
+-- FenixBackup.bonusUnits() turns into extra units on top of
+-- Config.maxUnitsPerLevel/Reinforcement's own bonus, and a forced radio call
+-- distinct from "suspect still evading" (see FenixPursuit.announceBackupRequest).
+Config.Backup = {
+    enabled = true,
+    debug = false,
+
+    -- Points added to the incident score per trigger. Two officers going down
+    -- calls in a lot more than one taking a graze.
+    officerDownScore   = 40,
+    takingFireScore    = 12,
+    suspectArmedScore  = 8,
+
+    -- The score decays linearly to 0 over this window rather than being
+    -- cleared instantly -- a unit that just lost an officer stays "hot" for a
+    -- little while, not just for the tick it happened on.
+    decayMs = 60000,
+
+    -- Score -> extra units, same shape as Config.Reinforcement's
+    -- unitsPerInterval/maxBonusUnits: one extra unit per this many points,
+    -- capped so a single ugly incident doesn't summon the entire department.
+    scorePerGroundUnit = 20,
+    maxBonusGroundUnits = 3,
+    scorePerHeliUnit    = 40,
+    maxBonusHeliUnits   = 1,
+
+    -- Minimum time between two backup radio calls, so a burst of gunfire
+    -- doesn't key the radio every cycle -- the score keeps accumulating
+    -- underneath even while the radio itself is on cooldown.
+    announceCooldownMs = 20000,
+}
+
+
+-- MORALE / CASUALTIES / RETREAT --
+-- Read by client/morale.lua. Without this an officer either wins or is
+-- silently deleted and replaced next maintainPoliceUnits() pass -- there is
+-- no state in between. This adds one: a unit that has taken real losses or is
+-- badly outmatched disengages (task state 'Retreating') and regroups at a
+-- distance (task state 'Regrouping') instead of fighting to the last officer,
+-- then either rejoins or is released to be replaced by a fresh unit.
+--
+-- Deliberately NOT applied to client/tactics.lua's roadblock/spike-strip
+-- officers -- those are static obstacles with no combat state machine to
+-- retreat out of, only chase-unit officers (client.lua's ground/heli/air
+-- loops) have morale.
+Config.Morale = {
+    enabled = true,
+    debug = false,
+
+    -- A unit falls back once it has lost at least this fraction of the
+    -- officers it originally spawned with (a 2-officer unit breaks the moment
+    -- it loses its first).
+    casualtyFraction = 0.5,
+
+    -- An officer below this health fraction counts as a casualty for the
+    -- fraction above even if they're still standing -- badly wounded, not
+    -- fighting effectively.
+    woundedHealthFraction = 0.3,
+
+    -- A LONE surviving officer (the unit is down to one) facing a suspect who
+    -- is armed and at/above this wanted level is outnumbered in the sense
+    -- that matters -- one badge against a determined armed suspect -- even
+    -- though nothing has been shot yet.
+    outnumberedWantedLevel = 3,
+
+    -- Sustained fire without landing a kill for this long reads as suppressed
+    -- rather than winning, and is its own retreat trigger.
+    suppressedMs = 25000,
+
+    -- 'flee' = TaskSmartFleePed away from the player before making for the
+    -- car. 'cower' = TaskCower in place first (a cornered officer with
+    -- nowhere clear to run). FenixMorale picks per-officer based on whether a
+    -- flee direction is actually clear.
+    retreatStyle = 'flee',
+
+    -- How long a regrouped unit sits out before it's eligible to rejoin the
+    -- fight (if the player is still in the area) or is released for
+    -- maintainPoliceUnits to replace with a fresh unit.
+    regroupSeconds = 35,
+}
 
 
 -- SERVER-SIDE ENTITY SECURITY --
@@ -1348,6 +1623,19 @@ Config.Tactics = {
     -- where possible, which is the difference between an obstacle and an ambush.
     placementAttempts = 12,
 
+    -- ── Sustained pursuit ───────────────────────────────────────────────────
+    -- Road tactics used to be gated on wanted level alone, which meant a
+    -- 2-star chase that just kept running for ten minutes never once saw a
+    -- roadblock or spike strip -- exactly the kind of pursuit real dispatch
+    -- WOULD start committing road tactics against, once it's clearly not
+    -- resolving on its own. This lets either the level gates below OR enough
+    -- sustained contact unlock them, whichever comes first. Set
+    -- durationFallbackMs to 0 to go back to level-only gating.
+    -- See FenixPursuit.pursuitElapsedMs in client/pursuit.lua -- time since a
+    -- cop first spotted the player, counting through lost-contact searches.
+    durationFallbackMs      = 60000, -- 1 minute of sustained pursuit
+    durationFallbackMinLevel = 2,    -- never below this, however long it runs
+
     -- ── Roadblocks ──────────────────────────────────────────────────────────
     roadblockFromLevel  = 3,
     roadblockChance     = 0.5,     -- rolled once per cooldown window
@@ -1525,9 +1813,31 @@ Config.Roads = {
     -- civilian traffic. Restored when the resource stops.
     disableAiRoads = true,
 
+    -- Whether that suppression is broadcast to the session or kept local to
+    -- this client.
+    --
+    -- Broadcasting it costs a slot in the engine's CNetworkRoadNodeWorldStateData
+    -- pool, which holds TWENTY entries for the whole session and is shared with
+    -- every other script that touches road nodes. Once it is full the client
+    -- spams "CNetworkRoadNodeWorldStateData Pool Full, Size == 20" and nothing
+    -- else can suppress roads for the rest of the session. Slots are also not
+    -- obviously reclaimed on a resource restart, so a scripter restarting this
+    -- resource a dozen times in one sitting can exhaust it on their own.
+    --
+    -- Local costs nothing and is what this actually wants: every player runs
+    -- this resource's client script, so every player suppresses the same zones
+    -- for themselves, and pathfinding decisions are made by the client that
+    -- owns the vehicle anyway.
+    --
+    -- Set true only if you have a reason to need the state replicated to
+    -- clients that are NOT running this resource -- and then keep an eye on
+    -- that pool.
+    networkRoadSuppression = false,
+
     -- How close the player has to be to a zone before the above is applied.
-    -- Node state is reset by the engine when a region streams back in, so it is
-    -- re-applied on a timer rather than once at startup.
+    -- Checked on a timer, but the suppression itself is applied ONCE and left
+    -- alone: the engine re-applies it on region stream-in by itself, and
+    -- re-issuing the call on a timer is what used to exhaust the pool above.
     suppressionRadius = 2000.0,
 
     -- Areas police neither spawn in nor path through.
@@ -1577,6 +1887,49 @@ Config.Roads = {
             zMax = 80.0,
         },
     },
+}
+
+
+-- JURISDICTION HANDOFF --
+-- Read by client/jurisdiction.lua. Config.vehiclesByRegion + Config.ZoneEnum
+-- above already ARE a jurisdiction model -- which agency's cars/peds spawn is
+-- already keyed by which of GTA's own (huge, few) named zones the player is
+-- in. What was missing is anyone reacting to a crossing: existing units kept
+-- fighting under the outgoing agency's livery forever, and nothing on the
+-- radio ever said a handoff happened.
+--
+-- `zones` lets a server define boundaries finer than GTA's own named zones --
+-- same box/cylinder/poly shape as Config.Roads.exclusionZones above, but each
+-- one tagged with a `region` key into Config.vehiclesByRegion instead of
+-- being a no-spawn zone. A point that matches none of these falls back to
+-- today's behaviour (GetNameOfZone -> Config.ZoneEnum), so a server that
+-- configures nothing here sees no change at all.
+Config.Jurisdiction = {
+    enabled = true,
+    debug = false,
+
+    -- Example: give the highway patrol its own strip along Route 68 instead
+    -- of it being silently "whichever region the road happens to pass
+    -- through". Disabled by default -- hand-measure with /fenixroads-style
+    -- coordinates before enabling on your server.
+    zones = {
+        -- {
+        --     name = 'Route 68 corridor',
+        --     region = 'sandyShores',
+        --     min = vector3(-200.0, 2000.0, 0.0),
+        --     max = vector3(1800.0, 3200.0, 0.0),
+        --     zMin = -50.0,
+        --     zMax = 200.0,
+        --     enabled = false,
+        -- },
+    },
+
+    -- Units belonging to the outgoing region run through the same
+    -- Retreating/Regrouping states Config.Morale drives (client/morale.lua) --
+    -- "not my jurisdiction anymore" and "we're beaten" both mean "this unit
+    -- stops engaging and heads for its own turf", just with a different radio
+    -- line (FenixPursuit.announceHandoff).
+    handoffRadio = true,
 }
 
 

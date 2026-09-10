@@ -4,6 +4,10 @@
 # See config.local.example.lua for the pattern.
 config.local/
 
+# Local editor/tooling settings. Machine-specific, nobody else needs it.
+.vscode/
+.idea/
+
 # Compiled Lua sources
 luac.out
 

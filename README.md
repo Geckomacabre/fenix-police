@@ -83,6 +83,14 @@ key does something different when you're behind the wheel at a low wanted level.
 The radar trap that clocked you stands its own car down when a stop starts,
 rather than PITting a vehicle that has already pulled over.
 
+### Moving violations
+
+Speeding was never the only thing worth pulling someone over for. Wrong-way
+driving, riding without a helmet, wheelies/stoppies, and using a phone at the
+wheel are now enforced the same way — gated on an ambient officer actually
+witnessing it, feeding the same wanted-level pipeline radar enforcement uses
+rather than a separate system bolted on the side. See `client/violations.lua`.
+
 ### Weighted vehicle selection
 
 `Config.Ambient.vehicles` accepts a `model = weight` map per region as well as
@@ -271,6 +279,67 @@ spawned — road snapping (up to 120 m), a shoulder offset with a 180° heading
 flip, and `GetSafeCoordForPed` (up to 25 m). Points authored through `em_toolkit`
 now carry an `exact` flag and skip all three.
 
+### Backup requests that react to the fight, not just the star count
+
+Dispatch used to answer "how many units" from a flat table indexed by wanted
+level, plus one clock-driven bonus for a pursuit that's been running a while.
+Neither one ever looked at what was actually happening to the units already
+on scene.
+
+An officer going down, an officer taking fire while still alive, and a
+suspect who's visibly armed at a serious wanted level now build up a decaying
+incident score. Enough of it calls in real reinforcements on top of the
+normal cap, with its own forced radio call ("Shots fired, officer down! All
+units respond.") distinct from the plain "still evading" line. See
+`Config.Backup` and `/fenixbackup`.
+
+### Officers who take losses fall back instead of fighting to the last man
+
+Every officer this resource has ever spawned has been set to never flee, and
+a dead officer was simply dropped from tracking and silently replaced at the
+next spawn pass — there was no state between "winning" and "dead." A unit
+that's lost too many officers (or effectively lost them to being badly
+wounded), is down to its last officer facing an armed suspect at a serious
+wanted level, or has been in trouble for a while without it resolving either
+way now breaks off: officers flee or take cover, re-board if their car
+survived, and drive away, sitting out for a configurable regroup period
+before rejoining. One radio call per retreat, not per officer. Ground units
+only — see [Project status](#project-status) for why helicopters and planes
+don't do this yet. `Config.Morale`, `/fenixmorale`.
+
+### Jurisdiction handoff
+
+`Config.vehiclesByRegion` has always meant Los Santos draws LSPD and the
+county draws the Sheriff, but nothing ever reacted to a pursuit actually
+crossing that line — units kept fighting under the old agency's livery
+forever, and the radio never said a word about it. A crossing mid-pursuit now
+hands the outgoing units to the same fall-back-and-regroup behaviour above
+and puts an actual handoff call on the radio. Works entirely off the existing
+region lookup by default; `Config.Jurisdiction.zones` lets you draw a finer
+boundary than GTA's own zones if you want one (a highway corridor split
+between two agencies, for instance) — same shape as `Config.Roads`'s no-go
+zones. `/fenixjurisdiction` reports which region you're currently standing in.
+
+### Cuffed, and put in the back of the car
+
+Both arrest paths in this resource used to stop at hands-up: the player got a
+straight cut to the BUSTED screen, and an NPC pursuit that resolved on its
+own just had the scene blink out of existence. Neither one ever actually put
+anyone in a car.
+
+Getting arrested now runs a short beat first — cuffed hands, nearby officers
+converging, a walk to whichever responding vehicle is closest, into whichever
+rear seat is actually free — before the BUSTED fade and station teleport
+happen exactly as they did before. This is deliberately **not** a scripted
+drive to the station; the fade already reads as "the ride happens
+off-screen," and turning that into a real drive on every single arrest would
+make it a chore rather than a payoff. An ambient NPC pursuit gets the same
+treatment: the suspect is walked to a surviving scene vehicle and put in the
+back seat before the car drives off, instead of the scene just vanishing.
+Both sides can be turned off independently
+(`Config.ArrestSystem.escortToVehicle`, `Config.Ambient.pursuitEscortToVehicle`)
+to go back to the old instant-cut behaviour.
+
 ### Notable fixes
 
 - **`Config.PoliceWantedProtection` never worked.** Two upstream defects stacked:
@@ -292,14 +361,16 @@ now carry an `exact` flag and skip all three.
   watchdog. Fixed with a shared helper that waits for control to actually land
   before deleting.
 
-**Tried and shelved:** a field-revive / hold-the-scene sequence for when a
-player goes down (`Config.Aftermath`). The nearest officer attempts CPR, and
-others hold the scene instead of every unit despawning within a couple of
-ticks. It fought the rest of the pursuit AI through several rounds of fixes
-(a watchdog thread, server-side re-tasking, other units staying hostile) and
-still wasn't behaving correctly, so it ships **disabled**; death goes back to
-instant despawn. Left in the code rather than removed, in case it's worth
-picking back up.
+**Field-revive / hold-the-scene on player down** (`Config.Aftermath`): the
+nearest officer attempts CPR and others hold the scene instead of every unit
+despawning within a couple of ticks. Originally shipped disabled after it
+fought the rest of the pursuit AI through several rounds of fixes (a
+watchdog thread, server-side re-tasking, other units staying hostile) and
+still wasn't behaving correctly. The actual remaining cause turned out to be
+narrower than it looked — helicopter and plane gunners were never stood
+down, only ground officers, so an airborne unit kept fighting straight
+through a revive attempt regardless of what else got fixed — and it now
+ships **enabled** with that closed. See `Config.Aftermath` in `config.lua`.
 
 Full detail in [`FORK-CHANGELOG.md`](FORK-CHANGELOG.md); the earlier patch series
 this builds on is in [`UPSTATE_PATCHES.md`](UPSTATE_PATCHES.md).
@@ -324,7 +395,12 @@ session looks like this:
 3. **Dispatch decides who responds** (`client/client.lua` + `server/server.lua`).
    Units are spawned server side, network IDs handed to the requesting
    client, driving profile and combat aggression scaled by the current
-   wanted level (`Config.Combat`, `Config.Driving`).
+   wanted level (`Config.Combat`, `Config.Driving`). How many units on top of
+   the flat per-wanted-level cap is no longer just a clock
+   (`Config.Reinforcement`) — `client/backup.lua` adds real reinforcements
+   when officers actually go down or take fire, and which agency responds at
+   all can change mid-pursuit if you cross a jurisdiction line
+   (`client/jurisdiction.lua`).
 4. **The pursuit state machine** (`client/pursuit.lua`) tracks what the
    police actually know, separately from the wanted level itself: whether an
    officer currently has line of sight (`contact`), is hunting a last known
@@ -336,11 +412,16 @@ session looks like this:
 5. **Tactics respond to that state.** `client/tactics.lua` drops roadblocks
    and spike strips ahead of a suspect police can currently see. Passengers
    hold fire at a suspect nobody can see rather than shooting through walls
-   at a live coordinate.
-6. **The player escapes, or doesn't.** Change clothes, ditch the marked
-   vehicle, or simply break contact and stay hidden past the giveup window,
-   and the tells and search state both reflect it. `Config.evasionTimes`
-   still governs when the stars themselves come off.
+   at a live coordinate. A unit that's taken real losses or is badly
+   outmatched breaks off instead of fighting to the last officer
+   (`client/morale.lua`), and falls back into the response the same way a
+   fresh unit would once it's had time to regroup.
+6. **The player escapes, gets arrested, or doesn't.** Change clothes, ditch
+   the marked vehicle, or simply break contact and stay hidden past the
+   giveup window, and the tells and search state both reflect it.
+   `Config.evasionTimes` still governs when the stars themselves come off. An
+   arrest now runs a cuffed, escorted beat — into the back of the nearest
+   responding car — before the usual BUSTED fade and station wake-up.
 
 ### Where vice_hud comes in
 
@@ -385,6 +466,21 @@ Honest assessment, because it affects what you should expect:
   carjackings are statically verified but were never observed running.** Timings
   are first guesses: the carjack approach window (25 s), NPC yield delay (15 s)
   and stop dwell (60 s) will all want tuning against real play.
+- **Backup requests, officer morale/retreat, jurisdiction handoff and the
+  arrest-escort beat (both sides) are new and unplayed.** Every touched file
+  passes a plain Lua syntax check and the resource boots cleanly, but none of
+  the four have been run through an actual firefight, a jurisdiction crossing,
+  or an arrest yet. A regrouped unit currently rejoins the fight rather than
+  being despawned and replaced by a fresh one — a deliberate, smaller-than-it-
+  sounds trade-off, not a bug — and the vehicle-escort beat assumes a normal
+  4-seat cruiser layout. See the "Known limitations" section of
+  [`FORK-CHANGELOG.md`](FORK-CHANGELOG.md) (2.7.0) before leaning on any of
+  the four in a real session.
+- **This same push also lands a backlog of older, previously-uncommitted
+  work** — K9 units, foot-chase armor/loadout escalation, ambient scenes
+  promoting into real pursuit units, and the `wasabi_ambulance` →
+  `qbx_medical` migration. See `FORK-CHANGELOG.md`'s 2.6.2 entry for the
+  summary; treat all of it as unplayed until proven otherwise.
 
 If ambient feels too sparse, loosen in this order: `radarFallbackToRoadNodes` →
 `minSceneSpacing` → `maxNearbyCops`.
@@ -692,6 +788,9 @@ Precedence when judging a driver:
 | `/fenixroads` | Draw every no-go zone in `Config.Roads.exclusionZones` as a wireframe box. **The zones are hand-measured — check them this way before trusting them.** |
 | `/fenixroads here` | Report what the road system makes of the ground you are standing on: zone, street name, whether it is excluded, whether a unit could spawn there, and the lane count in each direction |
 | `/fenixtactics` | List live roadblocks and spike strips with distances and entity counts |
+| `/fenixbackup` | Current backup incident score (ground/heli) and how many bonus units it's worth right now |
+| `/fenixmorale` | Units currently retreating/regrouping, their phase, and how long ago they broke off |
+| `/fenixjurisdiction` | The region key (agency) you're currently standing in |
 
 ---
 

@@ -36,6 +36,310 @@ carjacking provenance note below.
 
 ---
 
+## 2.7.0 (2026-09-10): event-driven backup, officer morale/retreat, jurisdiction handoff, arrest escort
+
+`client/backup.lua` (new), `client/morale.lua` (new), `client/jurisdiction.lua`
+(new), `client/pursuit.lua`, `client/client.lua`, `client/ambient.lua`,
+`config.lua`, `fxmanifest.lua`.
+
+Four things that were either flat lookups or didn't exist at all before this
+pass. The goal across all four was the same: keep the response *reactive* to
+what's actually happening instead of reading off a fixed table, without
+turning a pursuit into a chore.
+
+### Added: backup is now a decision, not just a wanted-level lookup
+
+Dispatch used to answer "how many units" purely from `Config.maxUnitsPerLevel`
+(a flat table by star count) plus one duration-based bonus
+(`Config.Reinforcement`, "how long has this pursuit run"). Neither one ever
+looked at what was actually happening to the units already on scene — an
+officer going down and an officer who never took a scratch called in exactly
+the same number of extra cars.
+
+New `client/backup.lua` (`FenixBackup`) scores three things as they happen —
+an officer dying, an officer's health dropping while still alive, a suspect
+who's visibly armed at a serious wanted level — and lets that score decay
+over time rather than clearing instantly, so a unit that just took a loss
+stays "hot" for a while. `FenixBackup.bonusUnits()` turns the score into extra
+ground/heli units on top of what `Config.Reinforcement` already adds, and a
+real incident earns a forced radio call ("Shots fired, officer down! All
+units respond.") distinct from the old "still evading" line. New
+`Config.Backup` block controls the weights, decay window, caps and the radio
+cooldown.
+
+### Added: officers who take losses fall back and regroup instead of fighting to the last man
+
+Every combat ped this resource spawns has always had
+`SetPedFleeAttributes(ped, 0, false)` set — nobody ever flees — and a dead
+officer was simply dropped from the tracking table and silently replaced next
+spawn pass. There was never a state between "winning" and "dead."
+
+New `client/morale.lua` (`FenixMorale`) tracks casualties, wounded officers
+(alive but below a configurable health fraction), and two harder-to-measure
+conditions: a unit down to its last officer facing an armed suspect at a
+serious wanted level ("outnumbered" whether or not shots have actually been
+traded), and a unit that's been in trouble for a while without it resolving
+either way ("suppressed"). Once a unit crosses the configured threshold
+(`Config.Morale`), its officers flee or take cover, re-board their car if it
+survived, and drive off — the unit sits out for `Config.Morale.regroupSeconds`
+before it's handed back to normal tasking. One radio call per retreat ("Unit
+disengaging, requesting relief."), not per officer.
+
+Ground units only. Helicopter and plane crews still feed the backup score
+above (a gunner going down is still a real incident) but don't attempt to
+disengage mid-air — scripting an aircraft actually breaking off and
+returning is a materially different, riskier problem than a ground unit
+driving away, and wasn't attempted here. Roadblock/spike-strip officers
+(`client/tactics.lua`) are untouched on purpose too — they're static
+obstacles with no per-officer task state to retreat out of.
+
+### Added: jurisdiction handoff when a pursuit crosses agency lines
+
+`Config.vehiclesByRegion` + `Config.ZoneEnum` have always mapped GTA's own
+named zones to which agency's cars and peds spawn — Los Santos draws LSPD,
+the county draws the Sheriff. That part worked. What never existed was
+anyone *reacting* to a crossing: drive from the city into the county mid
+pursuit and the units already on scene kept fighting under the old agency's
+livery forever, and nothing on the radio ever acknowledged it.
+
+New `client/jurisdiction.lua` (`FenixJurisdiction`) sits on top of that
+existing lookup rather than replacing it — same `Config.zones` →
+`Config.ZoneEnum` chain client.lua's `spawnPoliceUnitNet` always used, now
+centralised in one place, with an optional finer boundary
+(`Config.Jurisdiction.zones`, same box/cylinder/poly shape as
+`Config.Roads.exclusionZones`) for a server that wants a line drawn somewhere
+GTA's own zones don't put one — a highway corridor split between two
+agencies, for instance. A crossing detected mid-pursuit hands every unit
+belonging to the outgoing region to the same retreat/regroup machinery
+morale uses above (a different reason, the same "stop engaging, head for your
+own turf" behaviour) and fires a radio call. A server that configures no
+custom zones sees no behavioural change at all — it's the same GTA-zone
+lookup as before, just watched for changes instead of only read once per
+spawn.
+
+The two dead locals this replaced inline (`getPlayerZoneCode`,
+`getZoneKey` in `client.lua`) were removed rather than left dangling — nothing
+else called them.
+
+### Added: arrests put the suspect in the back of a car
+
+Both arrest paths in this resource used to stop at the same point: officers
+converge, hands go up, and then the scene either fades to the BUSTED screen
+(player) or just blinks out of existence (an NPC pursuit resolving on its
+own). Nobody ever actually got cuffed and put in a car.
+
+**Player arrest** (`triggerArrest`, `client/client.lua`) now runs a short
+beat between the kneel and the BUSTED fade: `SetEnableHandcuffs` for the
+game's own cuffed walk, up to `Config.ArrestSystem.escortOfficerCount`
+nearby officers converge and stand around the player, then everyone walks to
+the nearest responding vehicle and the player is put in whichever rear seat
+is actually free. The fade and station teleport happen exactly as they did
+before — this doesn't add a scripted drive to the station, which would turn
+every single arrest into a repeated chore rather than a payoff; the fade
+already reads as "the ride happens off-screen," and that's kept. New
+`Config.ArrestSystem.escortToVehicle` (default `true`) reverts to the old
+instant-fade behaviour if turned off.
+
+**Ambient NPC pursuits** (`advancePursuit`'s `arrested` phase,
+`client/ambient.lua`) get the equivalent: once the hands-up tableau has held
+for `pursuitHoldSeconds`, the suspect is walked to the nearest surviving
+scene vehicle and put in the back seat, and only then does the scene release
+and drive off — so the car that pulls away actually looks like it's carrying
+someone, instead of the scene just vanishing. New
+`Config.Ambient.pursuitEscortToVehicle` (default `true`) reverts to the old
+behaviour.
+
+### Config reference — new keys
+
+`Config.Backup`, `Config.Morale`, `Config.Jurisdiction` (all new blocks —
+see their own comments in `config.lua` for every key), plus
+`Config.ArrestSystem.escortToVehicle` / `escortOfficerCount` /
+`escortWalkSpeed` / `escortMaxVehicleDistance` / `escortWalkTimeoutMs`, and
+`Config.Ambient.pursuitEscortToVehicle` / `pursuitEscortSeconds`.
+
+### Commands
+
+| Command | Purpose |
+|---|---|
+| `/fenixbackup` | Current backup incident score (ground/heli) and how many bonus units it's currently worth |
+| `/fenixmorale` | Units currently retreating/regrouping, their phase and how long ago they broke |
+| `/fenixjurisdiction` | The region key the player is currently standing in |
+
+### Known limitations — read this before relying on any of the above in a live session
+
+This pass was written and syntax-checked (`luac -p` against every touched
+file) and the resource was restarted on a live server with a clean boot log,
+but none of the four systems above have been run through an actual firefight,
+border crossing, or arrest yet. Specifically worth watching the first time
+you do:
+
+- **Regrouped units rejoin, they don't get replaced.** A unit that falls back
+  sits out `regroupSeconds` and then simply becomes available to fight again
+  — it does not despawn and get backfilled by a fresh unit the way a genuine
+  casualty-driven relief would. Reaching into the delete/ownership path
+  (`server/guard.lua`'s ticket system) to do that properly was more risk than
+  this pass was willing to take on blind, so a very long, very bad firefight
+  may look like "the same two units keep peeling off and coming back" rather
+  than fresh cars arriving. Not a crash risk, just a smaller effect than the
+  name "regroup and get relief" implies.
+- **The escort-to-vehicle beat assumes a normal 4-seat cruiser.** It checks
+  seat 2 then seat 1 with `IsVehicleSeatFree` and falls back to seat 2
+  outright if neither reads free — on an unusual add-on vehicle, a bike, or a
+  riot van without a normal rear bench, this could try to put someone in a
+  seat that doesn't exist or is already occupied. Worth a look if your
+  vehicle pools include anything non-standard.
+- **The walk to the car has a time budget, not a guaranteed path.**
+  `TaskGoStraightToCoord` doesn't route around obstacles the way a full
+  pathfinding task would. There's a timeout (`escortWalkTimeoutMs`, 6
+  seconds by default; `pursuitEscortSeconds` on the ambient side) so a
+  suspect stuck on a curb or a fence eventually gets boarded from wherever
+  they ended up rather than holding the scene forever, but "wherever they
+  ended up" can look a little off if the path was actually blocked.
+- **Jurisdiction's custom zones ship empty.** Out of the box this rides
+  entirely on the existing GTA-named-zone lookup, exactly as before — the
+  example in `Config.Jurisdiction.zones` is commented out. Nothing changes
+  behaviourally until you hand-measure and enable a zone, same caution as
+  `Config.Roads.exclusionZones` already carries.
+- **Heli/plane crews report incidents but never disengage.** Expect an
+  aircraft to keep fighting even while its own casualty numbers would break
+  a ground unit — that's a deliberate scope cut (see above), not an
+  oversight, but worth knowing before assuming morale applies uniformly.
+
+---
+
+## 2.6.2 (2026-09-09): K9, foot-chase escalation, ambient-to-pursuit promotion, qbx_medical migration
+
+`client/client.lua`, `client/ambient.lua`, `client/roads.lua`,
+`client/tactics.lua`, `client/tracker.lua`, `server/server.lua`,
+`server/guard.lua`, `config.lua`.
+
+This is a batch of work that had built up across several sessions without
+ever getting committed or written up individually — it's landing here as one
+entry rather than a properly detailed one per feature, because going back and
+reconstructing a line-by-line account of someone else's earlier session isn't
+something to fake. What it contains, named plainly:
+
+- **K9 units** (`Config.K9`): a dog can be released against a foot chase at
+  or above a configurable wanted level, tracked per responding vehicle and
+  released again once the wanted level drops back below it. Client-local
+  (not networked), so cleanup is a plain `DeleteEntity` rather than the
+  network-control dance every other officer needs.
+- **Foot-chase escalation** (`Config.FootChase`): resisting a foot chase for
+  long enough — measured as damage dealt to officers actively chasing on
+  foot — steps committing officers up through armor/loadout tiers, up to and
+  including a riot shield prop attached to an officer's hand bone at the
+  top tier. Resistance decays over time if you stop fighting back.
+- **Ambient-to-pursuit promotion**: a patrol or convoy scene the ambient
+  layer already spawned (client-local, non-networked, no record in
+  `server/guard.lua`) is now networked in place and handed a real pursuit
+  ticket the moment a wanted level appears nearby, instead of being deleted
+  and replaced by a freshly spawned unit. `server/guard.lua`'s vehicle/ped
+  allowlist was extended to include the ambient system's own model pools so
+  a promoted unit's later delete/rearm calls don't get silently refused.
+- **wasabi_ambulance → qbx_medical migration**: the field-revive path
+  (aftermath) and the death screen both moved off `wasabi_ambulance` onto
+  `qbx_medical`/`qbx_ambulancejob`. The BUSTED-style WASTED screen now fires
+  on `qbx_medical:client:onPlayerDied` — confirmed against that resource's
+  own source to fire only on a truly final death, never a revivable
+  last-stand — and deliberately doesn't freeze position, disable controls,
+  or teleport, since `qbx_medical` already owns all of that; it only adds
+  the camera pull-back, red wash and word on top.
+- **`qbx_honor` hook**: paying a ticket instead of running or fighting now
+  calls `qbx_honor`'s `complied_with_police` hook if that resource is
+  running (`pcall`-guarded, no hard dependency).
+- **Reinforcement wiring actually landed**: `Config.Reinforcement` and the
+  changelog entry describing it existed since 2.6.0, but the code reading it
+  — `pursuitElapsedMs()`, `reinforcementBonus()`, `announceReinforcement()`
+  — had never actually been committed until now. If you were wondering why
+  sustained-contact reinforcement didn't seem to do anything, this is why.
+- **A third contributor to the `CNetworkRoadNodeWorldStateData` pool
+  exhaustion** (see 2.6.1's other two): the airside road-suppression call in
+  `client/roads.lua` was re-issued on a repeating timer under the mistaken
+  assumption that node state resets when a region streams back in — it
+  doesn't, the engine remembers the change and reapplies it on its own. Now
+  called once and left alone, and kept local rather than broadcast to the
+  session (the broadcast flag is what actually spends the pool's 20 slots).
+- **A crash fix in `client/tracker.lua`**: `ox_target`'s global vehicle scan
+  calls `FenixTracker.hasTracker` against every vehicle in range, every tick,
+  including one being torn down in that exact frame — confirmed live,
+  `GetEntityModel` threw inside the streaming engine itself. Wrapped in
+  `pcall`. Also scoped the GPS-tracker-removal prompt to third-eye-only, so
+  it stopped showing as an always-on prompt just walking past any tracked
+  vehicle.
+- Small tuning: `Config.Driving.aggression` pulled back a tier at every
+  wanted level, `client/tactics.lua` roadblocks/spikes can now unlock early
+  on a long-running pursuit even below their normal wanted-level gate
+  (`durationFallbackMs`).
+
+None of this has a dedicated "what might be broken" writeup the way 2.7.0
+below does, for the same reason it doesn't have per-feature detail — it
+wasn't written this session and hasn't been re-verified beyond a syntax
+check and a clean resource boot. Treat K9, foot-chase escalation, and ambient
+promotion as **unplayed** until proven otherwise, the same caveat 2.0.0's
+carjackings and stops originally shipped with.
+
+---
+
+## 2.6.1 (2026-09-03): moving violations, aftermath re-enabled, pool-exhaustion fixes
+
+`client/violations.lua` (new), `client/client.lua`, `client/ambient.lua`,
+`config.lua`.
+
+### Added: moving violations feed the same wanted-level pipeline as radar
+
+Wrong-way driving, riding without a helmet, wheelies/stoppies and phone use
+at the wheel are now enforced the same way speeding already was — gated on an
+ambient officer actually witnessing it, through the same `ApplyWantedLevel`
+pipeline radar enforcement uses rather than a separate parallel system.
+
+### Fixed: `Config.Aftermath` re-enabled
+
+Shipped disabled in 2.6.0 after it wouldn't behave correctly. Root cause
+turned out to be narrower than it looked: `beginAftermath()` only ever stood
+down GROUND officers, leaving helicopter and plane gunners still mid a
+previously-issued `TaskCombatPed` — a "last stand" player isn't
+`IsEntityDead` at the native level, so an airborne unit had no signal telling
+it to stop and kept strafing straight through a field-revive attempt no
+matter what else got fixed on the ground side. Also now calls
+`exports['ps-dispatch']:InjuriedPerson()` directly instead of relying on
+ps-dispatch's own automatic down-alert, which never fires against
+wasabi_ambulance's soft last-stand — confirmed by reading that EMS resource's
+own source, which never calls `SetMetaData` for `isdead`/`inlaststand`
+anywhere.
+
+### Fixed: two more contributors to `CNetworkRoadNodeWorldStateData` pool exhaustion
+
+`radarTick()` was calling `GetClosestVehicleNodeWithHeading` every tick
+regardless of whether the player was even outdoors; it now skips entirely
+while indoors. Ground pursuit units' `TaskVehicleDriveToCoord` re-issue is
+now throttled to fire only once the target has moved more than 15 m since
+the last issuance, instead of unconditionally every tick. (The dominant
+cause of the pool errors was actually `um_density`'s population multipliers,
+fixed separately and outside this resource.)
+
+### Changed: pulled back pursuit aggression, fixed a status line
+
+`Config.Driving.aggression` pulled back a full tier across every wanted level
+after a live pursuit test showed a near-instant point-blank box-in at 3
+stars. `/ambientpolice status` now actually counts `em_toolkit` points
+instead of printing 1-or-0 regardless of how many exist.
+
+### Fixed: a stale QBCore reference after a qbx_core restart could crash the client
+
+`QBCore = exports['qb-core']:GetCoreObject()` was only ever fetched once, at
+script start. `qbx_core` declares `provide 'qb-core'`, so that export
+resolves there transparently — but restarting `qbx_core` for any reason
+invalidates every reference already held to it, and this resource never
+re-fetched. Confirmed from an actual client crash log: once `qbx_core`
+restarted, every later call into the stale object threw "Execution of
+function reference in script host failed" on every single main-loop tick,
+forever, stacking on top of unrelated `CNetworkRoadNodeWorldStateData` pool
+errors until the connection timed out and the client crashed. Now listens
+for `onClientResourceStart` on `qb-core`/`qbx_core` and re-fetches, so a
+future restart heals on its own.
+
+---
+
 ## 2.6.0 (2026-09-01): softer radar stops, search giveup, aftermath tried and disabled
 
 `client/client.lua`, `client/pursuit.lua`, `client/combat_bridge.lua` (new),

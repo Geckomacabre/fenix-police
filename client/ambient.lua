@@ -336,6 +336,17 @@ local function destroyScene(scene)
     dbg(('destroyed %s scene #%d'):format(scene.kind, scene.id))
 end
 
+--- Drops a scene's bookkeeping WITHOUT touching its entities — used when
+--- PromoteAmbientUnit (client.lua) has just taken over ownership of them as a
+--- real pursuit unit. Unlike destroyScene, nothing here is deleted or handed
+--- to the population manager; client.lua's spawnedVehicles now owns them and
+--- will clean them up itself the same way it cleans up any other unit.
+local function handOffScene(scene)
+    if scene.pointKey then claimedPoints[scene.pointKey] = nil end
+    scenes[scene.id] = nil
+    dbg(('handed off %s scene #%d to the pursuit system'):format(scene.kind, scene.id))
+end
+
 local function destroyAllScenes()
     for _, scene in pairs(scenes) do destroyScene(scene) end
     scenes = {}
@@ -931,10 +942,64 @@ local function advancePursuit(scene)
 
     elseif p.phase == 'arrested' then
         if elapsed < (cfg().pursuitHoldSeconds or 20) * 1000 then return end
-        -- Let the tableau sit, then release everyone back to the world.
+
+        -- Used to tear the whole scene down straight from the hands-up
+        -- tableau -- the suspect just stood there until the scene blinked out
+        -- of existence. This walks them to the nearest cop car and puts them
+        -- in the back seat first, so the car (with its new passenger) drives
+        -- off looking like a real transport once releaseOnTeardown lets it go.
+        if cfg().pursuitEscortToVehicle ~= false then
+            local copVeh
+            for i = 2, #scene.vehicles do -- index 1 is the suspect's own vehicle
+                local v = scene.vehicles[i]
+                if v and DoesEntityExist(v) and not IsEntityDead(v) then
+                    copVeh = v
+                    break
+                end
+            end
+
+            if copVeh then
+                p.phase, p.since = 'escorting', now
+                p.escortVehicle = copVeh
+                ClearPedTasks(p.suspect)
+                local vc = GetEntityCoords(copVeh)
+                TaskGoStraightToCoord(p.suspect, vc.x, vc.y, vc.z, 1.0, -1, GetEntityHeading(copVeh), 1.0)
+                return
+            end
+        end
+
+        -- No escort configured, or no cop car survived the pursuit to put
+        -- them in -- release the tableau exactly as before.
         scene.releaseOnTeardown = true
         scene.expiresAt = now
         scene.pursuit = nil
+
+    elseif p.phase == 'escorting' then
+        local copVeh = p.escortVehicle
+        if not DoesEntityExist(p.suspect) or not copVeh or not DoesEntityExist(copVeh) then
+            scene.releaseOnTeardown = true
+            scene.expiresAt = now
+            scene.pursuit = nil
+            return
+        end
+
+        local vc = GetEntityCoords(copVeh)
+        -- Time budget as well as distance -- a suspect who gets stuck on
+        -- scenery shouldn't hold the scene open forever.
+        if #(GetEntityCoords(p.suspect) - vc) < 3.0
+            or elapsed > (cfg().pursuitEscortSeconds or 6) * 1000 then
+            local seat = IsVehicleSeatFree(copVeh, 2) and 2
+                or (IsVehicleSeatFree(copVeh, 1) and 1) or 2
+            TaskEnterVehicle(p.suspect, copVeh, 5000, seat, 1.0, 1, 0)
+            p.phase, p.since = 'boarding', now
+        end
+
+    elseif p.phase == 'boarding' then
+        if not DoesEntityExist(p.suspect) or IsPedInAnyVehicle(p.suspect, false) or elapsed > 6000 then
+            scene.releaseOnTeardown = true
+            scene.expiresAt = now
+            scene.pursuit = nil
+        end
     end
 end
 
@@ -1712,10 +1777,84 @@ local function cullScenes(playerCoords)
     return nearbyCops
 end
 
+--- A scene's reference position for distance checks — its lead vehicle if
+--- it's still around and alive, otherwise its original anchor. Mirrors
+--- cullScenes' own `reference` above; pulled out so tryPromoteScene below can
+--- use the exact same notion of "where this scene actually is" without
+--- duplicating cullScenes' whole walk.
+local function sceneReference(scene)
+    local lead = scene.vehicles[1]
+    if lead and DoesEntityExist(lead) then return GetEntityCoords(lead) end
+    return scene.anchor
+end
+
+--- Attempts to fold one ambient scene into the pursuit system in place of
+--- despawning it (PromoteAmbientUnit, client.lua). Only patrol/convoy scenes
+--- qualify — a cop already driving around, the thing the player actually
+--- means by "cops that are already patrolling". Radar traps, static posts and
+--- traffic stops are left to the normal despawn path: they're either parked
+--- (no chase to join) or already mid-interaction with someone else.
+---@return integer promotedCount — 0 means the scene wasn't touched and
+--- should fall through to the normal despawn; a convoy can promote more than
+--- one vehicle in a single call, which the caller counts against its
+--- per-onset cap rather than treating the whole scene as "one". Whenever this
+--- returns > 0, every entity in the scene has already been either promoted or
+--- deleted — the caller can hand the bookkeeping off (handOffScene) without
+--- touching entities itself, same as it would after a clean promotion.
+local function tryPromoteScene(scene)
+    if scene.kind ~= 'patrol' and scene.kind ~= 'convoy' then return 0 end
+    if scene.stop or scene.carjack or scene.pursuit then return 0 end
+
+    local promotedCount = 0
+    local promotedPeds = {} -- ped entity -> true, so the leftover sweep below skips them
+    for _, veh in ipairs(scene.vehicles) do
+        if DoesEntityExist(veh) then
+            local driver = GetPedInVehicleSeat(veh, -1)
+            local promoted = false
+            if driver and driver ~= 0 and DoesEntityExist(driver) then
+                local passengers = {}
+                local seats = GetVehicleModelNumberOfSeats(GetEntityModel(veh)) or 2
+                for seat = 0, seats - 2 do
+                    local p = GetPedInVehicleSeat(veh, seat)
+                    if p and p ~= 0 and DoesEntityExist(p) then passengers[#passengers + 1] = p end
+                end
+                if PromoteAmbientUnit(veh, driver, passengers) then
+                    promoted = true
+                    promotedCount = promotedCount + 1
+                    promotedPeds[driver] = true
+                    for _, p in ipairs(passengers) do promotedPeds[p] = true end
+                end
+            end
+            -- Couldn't promote this one (no reachable driver, or the network
+            -- handshake failed) — delete it now rather than leaving a car this
+            -- scene no longer tracks and spawnedVehicles never claimed.
+            if not promoted then DeleteEntity(veh) end
+        end
+    end
+
+    -- Any ped tracked by this scene that didn't end up promoted (the vehicle
+    -- it was riding in failed above, or it was never seated at all) still
+    -- needs cleaning up here, for the same reason.
+    for _, ped in ipairs(scene.peds) do
+        if DoesEntityExist(ped) and not promotedPeds[ped] then
+            DeleteEntity(ped)
+        end
+    end
+
+    return promotedCount
+end
+
 CreateThread(function()
     -- Let config.lua, the points file and the rest of the resource settle.
     Wait(4000)
     refreshToolkitPoints()
+
+    -- Promotion is capped per wanted-level *onset*, not per tick — otherwise
+    -- every 1s pass through a still-wanted player would keep trying to
+    -- promote the same handful of leftover scenes. wasWanted is the rising-
+    -- edge detector; promotedThisOnset resets on it.
+    local wasWanted = false
+    local promotedThisOnset = 0
 
     while true do
         Wait(1000)
@@ -1750,11 +1889,42 @@ CreateThread(function()
             -- Stay entirely out of the pursuit system's way — except for a trap
             -- that started this pursuit itself. Wiping the car mid-catch leaves a
             -- chase with no visible origin, which reads as a bug to the player.
+            --
+            -- [Upstate Mafia] Before despawning, try to hand nearby patrol/convoy
+            -- scenes off to the pursuit system instead (tryPromoteScene /
+            -- PromoteAmbientUnit, client.lua) — the same cop that was already
+            -- driving around turns and joins the chase, rather than vanishing
+            -- and being replaced by a freshly spawned one. Capped by
+            -- maxPromotedPerOnset and promoteRadius so a wanted level doesn't
+            -- instantly deputise every patrol on the map.
             if cfg().despawnWhenWanted and GetPlayerWantedLevel(PlayerId()) > 0 then
+                if not wasWanted then
+                    wasWanted = true
+                    promotedThisOnset = 0
+                end
+
+                local promoteOn = cfg().promoteOnWanted ~= false
+                local promoteRadius = cfg().promoteRadius or 100.0
+                local maxPromoted = cfg().maxPromotedPerOnset or 2
+
                 for _, scene in pairs(scenes) do
-                    if not scene.enforcing then destroyScene(scene) end
+                    if not scene.enforcing then
+                        local eligible = promoteOn
+                            and promotedThisOnset < maxPromoted
+                            and #(sceneReference(scene) - playerCoords) <= promoteRadius
+
+                        local promotedCount = eligible and tryPromoteScene(scene) or 0
+                        if promotedCount > 0 then
+                            promotedThisOnset = promotedThisOnset + promotedCount
+                            handOffScene(scene)
+                        else
+                            destroyScene(scene)
+                        end
+                    end
                 end
                 return
+            else
+                wasWanted = false
             end
 
             local now = GetGameTimer()

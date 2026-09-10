@@ -3,7 +3,7 @@ resource_manifest_version "05cfa83c-a124-4cfa-a768-c24a5811d8f9"
 game "gta5"
 author "Fenix, fork by Upstate Mafia"
 description "AI police dispatch and wanted levels, with ambient enforcement"
-version "2.6.0"
+version "2.7.0"
 
 shared_scripts {
     -- Needed by client/tracker.lua (lib.notify, lib.progressCircle). Nothing
@@ -43,6 +43,14 @@ client_scripts {
 
     -- Roadblocks and spike strips. Reads both of the modules above.
     'client/tactics.lua',
+
+    -- Event-driven backup escalation, officer morale/retreat, and jurisdiction
+    -- handoff. Each is self-contained (own cfg()/dbg(), own driver thread) and
+    -- loaded before client.lua, which calls into all three FenixBackup /
+    -- FenixMorale / FenixJurisdiction globals from its per-officer loops.
+    'client/backup.lua',
+    'client/morale.lua',
+    'client/jurisdiction.lua',
 
     'client/client.lua',
     'client/ambient.lua',

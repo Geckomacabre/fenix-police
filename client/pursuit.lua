@@ -54,6 +54,7 @@ local contact = {
     lostAt       = 0,          -- game timer when contact broke, 0 while held
     gaveUp       = false,      -- search called off after Config.Pursuit.giveUpAfterMs, see isSearching()
     everSeen     = false,      -- suppresses "lost the suspect" before first sight
+    firstContactAt = 0,        -- game timer of the FIRST sighting this pursuit, see FenixPursuit.pursuitElapsedMs()
     vehicleDesc  = nil,        -- cached description of the car they were last in
 
     -- What dispatch broadcast when the crime was called in — see callItIn().
@@ -401,6 +402,18 @@ function FenixPursuit.secondsSinceSeen()
     return (GetGameTimer() - contact.lastSeenAt) / 1000.0
 end
 
+--- Milliseconds since a cop FIRST laid eyes on the player this pursuit, or 0
+--- before that has ever happened. Keeps counting through a lost-contact
+--- search rather than resetting -- dispatch doesn't forget the incident is
+--- live just because nobody currently has eyes on you, and this is what
+--- client.lua's reinforcement escalation (Config.Reinforcement) reads to
+--- decide how many extra units the longer a suspect stays out are worth
+--- sending. Reset to 0 by FenixPursuit.reset() when the wanted level clears.
+function FenixPursuit.pursuitElapsedMs()
+    if not contact.everSeen or contact.firstContactAt == 0 then return 0 end
+    return GetGameTimer() - contact.firstContactAt
+end
+
 --- Should this unit's siren be running? Units go quiet on a search: a siren is
 --- how you tell a street you are coming, and a unit that has lost the suspect
 --- wants to hear, not announce. Lights stay on throughout. Also quiet once
@@ -453,6 +466,7 @@ function FenixPursuit.reset()
     contact.lostAt       = 0
     contact.gaveUp       = false
     contact.everSeen     = false
+    contact.firstContactAt = 0
     contact.vehicleDesc  = nil
     contact.outfitSig    = nil
     contact.vehicleModel = nil
@@ -499,6 +513,57 @@ function FenixPursuit.callItIn(wantedLevel)
     if where then table.insert(parts, 'on ' .. where) end
 
     dispatch(table.concat(parts, ' ') .. '.', true)
+end
+
+--- Radio call for a reinforcement escalation -- see Config.Reinforcement and
+--- client.lua's reinforcementBonus(): the longer a spotted suspect stays out,
+--- the more units get added on top of the wanted level's normal cap. Forced
+--- (bypasses the normal dispatch cooldown) because this only fires a handful
+--- of times per pursuit at most, capped by Config.Reinforcement.maxBonusUnits
+--- -- it should always be heard, not swallowed by whatever else is on the
+--- radio that second.
+function FenixPursuit.announceReinforcement(totalBonusUnits)
+    if cfg().enabled == false then return end
+    dispatch(('Suspect still evading, additional units responding (%d).')
+        :format(totalBonusUnits), true)
+end
+
+--- Radio call the moment a K9 unit is released against a foot chase (see
+--- Config.K9 / client.lua's spawnK9). Forced for the same reason
+--- announceReinforcement is -- a rare, specific escalation that should always
+--- be heard over whatever else is on the radio that second.
+function FenixPursuit.announceK9()
+    if cfg().enabled == false then return end
+    dispatch('K9 unit deployed, suspect on foot.', true)
+end
+
+--- Radio call for a genuine incident-driven escalation — see
+--- client/backup.lua's FenixBackup, which decides WHEN this is warranted
+--- (officer down, officer taking fire, an armed suspect) as opposed to
+--- announceReinforcement's plain "still evading, been a while" clock. Forced
+--- for the same reason the other escalations here are: rare, and should
+--- always cut through whatever else is on the radio that second.
+function FenixPursuit.announceBackupRequest()
+    if cfg().enabled == false then return end
+    dispatch('Shots fired, officer down! All units respond.', true)
+end
+
+--- Radio call for a unit disengaging — see client/morale.lua's FenixMorale,
+--- which decides when a unit has taken enough losses or is badly enough
+--- outnumbered to fall back and regroup instead of fighting to the last
+--- officer. One call per retreat, not per officer.
+function FenixPursuit.announceRetreat()
+    if cfg().enabled == false then return end
+    dispatch('Unit disengaging, requesting relief.', true)
+end
+
+--- Radio call for a jurisdiction handoff — see client/jurisdiction.lua's
+--- FenixJurisdiction, which detects the player crossing from one agency's
+--- ground into another's mid-pursuit.
+function FenixPursuit.announceHandoff(fromRegion, toRegion)
+    if cfg().enabled == false then return end
+    dispatch(('Suspect crossing into %s — responding units, expect a jurisdiction handoff.')
+        :format(tostring(toRegion or 'a neighbouring jurisdiction')), true)
 end
 
 -------------------------------------------------------------------------------
@@ -572,6 +637,7 @@ CreateThread(function()
                     local firstEver = not contact.everSeen
                     contact.active = true
                     contact.everSeen = true
+                    if firstEver then contact.firstContactAt = now end
                     contact.lostAt = 0
                     contact.gaveUp = false
 
@@ -652,6 +718,7 @@ exports('IsSearching', FenixPursuit.isSearching)
 exports('HasContact', FenixPursuit.hasContact)
 exports('HasGivenUp', FenixPursuit.hasGivenUp)
 exports('SearchRadius', FenixPursuit.searchRadius)
+exports('PursuitElapsedMs', FenixPursuit.pursuitElapsedMs)
 
 -- { outfit, vehicle, voice } -- which parts of dispatch's description of the
 -- player are still accurate right now. See FenixPursuit.tells() above; this
