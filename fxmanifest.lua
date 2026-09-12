@@ -33,6 +33,10 @@ client_scripts {
     -- into the FenixRoads global it defines.
     'client/roads.lua',
 
+    -- Agency livery + installed-model fallback for add-on cruisers. Loaded
+    -- before every spawner (tactics/client/ambient) that calls FenixLivery.
+    'client/livery.lua',
+
     -- GPS tracker model. Loaded before pursuit.lua, whose contact thread
     -- calls into the FenixTracker global this defines.
     'client/tracker.lua',
@@ -55,10 +59,9 @@ client_scripts {
     'client/client.lua',
     'client/ambient.lua',
 
-    -- Moving violations (wrong-way, no helmet, wheelie, phone use). Loaded
-    -- last: reads the FenixRoads global from roads.lua, ApplyWantedLevel from
-    -- client.lua, and calls exports('fenix-police'):IsWitnessed, added in
-    -- ambient.lua.
+    -- Moving violations (no helmet, wheelie, phone use). Loaded last: reads
+    -- ApplyWantedLevel from client.lua and calls
+    -- exports('fenix-police'):IsWitnessed, added in ambient.lua.
     'client/violations.lua'
 }
 

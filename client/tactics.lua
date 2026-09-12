@@ -98,6 +98,7 @@ end
 
 local function createVehicle(place, modelName, x, y, z, heading)
     if not modelName then return nil end
+    modelName = FenixLivery.resolveModel(modelName, vector3(x, y, z))
     local hash = GetHashKey(modelName)
     if not loadModel(hash) then return nil end
 
@@ -107,6 +108,7 @@ local function createVehicle(place, modelName, x, y, z, heading)
 
     SetEntityAsMissionEntity(veh, true, true)
     SetVehicleOnGroundProperly(veh)
+    FenixLivery.apply(veh)
     SetVehicleDoorsLocked(veh, 2)
     SetVehicleEngineOn(veh, true, true, false)
     -- Lights and bar on, siren silent. A roadblock is announcing a closed road,

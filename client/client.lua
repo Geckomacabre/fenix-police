@@ -146,15 +146,20 @@ local isPullingOver   = false
 local isBeingTicketed = false
 local ticketWrapUp    = false
 
--- [Upstate Mafia] Global K9 trigger state. Separate from vehicleData.k9 (the
--- per-unit dog handleK9Backup can still release from an officer already
--- foot-chasing) -- this one isn't tied to any unit having actually caught up
--- yet, so a dog can show up the moment the wanted level rises rather than
--- waiting on a car to arrive and close the exit distance. See
--- releaseGlobalK9/spawnGlobalK9/watchForGlobalK9Trigger further down.
-local activeGlobalK9 = nil
-local globalK9CooldownUntil = 0
-local lastWantedLevelForK9 = 0
+-- [Upstate Mafia] The one K9 currently out, if any. Tracked here rather than
+-- on its unit's vehicleData because a unit can drop out of spawnedVehicles
+-- while its dog is still on the ground (last officer lost, foot chaser gave
+-- up), and a dog tracked only there would be orphaned in the world. See the
+-- K9 UNITS section further down.
+--   { ped, vehNetID, handler, state = 'Attack'|'Return', returnUntil, returnTarget }
+local activeK9 = nil
+local k9CooldownUntil = 0
+
+-- [Upstate Mafia] Response pacing (Config.Response): when the current wanted
+-- episode began, and when the last ground unit was dispatched. Both cleared
+-- the moment the wanted level drops back to zero.
+local responseStartedAt = nil
+local lastGroundDispatchAt = nil
 
 
 -- [Upstate Mafia patch] Forward declaration. isPlayerPoliceOfficer is defined
@@ -270,11 +275,18 @@ end)
 -- offshore or somewhere with no real road in range, and spawning anyway is the
 -- behaviour being removed.
 local function getSafeSpawnPoint(playerCoords, minDistance, maxDistance, playerForward)
+    -- [Upstate Mafia] Never inside the player's view on the first two passes
+    -- (Config.Response.avoidVisibleSpawns) -- a cruiser popping into existence
+    -- on screen is the "out of nowhere" moment. The last-resort pass below
+    -- still allows it: a response that never arrives is worse.
+    local avoidVisible = (Config.Response or {}).avoidVisibleSpawns ~= false
+
     local pos, heading = FenixRoads.findSpawnPoint(playerCoords, {
         minDistance  = minDistance,
         maxDistance  = maxDistance,
         behindVector = playerForward,
         towards      = playerCoords,
+        avoidVisible = avoidVisible,
     })
     if pos then return pos, heading end
 
@@ -285,6 +297,7 @@ local function getSafeSpawnPoint(playerCoords, minDistance, maxDistance, playerF
         maxDistance  = maxDistance * 1.75,
         behindVector = playerForward,
         towards      = playerCoords,
+        avoidVisible = avoidVisible,
     })
     if pos then return pos, heading end
 
@@ -850,8 +863,14 @@ local function spawnPoliceUnitNet(wantedLevel)
         print(('[FENIX-SPAWN] region=%s'):format(tostring(regionCode)))
     end
 
-    -- Get a safe spawn point
-    local spawnPoint, spawnHeading = getSafeSpawnPoint(playerCoords, Config.minPoliceSpawnDistance, Config.maxPoliceSpawnDistance, GetEntityForwardVector(playerPed))
+    -- Get a safe spawn point. [Upstate Mafia] Config.Response.spawnDistance
+    -- pushes low-level responses further out, so a 1-star unit is driving in
+    -- from a few blocks away rather than materialising round the corner.
+    local response = Config.Response or {}
+    local band = response.enabled ~= false and (response.spawnDistance or {})[wantedLevel] or nil
+    local minDistance = band and band[1] or Config.minPoliceSpawnDistance
+    local maxDistance = band and band[2] or Config.maxPoliceSpawnDistance
+    local spawnPoint, spawnHeading = getSafeSpawnPoint(playerCoords, minDistance, maxDistance, GetEntityForwardVector(playerPed))
     if not spawnPoint then
         -- Not an error. There is genuinely nowhere legal to put a car when the
         -- player is on a runway, out at sea or deep in the hills, and the whole
@@ -1073,17 +1092,20 @@ AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedM
         return
     end
     local playerPed = PlayerPedId()
-    local vehicleHash = GetHashKey(vehicleInfo.model)
+    -- [Upstate Mafia] Stock cruiser instead of no unit at all if an add-on
+    -- pack isn't loaded on this client -- see client/livery.lua.
+    local modelName = FenixLivery.resolveModel(vehicleInfo.model, spawnPoint, vehicleInfo.fallback)
+    local vehicleHash = GetHashKey(modelName)
 
     if not requestModelLoaded(vehicleHash) then
-        print(('[FENIX-SPAWN] failed to load vehicle model %s'):format(tostring(vehicleInfo.model)))
+        print(('[FENIX-SPAWN] failed to load vehicle model %s'):format(tostring(modelName)))
         if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
         return
     end
 
     local vehicle = CreateVehicle(vehicleHash, spawnPoint.x, spawnPoint.y, spawnPoint.z, spawnHeading or 0.0, true, true)
     if not DoesEntityExist(vehicle) then
-        print(('[FENIX-SPAWN] failed to create vehicle %s client-side'):format(tostring(vehicleInfo.model)))
+        print(('[FENIX-SPAWN] failed to create vehicle %s client-side'):format(tostring(modelName)))
         if pendingGroundSpawns > 0 then pendingGroundSpawns = pendingGroundSpawns - 1 end
         return
     end
@@ -1093,6 +1115,7 @@ AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedM
     SetVehicleOnGroundProperly(vehicle)
     SetVehicleSiren(vehicle, true)
     SetSirenKeepOn(vehicle, true)
+    FenixLivery.apply(vehicle, vehicleInfo.livery, vehicleInfo.unmarked)
 
     local vehNetID = VehToNet(vehicle)
     NetworkSetNetworkIdDynamic(vehNetID, false)
@@ -1163,7 +1186,7 @@ AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedM
     local driver = GetPedInVehicleSeat(vehicle, -1)
     if not DoesEntityExist(driver) or driver == 0 then
         if Config.isDebug then
-            print(('[FENIX-SPAWN] deleting driverless client police vehicle %s'):format(tostring(vehicleInfo.model)))
+            print(('[FENIX-SPAWN] deleting driverless client police vehicle %s'):format(tostring(modelName)))
         end
         for _, pedNetID in ipairs(officers) do
             local ped = NetToPed(pedNetID)
@@ -1495,9 +1518,39 @@ local function maybeAnnounceReinforcement(groundBonus)
 end
 
 -- Function to maintain the desired number of police units
+--- [Upstate Mafia] Whether dispatch has had time to "get there" yet for the
+--- current wanted episode (Config.Response.initialDelay). Skipped outright
+--- when the player opens fire, or when an officer already has eyes on them --
+--- the delay stands for a unit driving in from elsewhere after a call-in, not
+--- for police who watched it happen.
+local function responseReady(wantedLevel)
+    local r = Config.Response or {}
+    if r.enabled == false then return true end
+
+    local now = GetGameTimer()
+    responseStartedAt = responseStartedAt or now
+
+    if r.skipDelayWhenShooting ~= false and playerHasShot then return true end
+    if r.skipDelayOnContact ~= false and FenixPursuit and FenixPursuit.hasContact() then return true end
+
+    local delay = ((r.initialDelay or {})[wantedLevel] or 0) * 1000
+    return (now - responseStartedAt) >= delay
+end
+
+--- [Upstate Mafia] Whether enough time has passed since the last ground unit
+--- to send the next one (Config.Response.unitInterval) -- units arrive one by
+--- one instead of the whole allowance appearing in the same second.
+local function groundDispatchDue(wantedLevel)
+    local r = Config.Response or {}
+    if r.enabled == false or not lastGroundDispatchAt then return true end
+    local interval = ((r.unitInterval or {})[wantedLevel] or 0) * 1000
+    return (GetGameTimer() - lastGroundDispatchAt) >= interval
+end
+
 local function maintainPoliceUnits(wantedLevel)
     local playerPed = PlayerPedId()
     local playerVeh = GetVehiclePedIsIn(playerPed, false)
+    local ready = responseReady(wantedLevel)
 
     -- Jurisdiction crossing check -- once per pass, same cadence this
     -- function already runs at. A non-nil return means units currently on
@@ -1567,9 +1620,13 @@ local function maintainPoliceUnits(wantedLevel)
         --if Config.isDebug then print('currentUnits = ' ..currentUnits.. ' and maxUnits = ' ..maxUnits .. ' and isSpawning = ' .. tostring(isSpawning)) end
 
         -- Spawn additional units if needed, allowing up to MAX_CONCURRENT_SPAWNS requests in flight at once.
-        while currentUnits < maxUnits and pendingGroundSpawns < MAX_CONCURRENT_SPAWNS do
+        -- [Upstate Mafia] Gated on Config.Response: nothing until the initial
+        -- delay has run, then one unit per unitInterval.
+        while ready and currentUnits < maxUnits and pendingGroundSpawns < MAX_CONCURRENT_SPAWNS
+            and groundDispatchDue(wantedLevel) do
             pendingGroundSpawns = pendingGroundSpawns + 1
             spawnPoliceUnitNet(wantedLevel)
+            lastGroundDispatchAt = GetGameTimer()
             currentUnits = currentUnits + 1
         end
     end
@@ -1601,7 +1658,7 @@ local function maintainPoliceUnits(wantedLevel)
 
         --if Config.isDebug then print('currentHeliUnits = ' ..currentHeliUnits.. ' and maxHeliUnits = ' ..maxHeliUnits .. ' and isSpawning = ' .. tostring(isSpawning)) end
         -- Spawn additional units if needed
-        while currentHeliUnits < maxHeliUnits and pendingHeliSpawns < MAX_CONCURRENT_SPAWNS do
+        while ready and currentHeliUnits < maxHeliUnits and pendingHeliSpawns < MAX_CONCURRENT_SPAWNS do
             pendingHeliSpawns = pendingHeliSpawns + 1
             spawnHeliUnitNet(wantedLevel, heliSpawnTable)
             currentHeliUnits = currentHeliUnits + 1
@@ -1652,13 +1709,19 @@ end
 
 
 
--- Driving-style bitfields, named because "6" and "262571" appear in enough
--- places to be worth reading.
---   PURSUIT  4 (avoid vehicles) + 2 (stop before peds). No traffic-light bit, so
---            units run reds, and no wrong-way bit, so they stay on their side.
+-- Driving-style bitfields, named because "46" and "262571" appear in enough
+-- places to be worth reading. Bit values confirmed against GTA's own
+-- eDriveBehaviorFlags enum.
+--   PURSUIT  4 (swerve around all cars) + 2 (stop for peds) + 8 (steer around
+--            stationary cars) + 32 (steer around objects). No traffic-light
+--            bit, so units run reds, and no wrong-way bit, so they stay on
+--            their side -- but they now dodge parked cars and street
+--            furniture instead of driving straight through them, which read
+--            as careless rather than urgent. Was plain 6 (swerve + stop-for-
+--            peds only) before this.
 --   SEARCH   the normal-driving field: obey lights, keep to the road. A unit
 --            sweeping for a suspect it cannot see is not running reds to do it.
-local DRIVING_STYLE_PURSUIT = 6
+local DRIVING_STYLE_PURSUIT = 46
 local DRIVING_STYLE_SEARCH  = 262571
 
 --- Random float in [range[1], range[2]], falling back to the given bounds when
@@ -1703,10 +1766,85 @@ local function officerDrivingProfile(vehicleData, pedNetID, wantedLevel, vehicle
         aggression  = randRange(levelValue(c.aggression, wantedLevel, nil), 0.4, 1.0),
         speed       = speed * randRange(c.speedVariance, 0.9, 1.05),
         searchSpeed = c.searchSpeed or 16.0,
+
+        -- How tight this officer follows once TaskVehicleChase actually takes
+        -- over (SET_TASK_VEHICLE_CHASE_IDEAL_PURSUIT_DISTANCE, applied once
+        -- below where VehicleChase is first issued). Scaled by wanted level
+        -- like ability/aggression -- a level-1 patrol car hangs back further
+        -- than a level-5 unit that's decided to end this now.
+        pursuitDistance = levelValue(c.pursuitDistance, wantedLevel, 10.0),
     }
 
     vehicleData.officerDriving[pedNetID] = profile
     return profile
+end
+
+--- Pick and task a new search-sweep waypoint for a unit that's lost contact.
+---
+--- Used to be one TaskVehicleDriveWander for the entire search -- a real
+--- random wander with no memory of where it had already looked, which reads
+--- as aimless rather than searching. This instead samples a point on a ring
+--- around the search centre, resolves it against the real road network
+--- (client/roads.lua's FenixRoads.roadInfoAt -- the lightweight read-only
+--- primitive, no spawn validation overhead needed for a drive-through point),
+--- rejects anywhere too close to this unit's own recent stops or to a point
+--- another searching unit already claimed, and drives there.
+---
+--- Reuses FenixRoads' existing spawn-deconfliction reservation table
+--- (isReserved/reserve) for the "another unit already claimed this" check --
+--- the identical problem two units picking the same point in the same tick,
+--- just for a search waypoint instead of a spawn point.
+---
+--- Returns true and tasks the drive on success. Returns false having tasked
+--- nothing on failure -- the caller falls back to a plain wander for one
+--- cycle rather than the unit stalling in place, "degrade rather than
+--- disappear" the same way roadInfoAt's own fallback chain does.
+local function pickSweepWaypoint(vehicleData, officer, polVehicle, center, radius, searchSpeed)
+    local c = Config.Driving or {}
+    local minSeparation = c.sweepMinSeparation or 25.0
+
+    local minDist = math.max(10.0, radius * 0.3)
+    local maxDist = math.max(minDist + 5.0, radius)
+
+    local sweep = vehicleData.sweep or { history = {} }
+
+    for _ = 1, (c.sweepSampleAttempts or 6) do
+        local ang = math.rad(math.random(0, 359))
+        local dist = minDist + (math.random() * (maxDist - minDist))
+        local sample = vector3(center.x + (math.sin(ang) * dist), center.y + (math.cos(ang) * dist), center.z)
+
+        local road = FenixRoads.roadInfoAt(sample)
+        if road then
+            local candidate = road.center
+
+            local tooCloseToOwnHistory = false
+            for _, prev in ipairs(sweep.history) do
+                if #(candidate - prev) < minSeparation then
+                    tooCloseToOwnHistory = true
+                    break
+                end
+            end
+
+            if not tooCloseToOwnHistory and not FenixRoads.isReserved(candidate, minSeparation) then
+                FenixRoads.reserve(candidate)
+
+                table.insert(sweep.history, candidate)
+                while #sweep.history > (c.sweepHistorySize or 3) do
+                    table.remove(sweep.history, 1)
+                end
+                sweep.target = candidate
+                sweep.since = GetGameTimer()
+                vehicleData.sweep = sweep
+
+                TaskVehicleDriveToCoord(officer, polVehicle, candidate.x, candidate.y, candidate.z,
+                    searchSpeed or c.searchSpeed or 16.0,
+                    1, GetEntityModel(polVehicle), DRIVING_STYLE_SEARCH, c.sweepArriveDistance or 12.0, true)
+                return true
+            end
+        end
+    end
+
+    return false
 end
 
 -- [Upstate Mafia] Forward declarations: the surrender and traffic-stop handlers
@@ -1715,8 +1853,8 @@ end
 local handleSurrenderApproach
 local handleTicketApproach
 local handleFootChase
-local handleK9Backup
-local releaseK9
+local recallK9
+local deleteK9
 
 -- Function to handle police foot chase and vehicle retrieval
 local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasShot)
@@ -1733,13 +1871,12 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
 
     -- [Upstate Mafia] Hands up: stop chasing, start arresting. Returning early
     -- leaves every combat and driving task below unassigned for this unit, which
-    -- is what stops officers shooting a surrendering player -- and, if this unit
-    -- had a K9 out, calls it off too. A dog isn't in vehicleData.officers, so
-    -- nothing in handleSurrenderApproach's own arrester search would otherwise
-    -- ever touch it, and it would just keep biting a suspect who's already
-    -- given up.
+    -- is what stops officers shooting a surrendering player -- and calls any
+    -- K9 back to its car. A dog isn't in vehicleData.officers, so nothing in
+    -- handleSurrenderApproach's own arrester search would otherwise ever touch
+    -- it, and it would just keep biting a suspect who's already given up.
     if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then
-        if vehicleData.k9 then releaseK9(vehicleData) end
+        recallK9('surrender')
         if handleSurrenderApproach(vehicleData, playerPed, vehNetID) then return end
     end
 
@@ -1750,17 +1887,6 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
     -- officer has committed to the chase.
     if Config.FootChase and Config.FootChase.enabled then
         if handleFootChase(vehicleData, playerPed, vehNetID, GetPlayerWantedLevel(PlayerId())) then
-            -- [Upstate Mafia] handleK9Backup's per-unit, 25s-delayed release is
-            -- superseded by the global trigger (watchForGlobalK9Trigger,
-            -- further down) -- that one fires the moment the wanted level
-            -- rises while on foot, rather than waiting on this specific unit
-            -- to both catch up AND keep chasing for releaseAfterFootChaseMs.
-            -- Left uncalled rather than deleted in case the "dog belongs to
-            -- the unit that's actually engaged" behaviour is ever preferred
-            -- back over "dog is a reliable, immediate consequence of running".
-            -- if Config.K9 and Config.K9.enabled then
-            --     handleK9Backup(vehicleData, playerPed, vehNetID)
-            -- end
             return
         end
     end
@@ -1903,19 +2029,41 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                             -- precisely the omniscience being removed. Drive to
                             -- the last known position, then sweep out from it.
                             --
-                            -- Issued on transition only. A wander task re-issued
-                            -- every second never gets anywhere, because each
-                            -- re-issue picks a fresh direction.
+                            -- The initial drive-to-last-known is issued on
+                            -- transition only, same as everywhere else in this
+                            -- function. Once inside the sweep radius, though,
+                            -- a single task can't just be issued once and left:
+                            -- a sweep is a SERIES of stops, not one destination,
+                            -- so pickSweepWaypoint is re-consulted whenever the
+                            -- current waypoint has been reached or has gone
+                            -- stale, not gated to a one-time transition.
                             local sweepRadius = math.max(25.0, FenixPursuit.searchRadius() * 0.5)
                             if #(GetEntityCoords(polVehicle) - target) < sweepRadius then
-                                if taskStatus ~= 'Sweep' then
-                                    ClearPedTasks(officer)
-                                    TaskVehicleDriveWander(officer, polVehicle, profile.searchSpeed, DRIVING_STYLE_SEARCH)
+                                local sweep = vehicleData.sweep
+                                local now = GetGameTimer()
+                                local arriveDist = (Config.Driving and Config.Driving.sweepArriveDistance) or 12.0
+                                local timeoutMs  = (Config.Driving and Config.Driving.sweepWaypointTimeoutMs) or 9000
+
+                                local needsNewWaypoint = taskStatus ~= 'Sweep' or not sweep or not sweep.target
+                                    or #(GetEntityCoords(polVehicle) - sweep.target) < arriveDist
+                                    or (now - (sweep.since or 0)) > timeoutMs
+
+                                if needsNewWaypoint then
+                                    if not pickSweepWaypoint(vehicleData, officer, polVehicle, target,
+                                            FenixPursuit.searchRadius(), profile.searchSpeed) then
+                                        -- Nothing suitable turned up this attempt --
+                                        -- fall back to a plain wander for one cycle
+                                        -- rather than the unit stalling in place.
+                                        ClearPedTasks(officer)
+                                        TaskVehicleDriveWander(officer, polVehicle, profile.searchSpeed, DRIVING_STYLE_SEARCH)
+                                        vehicleData.sweep = nil
+                                    end
                                     spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'Sweep'
                                 end
                             elseif taskStatus ~= 'ToLastKnown' then
                                 TaskVehicleDriveToCoord(officer, polVehicle, target.x, target.y, target.z, profile.speed, 1, GetEntityModel(polVehicle), DRIVING_STYLE_PURSUIT, 8.0, true)
                                 spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'ToLastKnown'
+                                vehicleData.sweep = nil
                             end
                         elseif distance > 45.0 or not inContact then
                             -- [Upstate Mafia] Was re-issued every single cycle for every
@@ -1938,6 +2086,7 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                                 SetDriveTaskDrivingStyle(officer, DRIVING_STYLE_PURSUIT)
                                 profile.lastDriveTarget = target
                                 spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'DriveToCoord'
+                                if taskStatus == 'Sweep' then vehicleData.sweep = nil end
                             end
                         else
                             -- Gated on transition only, matching handleHeliChaseBehavior's
@@ -1948,7 +2097,9 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                             if taskStatus ~= 'VehicleChase' then
                                 TaskVehicleChase(officer, playerPed)
                                 SetTaskVehicleChaseBehaviorFlag(officer, 8, true)
+                                SetTaskVehicleChaseIdealPursuitDistance(officer, profile.pursuitDistance)
                                 spawnedVehicles[vehNetID].officerTasks[pedNetID] = 'VehicleChase'
+                                if taskStatus == 'Sweep' then vehicleData.sweep = nil end
                             end
                         end
 
@@ -2912,18 +3063,19 @@ local function handleEndWantedDelete(force)
     -- Collect keys BEFORE iterating so that nilling entries mid-loop (which Lua's
     -- pairs iterator can silently skip) doesn't leave orphan units behind.
 
+    -- K9s are client-local (not networked, not server-owned), so the dog is
+    -- the one entity in the whole sweep that's a plain DeleteEntity rather
+    -- than deleteNetworkedEntity/deleteSpawnedPed -- see deleteK9 and
+    -- Config.K9's header comment. Its car is about to be deleted below, so
+    -- there's nothing left for it to run back to.
+    deleteK9()
+
     -- Ground units
     local groundKeys = {}
     for k in pairs(spawnedVehicles) do table.insert(groundKeys, k) end
     for _, vehNetID in ipairs(groundKeys) do
         local vehicleData = spawnedVehicles[vehNetID]
         if vehicleData then
-            -- K9s are client-local (not networked, not server-owned), so this
-            -- is the one entity in the whole sweep that's a plain DeleteEntity
-            -- rather than deleteNetworkedEntity/deleteSpawnedPed -- see
-            -- releaseK9 and Config.K9's header comment.
-            if vehicleData.k9 then releaseK9(vehicleData) end
-
             local pedKeys = {}
             for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
             for _, pedNetID in ipairs(pedKeys) do
@@ -3721,11 +3873,9 @@ function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
         end
         if not best then return false end
 
-        -- First officer this unit has ever sent after the player on foot --
-        -- read by handleK9Backup below to decide when a chase has been
-        -- running long enough to call a dog in. Only set once; a second
-        -- exit later this same pursuit (previous chaser lost/died) doesn't
-        -- restart the clock.
+        -- First officer this unit has ever sent after the player on foot.
+        -- Only set once; a second exit later this same pursuit (previous
+        -- chaser lost/died) doesn't restart the clock.
         vehicleData.footChaseStartedAt = vehicleData.footChaseStartedAt or GetGameTimer()
 
         if not NetworkHasControlOfEntity(best) then NetworkRequestControlOfEntity(best) end
@@ -3847,66 +3997,166 @@ function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
 end
 
 -- ============================================================================
--- K9 BACKUP (Upstate Mafia)
+-- K9 UNITS (Upstate Mafia)
 --
--- Released from a unit already committed to a foot chase once that chase has
--- run long enough (Config.K9.releaseAfterFootChaseMs) -- a dog is the answer
--- to "the player can just keep outrunning a jogging officer forever", which
--- Config.FootChase.giveUpDistance otherwise has no real counter to. See
--- Config.K9's own header comment for why this needs no bespoke bite/arrest
--- logic: TASK_COMBAT_PED on an animal ped is already the melee attack, and a
--- suspect it brings down falls straight into the existing Aftermath system.
+-- A dog closes distance a jogging officer never can -- the answer to "the
+-- player can just keep outrunning a foot chase forever", which
+-- Config.FootChase.giveUpDistance otherwise has no real counter to.
+--
+-- A dog is never conjured out of thin air behind the player. It has to come
+-- out of a real ground unit that is (a) close to the player, (b) stopped or
+-- nearly so, and (c) still has a living officer with it -- the handler, in
+-- the car or on foot beside it. The dog gets out at that car's tailgate. When
+-- it's called off (surrender, the player back in a car, the chase dragging it
+-- too far from its car, its handler and car both gone) it runs back to the
+-- car -- or to the handler if the car is gone -- and is loaded up (deleted)
+-- on arrival rather than just vanishing mid-street.
+--
+-- The dog itself needs no bespoke bite/arrest logic: TASK_COMBAT_PED on an
+-- animal ped is already GTA's own K9 attack, and a suspect it brings down
+-- falls straight into the existing Aftermath system.
 --
 -- Client-local/non-networked, the same precedent client/tactics.lua's
 -- roadblock and spike-strip peds already set for AI helpers that don't need
 -- to survive this client disconnecting.
 -- ============================================================================
 
---- Deletes this unit's dog (if any) and starts its release cooldown. Safe to
---- call with no dog out. Cooldown is set even when releasing for a reason
---- that isn't "the dog died" (surrender, arrest, pursuit ending) -- a fresh
---- pursuit against the same unit shouldn't be able to call in a second dog
---- within seconds of the last one being pulled off.
-function releaseK9(vehicleData)
-    local k9 = vehicleData.k9
-    if not k9 then return end
-
-    -- No network control dance needed -- unlike every other officer in this
-    -- file, the dog was created local-only (CreatePed's isNetwork=false), so
-    -- this client always owns it outright.
-    if k9.ped and DoesEntityExist(k9.ped) then
-        DeleteEntity(k9.ped)
+--- Deletes the dog (if any) outright and starts the redeploy cooldown. Used
+--- when it has reached its car, died, or its unit is being swept away
+--- entirely. Safe to call with no dog out.
+function deleteK9()
+    if not activeK9 then return end
+    -- No network control dance needed -- the dog was created local-only
+    -- (CreatePed's isNetwork=false), so this client always owns it outright.
+    if activeK9.ped and DoesEntityExist(activeK9.ped) then
+        DeleteEntity(activeK9.ped)
     end
-
-    vehicleData.k9 = nil
-    vehicleData.k9CooldownUntil = GetGameTimer() + (Config.K9.cooldownMs or 60000)
+    activeK9 = nil
+    k9CooldownUntil = GetGameTimer() + (Config.K9.cooldownMs or 60000)
 end
 
---- Creates the dog behind the player and sets it on the target. Assigns
---- straight into vehicleData.k9 -- callers don't get the ped handle back,
---- they just check vehicleData.k9 on the next tick same as every other
---- officer-task field in this file.
-local function spawnK9(vehicleData, playerPed)
+--- Calls the dog off: it stops attacking and heads back to its car/handler,
+--- where the watcher thread below loads it up. Safe to call with no dog out,
+--- or with one already on its way back.
+function recallK9(reason)
+    local k9 = activeK9
+    if not k9 or k9.state == 'Return' then return end
+
+    local dog = k9.ped
+    if not DoesEntityExist(dog) or IsPedDeadOrDying(dog, true) then
+        deleteK9()
+        return
+    end
+
+    k9.state = 'Return'
+    k9.returnUntil = GetGameTimer() + (Config.K9.returnTimeoutMs or 20000)
+    k9.returnTarget = nil -- forces the go-to task to be issued next tick
+
+    ClearPedTasks(dog)
+    -- Stops the dog reacting to the (still hated, still nearby) player on the
+    -- way back -- same blocking the medic's approach uses to stay on task.
+    SetBlockingOfNonTemporaryEvents(dog, true)
+
+    if Config.isDebug then print('[FENIX-K9] recalled: ' .. tostring(reason)) end
+end
+
+--- The unit's car if it still exists and isn't wrecked, otherwise the handler
+--- if they're still alive, otherwise nil -- where a recalled dog runs to.
+local function k9Home(k9)
+    if k9.vehNetID and NetworkDoesNetworkIdExist(k9.vehNetID) then
+        local vehicle = NetToVeh(k9.vehNetID)
+        if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) and not IsEntityDead(vehicle) then
+            return vehicle
+        end
+    end
+    if k9.handler and DoesEntityExist(k9.handler) and not IsPedDeadOrDying(k9.handler, true) then
+        return k9.handler
+    end
+    return nil
+end
+
+--- A living officer of this unit close enough to the car to be the dog's
+--- handler -- still seated, or on foot within Config.K9.handlerRange.
+local function findK9Handler(vehicleData, vehicle)
+    local range = Config.K9.handlerRange or 20.0
+    local vehCoords = GetEntityCoords(vehicle)
+    for pedNetID in pairs(vehicleData.officers or {}) do
+        local officer = NetToPed(pedNetID)
+        if officer and officer ~= 0 and DoesEntityExist(officer) and not IsPedDeadOrDying(officer, true)
+            and #(GetEntityCoords(officer) - vehCoords) <= range then
+            return officer
+        end
+    end
+    return nil
+end
+
+--- Config.K9.vehicleModels, if set, restricts which cars carry a dog at all.
+local function carriesK9(vehicle)
+    local models = Config.K9.vehicleModels
+    if not models or #models == 0 then return true end
+    local model = GetEntityModel(vehicle)
+    for _, name in ipairs(models) do
+        if GetHashKey(name) == model then return true end
+    end
+    return false
+end
+
+--- Closest ground unit that can put a dog on the ground right now, or nil.
+local function findK9Unit(playerCoords)
+    local kc = Config.K9
+    local best, bestDist = nil, (kc.deployRange or 60.0)
+    for vehNetID, vehicleData in pairs(spawnedVehicles) do
+        local vehicle = NetToVeh(vehNetID)
+        if vehicle and vehicle ~= 0 and DoesEntityExist(vehicle) and not IsEntityDead(vehicle)
+            and GetEntitySpeed(vehicle) <= (kc.maxDeploySpeed or 3.0)
+            and carriesK9(vehicle)
+        then
+            local d = #(GetEntityCoords(vehicle) - playerCoords)
+            if d <= bestDist then
+                local handler = findK9Handler(vehicleData, vehicle)
+                if handler then
+                    best, bestDist = { vehNetID = vehNetID, vehicle = vehicle, handler = handler }, d
+                end
+            end
+        end
+    end
+    return best
+end
+
+--- Pops the tailgate (door 5) for a few seconds, if this car has one, so
+--- the dog visibly comes out of / goes back into the car.
+local function popK9Door(vehicle)
+    if not GetIsDoorValid(vehicle, 5) then return end
+    SetVehicleDoorOpen(vehicle, 5, false, false)
+    SetTimeout(3000, function()
+        if DoesEntityExist(vehicle) then SetVehicleDoorShut(vehicle, 5, false) end
+    end)
+end
+
+--- Creates the dog at the unit's tailgate and sets it on the player.
+local function deployK9(unit, playerPed)
     local kc = Config.K9
     local hash = GetHashKey(kc.dogModel or 'a_c_shepherd')
     if not requestModelLoaded(hash) then return end
+    -- The model load can take a few frames; the car may have gone meanwhile.
+    if not DoesEntityExist(unit.vehicle) then
+        SetModelAsNoLongerNeeded(hash)
+        return
+    end
+
+    -- Just past the rear bumper, from the car's own model dimensions rather
+    -- than a fixed offset, so a long SUV and a short sedan both work.
+    local minDim = GetModelDimensions(GetEntityModel(unit.vehicle))
+    local p = GetOffsetFromEntityInWorldCoords(unit.vehicle, 0.0, minDim.y - 0.6, 0.0)
+    local okGround, groundZ = GetGroundZFor_3dCoord(p.x, p.y, p.z + 2.0, false)
+    local z = (okGround and math.abs(groundZ - p.z) < 3.0) and groundZ or p.z
 
     local playerCoords = GetEntityCoords(playerPed)
-    local heading = GetEntityHeading(playerPed)
-    local rad = math.rad(heading)
-    -- Forward vector of the player's current heading, then spawn behind it
-    -- (negated) -- same convention as client/tactics.lua's forwardOf().
-    local fx, fy = -math.sin(rad), math.cos(rad)
-    local dist = kc.spawnDistance or 18.0
-    local x = playerCoords.x - (fx * dist)
-    local y = playerCoords.y - (fy * dist)
+    local heading = GetHeadingFromVector_2d(playerCoords.x - p.x, playerCoords.y - p.y)
 
-    local okGround, groundZ = GetGroundZFor_3dCoord(x, y, playerCoords.z + 5.0, false)
-    local z = (okGround and math.abs(groundZ - playerCoords.z) < 8.0) and groundZ or playerCoords.z
-
-    -- false, false: local only, no network object -- see this block's header
-    -- comment on why a K9 is client-local like tactics.lua's other AI helpers.
-    local dog = CreatePed(4, hash, x, y, z, heading, false, false)
+    -- false, false: local only, no network object -- see this section's
+    -- header comment on why a K9 is client-local.
+    local dog = CreatePed(4, hash, p.x, p.y, z, heading, false, false)
     SetModelAsNoLongerNeeded(hash)
     if not DoesEntityExist(dog) then return end
 
@@ -3916,155 +4166,96 @@ local function spawnK9(vehicleData, playerPed)
     SetPedFleeAttributes(dog, 0, false)
     SetPedCombatAttributes(dog, 46, true) -- AlwaysFight
     SetPedRelationshipGroupHash(dog, GetHashKey('HATES_PLAYER'))
+    popK9Door(unit.vehicle)
     TaskCombatPed(dog, playerPed, 0, 16)
 
-    vehicleData.k9 = { ped = dog, task = 'Combat' }
+    activeK9 = { ped = dog, vehNetID = unit.vehNetID, handler = unit.handler, state = 'Attack' }
 
-    if Config.isDebug then print('[FENIX-K9] released behind player') end
+    if Config.isDebug then print('[FENIX-K9] deployed from unit ' .. tostring(unit.vehNetID)) end
     if FenixPursuit and FenixPursuit.announceK9 then FenixPursuit.announceK9() end
 end
 
---- Runs once per unit per tick while handleFootChase owns that unit's tick
---- (called from handleChaseBehavior right after a successful handleFootChase
---- call, so it never runs on a unit that isn't actually foot-chasing).
-function handleK9Backup(vehicleData, playerPed, vehNetID)
-    local kc = Config.K9
-    if GetPlayerWantedLevel(PlayerId()) < (kc.minWantedLevel or 2) then
-        if vehicleData.k9 then releaseK9(vehicleData) end
+--- One tick of a recalled dog heading home. Loads it up on arrival; if home
+--- is gone or it can't get there in time, removes it once it's off screen
+--- (or unconditionally a while later) rather than leaving a stray dog.
+local function tickK9Return(k9)
+    local dog = k9.ped
+    local now = GetGameTimer()
+    local home = k9Home(k9)
+
+    if not home then
+        if not IsEntityOnScreen(dog) or now > k9.returnUntil then deleteK9() end
         return
     end
 
-    local k9 = vehicleData.k9
-    if k9 then
-        local dog = k9.ped
-        if not DoesEntityExist(dog) or IsPedDeadOrDying(dog, true) then
-            releaseK9(vehicleData)
-            return
-        end
-
-        local playerCoords = GetEntityCoords(playerPed)
-        if #(GetEntityCoords(dog) - playerCoords) > (kc.giveUpDistance or 60.0) then
-            releaseK9(vehicleData)
-            return
-        end
-
-        -- TaskCombatPed tracks the live ped on its own once issued, same as
-        -- every other combat task in this file -- only re-issued if it was
-        -- ever cleared (it isn't, currently, but this keeps the pattern
-        -- consistent with handleFootChase/handleHeliChaseBehavior rather
-        -- than special-casing the one task that never changes).
-        if k9.task ~= 'Combat' then
-            TaskCombatPed(dog, playerPed, 0, 16)
-            k9.task = 'Combat'
-        end
+    local arriveDist = IsEntityAVehicle(home) and 4.0 or 2.5
+    if #(GetEntityCoords(dog) - GetEntityCoords(home)) <= arriveDist then
+        if IsEntityAVehicle(home) then popK9Door(home) end
+        deleteK9()
         return
     end
 
-    if vehicleData.k9CooldownUntil and GetGameTimer() < vehicleData.k9CooldownUntil then return end
-    if not vehicleData.footChaseStartedAt then return end
-    if (GetGameTimer() - vehicleData.footChaseStartedAt) < (kc.releaseAfterFootChaseMs or 25000) then return end
-
-    spawnK9(vehicleData, playerPed)
-end
-
--- ============================================================================
--- GLOBAL K9 TRIGGER (Upstate Mafia)
---
--- Fires on the wanted level rising while the player is on foot, independent
--- of any unit's own foot-chase progress -- handleK9Backup above only ever
--- releases a dog from an officer who has already caught up and started
--- chasing on foot, which can take a while (or never happen, if nothing gets
--- within Config.FootChase.exitDistance). This is what makes a dog a reliable
--- consequence of fleeing on foot rather than something that only sometimes
--- shows up once a chase is already well underway.
--- ============================================================================
-
---- Deletes the globally-triggered dog (if any) and starts its cooldown. Same
---- shape as releaseK9 above -- client-local ped, no network handshake needed.
-local function releaseGlobalK9()
-    if not activeGlobalK9 then return end
-    if activeGlobalK9.ped and DoesEntityExist(activeGlobalK9.ped) then
-        DeleteEntity(activeGlobalK9.ped)
+    if now > k9.returnUntil and (not IsEntityOnScreen(dog) or now > k9.returnUntil + 15000) then
+        deleteK9()
+        return
     end
-    activeGlobalK9 = nil
-    globalK9CooldownUntil = GetGameTimer() + (Config.K9.cooldownMs or 60000)
+
+    if k9.returnTarget ~= home then
+        TaskGoToEntity(dog, home, -1, 2.0, 3.0, 1073741824, 0)
+        k9.returnTarget = home
+    end
 end
 
---- Creates the dog behind the player and sets it hunting. Same placement/
---- setup as spawnK9 above, just not tied to any vehicleData unit.
-local function spawnGlobalK9(playerPed)
-    local kc = Config.K9
-    local hash = GetHashKey(kc.dogModel or 'a_c_shepherd')
-    if not requestModelLoaded(hash) then return end
-
-    local playerCoords = GetEntityCoords(playerPed)
-    local heading = GetEntityHeading(playerPed)
-    local rad = math.rad(heading)
-    local fx, fy = -math.sin(rad), math.cos(rad)
-    local dist = kc.spawnDistance or 18.0
-    local x = playerCoords.x - (fx * dist)
-    local y = playerCoords.y - (fy * dist)
-
-    local okGround, groundZ = GetGroundZFor_3dCoord(x, y, playerCoords.z + 5.0, false)
-    local z = (okGround and math.abs(groundZ - playerCoords.z) < 8.0) and groundZ or playerCoords.z
-
-    local dog = CreatePed(4, hash, x, y, z, heading, false, false)
-    SetModelAsNoLongerNeeded(hash)
-    if not DoesEntityExist(dog) then return end
-
-    SetEntityAsMissionEntity(dog, true, true)
-    SetEntityMaxHealth(dog, kc.health or 200)
-    SetEntityHealth(dog, kc.health or 200)
-    SetPedFleeAttributes(dog, 0, false)
-    SetPedCombatAttributes(dog, 46, true) -- AlwaysFight
-    SetPedRelationshipGroupHash(dog, GetHashKey('HATES_PLAYER'))
-    TaskCombatPed(dog, playerPed, 0, 16)
-
-    activeGlobalK9 = { ped = dog }
-
-    if Config.isDebug then print('[FENIX-K9] global trigger released a dog') end
-    if FenixPursuit and FenixPursuit.announceK9 then FenixPursuit.announceK9() end
-end
-
---- Polls wanted level + on-foot state and drives the single global dog's
---- lifecycle. Runs independently of handleChaseBehavior's per-unit loop, so
---- it works even before any unit is close enough to have started its own
---- foot chase.
+--- Drives the single dog's whole lifecycle: deploys one from a qualifying
+--- unit, recalls it when it should stand down or has strayed too far from
+--- home, and walks it back. Runs independently of handleChaseBehavior's
+--- per-unit loop so a unit dropping out of spawnedVehicles can't orphan it.
 Citizen.CreateThread(function()
     while true do
         Citizen.Wait(500)
 
-        if not (Config.K9 and Config.K9.enabled) then
-            lastWantedLevelForK9 = GetPlayerWantedLevel(PlayerId())
+        local kc = Config.K9
+        if not (kc and kc.enabled) then
+            if activeK9 then deleteK9() end
             goto continue
         end
 
         local playerPed = PlayerPedId()
+        local playerCoords = GetEntityCoords(playerPed)
         local wantedLevel = GetPlayerWantedLevel(PlayerId())
+        local standDown = wantedLevel < 1
+            or IsPedInAnyVehicle(playerPed, false)
+            or isSurrendering or isBeingArrested
+            or isPullingOver or isBeingTicketed or ticketWrapUp
+            or disableAIPolice
 
-        if activeGlobalK9 then
-            local dog = activeGlobalK9.ped
-            local playerCoords = GetEntityCoords(playerPed)
-            if not DoesEntityExist(dog) or IsPedDeadOrDying(dog, true) or wantedLevel < 1 then
-                releaseGlobalK9()
-            elseif #(GetEntityCoords(dog) - playerCoords) > (Config.K9.giveUpDistance or 60.0) then
-                -- Same reasoning as handleK9Backup's own giveUpDistance check:
-                -- the player got back in a car (or otherwise pulled away) and
-                -- a dog chasing that forever is just a straggling ped.
-                releaseGlobalK9()
+        if activeK9 then
+            local k9 = activeK9
+            local dog = k9.ped
+            if not DoesEntityExist(dog) or IsPedDeadOrDying(dog, true) then
+                deleteK9()
+            elseif k9.state == 'Attack' then
+                local home = k9Home(k9)
+                if standDown then
+                    recallK9('suspect stood down or got in a vehicle')
+                elseif not home then
+                    recallK9('car and handler both gone')
+                elseif #(GetEntityCoords(dog) - playerCoords) > (kc.giveUpDistance or 60.0) then
+                    recallK9('suspect outran the dog')
+                elseif #(GetEntityCoords(dog) - GetEntityCoords(home)) > (kc.leashDistance or 90.0) then
+                    recallK9('too far from its car')
+                end
+            else
+                tickK9Return(k9)
             end
-        elseif wantedLevel > lastWantedLevelForK9
-            and wantedLevel >= (Config.K9.minWantedLevel or 2)
-            and not IsPedInAnyVehicle(playerPed, false)
-            and not (isSurrendering or isBeingArrested or isPullingOver or isBeingTicketed or ticketWrapUp)
-            and not disableAIPolice
-            and GetGameTimer() >= globalK9CooldownUntil
+        elseif not standDown
+            and wantedLevel >= (kc.minWantedLevel or 2)
+            and GetGameTimer() >= k9CooldownUntil
             and not isPlayerPoliceOfficer()
         then
-            spawnGlobalK9(playerPed)
+            local unit = findK9Unit(playerCoords)
+            if unit then deployK9(unit, playerPed) end
         end
-
-        lastWantedLevelForK9 = wantedLevel
 
         ::continue::
     end
@@ -4074,7 +4265,7 @@ end)
 -- /fenixk9test - TEMPORARY: force-spawns a K9 next to the player to check the
 -- model/behaviour without setting up a real foot chase. Delete this block
 -- (and the RegisterCommand below) once confirmed working -- it bypasses
--- Config.K9.minWantedLevel and every other gate spawnK9 normally goes
+-- Config.K9.minWantedLevel and every other gate deployK9 normally goes
 -- through, so it has no place in a real pursuit.
 -- ============================================================================
 local testK9Ped = nil
@@ -5246,14 +5437,14 @@ local function beginAftermath(playerCoords)
                 held = held + 1
             end
         end
-        -- A K9 mid-attack has the same problem heli/air gunners do below: the
-        -- native AI target is still alive (last-stand isn't IsEntityDead), so
-        -- it would keep biting straight through a field-revive attempt.
-        -- Pulled off entirely rather than just stood down -- there's no
-        -- "guard the downed suspect" pose for a dog the way there is for an
-        -- officer.
-        if vehicleData.k9 then releaseK9(vehicleData) end
     end
+
+    -- A K9 mid-attack has the same problem heli/air gunners do below: the
+    -- native AI target is still alive (last-stand isn't IsEntityDead), so it
+    -- would keep biting straight through a field-revive attempt. Sent back to
+    -- its car rather than just stood down -- there's no "guard the downed
+    -- suspect" pose for a dog the way there is for an officer.
+    recallK9('aftermath')
 
     -- [Upstate Mafia] Heli/plane gunners never get physically parked (nobody
     -- lands a helicopter for this), and the per-tick handleHeliChaseBehavior /
@@ -5289,6 +5480,10 @@ local function beginAftermath(playerCoords)
     end
 end
 
+
+-- Compile-time hash instead of a runtime GetHashKey('policet') call every
+-- cycle of the main thread below.
+local POLICET_MODEL_HASH = `policet`
 
 -- MAIN THREAD --
 -- Monitor the player's wanted level and maintain police units
@@ -5330,7 +5525,7 @@ Citizen.CreateThread(function()
         EnableDispatchService(10, false)
 
         -- Keep policet suppressed every cycle — the game can reset this suppression flag.
-        SetVehicleModelIsSuppressed(GetHashKey('policet'), true)
+        SetVehicleModelIsSuppressed(POLICET_MODEL_HASH, true)
 
         -- [Upstate Mafia patch] SetMaxWantedLevel(5) previously only ran
         -- reactively inside UpdateDispatchServices(), itself only called from
@@ -5486,6 +5681,11 @@ Citizen.CreateThread(function()
             -- no error anywhere. Reset here alongside isSurrendering, which
             -- already gets this same treatment.
             isBeingArrested = false
+
+            -- [Upstate Mafia] Next wanted episode starts its response delay
+            -- from scratch (Config.Response).
+            responseStartedAt = nil
+            lastGroundDispatchAt = nil
 
             -- Pursuit over: drop the AI blips and forget the last known
             -- position, so the next one starts from no knowledge instead of

@@ -27,7 +27,22 @@ local toolkitPoints = nil -- extra points from the em_toolkit connector, if pres
 
 local function cfg() return Config.Ambient or {} end
 local function ambientOn() return cfg().enabled == true and runtimeEnabled end
-local function dbg(msg) if cfg().debug then print('[FENIX-AMBIENT] ' .. msg) end end
+-- [Upstate Mafia] Mirrors a line to the server console (server.lua's
+-- fenix-police:clientDiag), for when the client's own F8 console isn't
+-- reachable. Rate-limited here and again server-side.
+local lastRelayAt = 0
+local function relay(msg)
+    local now = GetGameTimer()
+    if now - lastRelayAt < 1000 then return end
+    lastRelayAt = now
+    TriggerServerEvent('fenix-police:clientDiag', '[AMBIENT] ' .. msg)
+end
+
+local function dbg(msg)
+    if not cfg().debug then return end
+    print('[FENIX-AMBIENT] ' .. msg)
+    relay(msg)
+end
 
 -------------------------------------------------------------------------------
 -- Helpers
@@ -285,6 +300,9 @@ local function createVehicle(modelName, x, y, z, heading)
     SetEntityAsMissionEntity(veh, true, true)
     SetVehicleOnGroundProperly(veh)
     SetVehicleHasBeenOwnedByPlayer(veh, false)
+    -- No-op on the civilian cars that also come through here -- only a model
+    -- with livery mods (the add-on cruisers) is touched. See client/livery.lua.
+    FenixLivery.apply(veh)
     return veh
 end
 
@@ -618,6 +636,45 @@ local function spawnStop(playerCoords)
     return commitScene(scene, true)
 end
 
+--- [Upstate Mafia] Roaming scenes (patrol/convoy) first drive to where the
+--- player was when they spawned, and only start wandering once they've got
+--- there (see advanceInbound). Straight TaskVehicleDriveWander from a spawn
+--- point that's deliberately out of view sent half of them off in the wrong
+--- direction; past cleanupDistance they were culled within ~20s, so the
+--- player never actually saw a patrol drive by. Config.Ambient.roamPastPlayer
+--- = false restores the old behaviour.
+local function driveInbound(scene, cop, veh, target, speed, style)
+    if cfg().roamPastPlayer == false then
+        TaskVehicleDriveWander(cop, veh, speed, style)
+        return
+    end
+    TaskVehicleDriveToCoordLongrange(cop, veh, target.x, target.y, target.z, speed, style, 15.0)
+    scene.inbound = scene.inbound or { target = target, since = GetGameTimer(), cars = {} }
+    scene.inbound.cars[#scene.inbound.cars + 1] = { cop = cop, veh = veh, speed = speed, style = style }
+end
+
+--- Hands an inbound roaming scene over to normal wandering once its lead car
+--- has reached the player's spawn-time position, or after a timeout (stuck,
+--- detoured, player long gone).
+local function advanceInbound(scene)
+    local ib = scene.inbound
+    if not ib then return end
+
+    local c = cfg()
+    local lead = ib.cars[1]
+    local arrived = lead and DoesEntityExist(lead.veh)
+        and #(GetEntityCoords(lead.veh) - ib.target) <= (c.roamPassDistance or 40.0)
+    local timedOut = GetGameTimer() - ib.since > (c.roamApproachTimeout or 60) * 1000
+    if not (arrived or timedOut) then return end
+
+    for _, car in ipairs(ib.cars) do
+        if DoesEntityExist(car.cop) and DoesEntityExist(car.veh) and not IsPedDeadOrDying(car.cop, true) then
+            TaskVehicleDriveWander(car.cop, car.veh, car.speed, car.style)
+        end
+    end
+    scene.inbound = nil
+end
+
 --- Cruiser driving a normal route with no siren.
 local function spawnPatrol(playerCoords)
     -- Moving scene: spawns on the carriageway and drives off, so no shoulder.
@@ -640,7 +697,7 @@ local function spawnPatrol(playerCoords)
     SetDriverAbility(cop, 0.9)
     SetDriverAggressiveness(cop, 0.2)
     -- Driving style 786603: obeys lights, avoids traffic, no shortcuts.
-    TaskVehicleDriveWander(cop, veh, 16.0, 786603)
+    driveInbound(scene, cop, veh, playerCoords, 16.0, 786603)
 
     return commitScene(scene, true)
 end
@@ -714,7 +771,7 @@ local function spawnConvoy(playerCoords)
                     -- Deliberate here, so the group holds together instead of
                     -- scattering at the first junction the way three unrelated
                     -- patrols would.
-                    TaskVehicleDriveWander(cop, veh, 14.0, 786603)
+                    driveInbound(scene, cop, veh, playerCoords, 14.0, 786603)
                 end
             end
         end
@@ -1879,6 +1936,7 @@ CreateThread(function()
                 if scene.stop then advanceStop(scene) end
                 if scene.carjack then advanceCarjack(scene) end
                 if scene.pursuit then advancePursuit(scene) end
+                if scene.inbound then advanceInbound(scene) end
             end
 
             -- An enforcing trap survives the sweep below, so it is the one scene
@@ -1938,15 +1996,20 @@ CreateThread(function()
             -- A builder legitimately fails when its prerequisites aren't there
             -- (no seed point in range, no road node, deep wilderness). Try a few
             -- kinds rather than burning the whole interval on one miss.
+            local tried = {}
             for _ = 1, 3 do
                 local kind = pickSceneKind()
                 local builder = kind and BUILDERS[kind]
-                if builder and builder(playerCoords) then break end
+                if builder and builder(playerCoords) then return end
+                tried[#tried + 1] = tostring(kind)
             end
+            dbg(('no scene spawned this attempt (tried %s; %d/%d scenes, %d cops nearby)')
+                :format(table.concat(tried, ', '), sceneCount(), cfg().maxScenes or 4, nearbyCops))
         end)
 
         if not ok then
             print('[FENIX-AMBIENT] director error: ' .. tostring(err))
+            relay('director error: ' .. tostring(err))
         end
     end
 end)
@@ -1956,12 +2019,15 @@ end)
 -------------------------------------------------------------------------------
 
 RegisterCommand('ambientpolice', function(_, args)
+    -- [Upstate Mafia] No argument = status only. It used to toggle, so
+    -- running it just to look at the status silently switched ambient police
+    -- off for the rest of the session.
     local arg = (args[1] or ''):lower()
     if arg == 'on' then
         runtimeEnabled = true
     elseif arg == 'off' then
         runtimeEnabled = false
-    else
+    elseif arg == 'toggle' then
         runtimeEnabled = not runtimeEnabled
     end
 

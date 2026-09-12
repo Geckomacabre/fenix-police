@@ -260,6 +260,33 @@ AddEventHandler('playerDropped', function()
     cleanupIfNoPlayersWanted()
 end)
 
+-- [Upstate Mafia] Client diagnostics relay: client/ambient.lua mirrors its
+-- debug trace and any director error here, so they can be read from the server
+-- console when a client's F8 console isn't reachable. Print-only, one line per
+-- player per second, truncated -- nothing a client sends here does anything
+-- but log.
+local lastClientDiag = {}
+local clientDiagLines = {} -- last 50, for the fenixdiag console command
+RegisterNetEvent('fenix-police:clientDiag', function(msg)
+    local src = source
+    if type(msg) ~= 'string' then return end
+    local now = GetGameTimer()
+    if lastClientDiag[src] and now - lastClientDiag[src] < 1000 then return end
+    lastClientDiag[src] = now
+    local line = ('[FENIX-CLIENT %d %s] %s'):format(src, os.date('%H:%M:%S'), msg:sub(1, 300))
+    print(line)
+    clientDiagLines[#clientDiagLines + 1] = line
+    if #clientDiagLines > 50 then table.remove(clientDiagLines, 1) end
+end)
+AddEventHandler('playerDropped', function() lastClientDiag[source] = nil end)
+
+-- Server console / RCON only (source 0): dumps the buffered relay lines.
+RegisterCommand('fenixdiag', function(src)
+    if src ~= 0 then return end
+    if #clientDiagLines == 0 then print('[FENIX-CLIENT] nothing relayed yet') return end
+    for _, line in ipairs(clientDiagLines) do print(line) end
+end, true)
+
 RegisterNetEvent('fenix-police:updateWantedStatus')
 AddEventHandler('fenix-police:updateWantedStatus', function(isWanted)
     local src = source

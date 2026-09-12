@@ -529,7 +529,7 @@ function FenixPursuit.announceReinforcement(totalBonusUnits)
 end
 
 --- Radio call the moment a K9 unit is released against a foot chase (see
---- Config.K9 / client.lua's spawnK9). Forced for the same reason
+--- Config.K9 / client.lua's deployK9). Forced for the same reason
 --- announceReinforcement is -- a rare, specific escalation that should always
 --- be heard over whatever else is on the radio that second.
 function FenixPursuit.announceK9()

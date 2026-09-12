@@ -598,6 +598,16 @@ function FenixRoads.reserve(pos)
     table.insert(reservations, { pos = pos, at = GetGameTimer() })
 end
 
+--- Read-only check-without-claim, exposed for callers that need to know
+--- whether a point is already spoken for before deciding whether it's worth
+--- reserving themselves -- client.lua's search-sweep waypoint picker uses
+--- this so two units searching the same area spread out instead of both
+--- driving to the same corner, the identical problem this table already
+--- solves for spawn placement.
+function FenixRoads.isReserved(pos, separation)
+    return isReserved(pos, separation)
+end
+
 --- Drop every reservation. Called when a pursuit ends, so the next one is not
 --- working around spots that were promised to units which no longer exist.
 function FenixRoads.clearReservations()

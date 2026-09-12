@@ -330,6 +330,17 @@ Config.Ambient = {
     -- minutes `stop` and `pursuit` cannot even attempt to spawn.
     roamingLifetime = 130,
 
+    -- [Upstate Mafia] Patrols and convoys spawn out of view, then drive to
+    -- where you were when they spawned before wandering off. Without this
+    -- they wandered in a random direction from a spot you couldn't see, went
+    -- past cleanupDistance in ~20s and were deleted -- scenes were spawning
+    -- constantly but you almost never saw a cop drive by. They switch to
+    -- wandering within roamPassDistance metres of that spot, or after
+    -- roamApproachTimeout seconds.
+    roamPastPlayer = true,
+    roamPassDistance = 40.0,
+    roamApproachTimeout = 60,
+
     -- ── Pursuits ────────────────────────────────────────────────────────────
     -- A pursuit is an event, not background traffic. The scene weight alone
     -- can't express "rare but memorable", so this is a hard floor between them
@@ -615,6 +626,11 @@ Config.Ambient = {
     --   array  { 'police', 'police2' }        picked uniformly
     --   map    { police = 4, police2 = 1 }    model -> relative weight
     --
+    -- A model that isn't installed is skipped when the pick is rolled rather than
+    -- failing the spawn, so a mixed list degrades to whatever you actually have.
+    -- If a region resolves to nothing installed at all, vehicleFallback below is
+    -- used — which is what makes it safe to point this at packs without checking
+    -- that every client has them.
     -- Base-game models only, deliberately: this ships as stock so it works on any
     -- server. The map form exists for add-on liveries — weights are how you get
     -- one agency dominant in a region while another still turns up occasionally,
@@ -627,12 +643,6 @@ Config.Ambient = {
     --       ['yourhwp_charger'] = 2,   -- highway patrol passes through
     --       ['yourhwp_suv'] = 2,
     --   },
-    --
-    -- A model that isn't installed is skipped when the pick is rolled rather than
-    -- failing the spawn, so a mixed list degrades to whatever you actually have.
-    -- If a region resolves to nothing installed at all, vehicleFallback below is
-    -- used — which is what makes it safe to point this at packs without checking
-    -- that every client has them.
     vehicles = {
         losSantos   = { 'police', 'police2', 'police3' },
         paletoBay   = { 'sheriff', 'sheriff2' },
@@ -703,13 +713,15 @@ Config.Ambient = {
     -- Per-client trace of ambient spawning and radar enforcement. Off for
     -- release; turn on when diagnosing placement or detection, alongside the
     -- /ambientpolice and /radartrace commands.
+    -- With debug on, the trace is also relayed to the server console, and the
+    -- last 50 lines can be dumped there with the `fenixdiag` console command.
     debug = false,
 }
 
 
 -- MOVING VIOLATIONS --
--- [Upstate Mafia] Non-speed traffic offences: wrong-way driving, riding a
--- motorcycle without a helmet, wheelies/stoppies, and phone use while driving.
+-- [Upstate Mafia] Non-speed traffic offences: riding a motorcycle without a
+-- helmet, wheelies/stoppies, and phone use while driving.
 -- Modeled on inspiration from the "Pull Me Over" singleplayer mod, reimplemented
 -- from scratch against this resource's own witness/wanted pipeline rather than
 -- ported (that mod is a ScriptHookVDotNet plugin; nothing in it runs on FiveM).
@@ -729,6 +741,10 @@ Config.Ambient = {
 -- locations). Those three would need a hand-surveyed intersection dataset
 -- before they could be built without constant false positives -- a separate
 -- task, not attempted here.
+--
+-- Wrong-way driving was covered once and removed: GET_CLOSEST_ROAD's lane
+-- counts and heading aren't reliable enough to tell a one-way carriageway from
+-- the correct side of an ordinary road, so it cited players driving normally.
 Config.Violations = {
     -- How far / wide an ambient officer can notice one of these from, same
     -- shape as Config.Ambient.radar.copDetectRange (a plain radius, not an
@@ -737,20 +753,6 @@ Config.Violations = {
     witnessRange = 35.0,
 
     tickMs = 750,
-
-    wrongWay = {
-        enabled = true,
-        -- Below this the car could just be turning, parking, or nosing out of
-        -- a driveway -- not yet "driving" against traffic.
-        minSpeedMph = 15,
-        -- FenixRoads.roadInfoAt() is trusted only when it found a real
-        -- GET_CLOSEST_ROAD segment (road.approximate == false) AND that
-        -- segment is genuinely one-directional (one of fwdLanes/bwdLanes is
-        -- zero) -- an ordinary two-way street can't be "wrong way" by this
-        -- check, only a one-way street or one carriageway of a divided road.
-        wantedLevel = 1,
-        cooldownSeconds = 60,
-    },
 
     noHelmet = {
         enabled = true,
@@ -851,15 +853,16 @@ Config.FootChase = {
 -- Config.FootChase.giveUpDistance: without this, a player who can simply
 -- outrun a jogging officer for 80m gets away for free, every time.
 --
--- Triggered globally (client.lua's watchForGlobalK9Trigger thread): the
--- moment the wanted level rises while the player is on foot, past
--- minWantedLevel and the cooldown below, a dog is released -- not tied to
--- any specific unit having caught up and started its own foot chase first
--- (that older path, handleK9Backup, is still in client.lua but no longer
--- called -- see the comment where handleChaseBehavior used to invoke it).
--- It's client-local/non-networked the same way client/tactics.lua's
--- roadblock and spike-strip peds are -- see that file's header for why
--- that's the established pattern here.
+-- A dog never appears out of nowhere: it comes out of a real ground unit that
+-- is within deployRange of the player, stopped (maxDeploySpeed), and still has
+-- a living officer with it (handlerRange) -- it gets out at that car's
+-- tailgate. Called off (surrender, the player back in a car, too far from its
+-- car, car and handler both gone), it runs back to the car -- or the handler
+-- if the car is gone -- and is loaded up on arrival. No qualifying unit
+-- nearby means no dog, however wanted the player is. See client.lua's
+-- K9 UNITS section. It's client-local/non-networked the same way
+-- client/tactics.lua's roadblock and spike-strip peds are -- see that file's
+-- header for why that's the established pattern here.
 --
 -- The dog itself needs no bespoke "bite and arrest" scripting: TASK_COMBAT_PED
 -- on an animal ped is already GTA's own K9 attack (melee, no weapon), and a
@@ -879,20 +882,29 @@ Config.K9 = {
     -- A real department doesn't send a dog after a level-1 jaywalker.
     minWantedLevel = 2,
 
-    -- Vestigial: only read by the disabled legacy path (handleK9Backup in
-    -- client.lua, no longer called). The active global trigger releases a
-    -- dog immediately on the wanted-level rise, not after a delay.
-    releaseAfterFootChaseMs = 25000,
+    -- A unit's car must be within this many metres of the player to deploy
+    -- its dog, and moving no faster than maxDeploySpeed (m/s, ~3 = crawling)
+    -- -- a dog doesn't jump out of a cruiser doing 40.
+    deployRange = 60.0,
+    maxDeploySpeed = 3.0,
 
-    -- Spawned this far behind the player along their current heading, so it
-    -- isn't just standing there in view the instant it's released.
-    spawnDistance = 18.0,
+    -- The handler: a living officer of that unit, in the car or on foot within
+    -- this many metres of it. No handler, no dog.
+    handlerRange = 20.0,
 
-    -- Give up (and delete) if the player somehow pulls back ahead of it by
-    -- this much -- got back in a car and drove off, mainly. A dog chasing a
-    -- car forever is a straggling ped, same reasoning as
-    -- Config.FootChase.giveUpDistance.
+    -- Optional whitelist of vehicle model names that carry a dog, e.g.
+    -- { 'yourcity_k9' }. Empty = any ground unit can.
+    vehicleModels = {},
+
+    -- Recall the dog if the player pulls this far ahead of it -- got back in a
+    -- car and drove off, mainly -- or if the chase drags it this far from its
+    -- own car/handler (leashDistance).
     giveUpDistance = 60.0,
+    leashDistance = 90.0,
+
+    -- How long (ms) a recalled dog gets to reach its car before it's removed
+    -- the moment it's off screen (and unconditionally 15s after that).
+    returnTimeoutMs = 20000,
 
     -- Cooldown (ms) before another dog can be released after the last one is
     -- lost, killed or given up on.
@@ -1154,6 +1166,41 @@ Config.controlWaitCount = 6
 Config.maxUnitsPerLevel = {2, 3, 4, 6, 10} -- Maximum ground units for each wanted level
 Config.maxHeliUnitsPerLevel = {0, 1, 1, 2, 4} -- Maximum heli units for each wanted level
 Config.maxAirUnitsPerLevel = {0, 0, 0, 0, 1} -- Maximum plane units for each wanted level
+
+-- RESPONSE PACING (Upstate Mafia) --
+-- How quickly units actually show up once you're wanted. Without this the full
+-- allowance above spawned the same second the star appeared, 80-140m away --
+-- break into a car, and two cruisers were already round the corner. Each list
+-- is indexed by wanted level 1..5.
+Config.Response = {
+    enabled = true,
+
+    -- Seconds from first going wanted until the first ground unit (or heli) is
+    -- sent. Lose the wanted level inside this window and nobody comes at all.
+    initialDelay = { 35, 20, 10, 5, 0 },
+
+    -- Seconds between each further ground unit, so they arrive one by one.
+    unitInterval = { 20, 12, 8, 4, 2 },
+
+    -- { min, max } ground-unit spawn distance in metres. A missing level falls
+    -- back to Config.minPoliceSpawnDistance / maxPoliceSpawnDistance.
+    spawnDistance = {
+        { 180.0, 280.0 },
+        { 140.0, 240.0 },
+        { 100.0, 180.0 },
+        { 80.0, 140.0 },
+        { 80.0, 140.0 },
+    },
+
+    -- The delay is for a unit driving in after a call-in. Skip it if you open
+    -- fire, or if an officer already has eyes on you (they watched it happen).
+    skipDelayWhenShooting = true,
+    skipDelayOnContact = true,
+
+    -- Never spawn a pursuit unit inside your view unless there's genuinely
+    -- nowhere else to put it.
+    avoidVisibleSpawns = true,
+}
 
 -- This controls whether ground units will spawn if the player is in a helicopter, already spawned units aren't removed.
 Config.spawnGroundUnitsInHeli = true
@@ -1585,6 +1632,33 @@ Config.Driving = {
     -- standing in the road forever is worse than one visible teleport.
     reboardPatience        = 12,
     reboardGiveUpDistance  = 45.0,
+
+    -- SEARCH SWEEP WAYPOINTS --
+    -- A unit that's lost contact and is within the current search radius used
+    -- to get one TaskVehicleDriveWander for the whole search -- a genuine
+    -- random wander, no memory of where it had already looked. This is what
+    -- turns that into a series of directed stops instead: see the 'Sweep'
+    -- branch of handleChaseBehavior in client.lua.
+    sweepArriveDistance    = 12.0,  -- close enough to the current waypoint to pick a new one
+    sweepWaypointTimeoutMs = 9000,  -- give up on the current waypoint and pick another after this long
+    sweepMinSeparation     = 25.0,  -- don't pick a point this close to one of the unit's own recent waypoints
+    sweepHistorySize       = 3,     -- how many recent waypoints per unit count as "recently visited"
+    sweepSampleAttempts    = 6,     -- candidate points tried before falling back to a plain wander for one cycle
+
+    -- Ideal following distance for the close-range TaskVehicleChase state
+    -- (SET_TASK_VEHICLE_CHASE_IDEAL_PURSUIT_DISTANCE), indexed by wanted
+    -- level like ability/aggression above. Never called before this existed,
+    -- so every unit followed at the native's own unscaled default regardless
+    -- of how serious the pursuit actually was. Tight at high wanted levels --
+    -- a unit that's decided to end this now -- looser at low ones, where a
+    -- real patrol car is still mostly just following.
+    pursuitDistance = {
+        [1] = 14.0,
+        [2] = 12.0,
+        [3] = 10.0,
+        [4] = 8.0,
+        [5] = 6.0,
+    },
 }
 
 
@@ -2123,6 +2197,46 @@ Config.zones = {
     ZANCUDO = { name = 'Zancudo River', location = 'Countryside' },
     ZP_ORT = { name = 'Port of South Los Santos', location = 'Los Santos' },
     ZQ_UAR = { name = 'Davis Quartz', location = 'Countryside' }
+}
+
+-- LIVERIES (Upstate Mafia) --
+-- Optional support for add-on cruiser packs that ship one model per car with
+-- every agency's paint job on it as a livery MOD (mod type 48). Empty by
+-- default: the base-game cars in Config.vehiclesByRegion carry their markings
+-- in the model itself, and a stock car has no livery mods to touch.
+--
+-- Point `byRegion` at the livery LABELS from your pack's carcols.meta -- labels
+-- rather than indices, so a pack update reordering its liveries cannot break it
+-- -- and `byModel` at any unit that belongs to one agency wherever it turns up.
+-- Precedence: a Config.vehiclesByRegion entry's own `livery` field, then
+-- byModel, then byRegion for wherever the car spawns. Listing several labels
+-- picks one of them at random.
+Config.Liveries = {
+    enabled = true,
+
+    byRegion = {
+        losSantos   = {},
+        paletoBay   = {},
+        sandyShores = {},
+        countryside = {},
+    },
+
+    -- e.g. my_highway_interceptor = { 'LIV_SAHP' },
+    byModel = {},
+
+    -- How a Config.vehiclesByRegion entry with `unmarked = true` is dressed:
+    -- livery removed, these extras switched off (a roof lightbar is usually
+    -- extra 1), and one of these paint colours (GTA colour indices: 0 black,
+    -- 1 graphite, 2 black steel, 3 dark silver, 4 silver). A stock model like
+    -- police4 is already unmarked and is left alone.
+    unmarked = {
+        extrasOff = { 1 },
+        colours   = { 0, 1, 2, 3, 4 },
+    },
+
+    -- Prints when a model is missing (fallback used) or has none of the
+    -- requested liveries.
+    debug = false,
 }
 
 -- The ZoneEnum maps location names from the above table to the Config.vehiclesByRegion key from the table below. 

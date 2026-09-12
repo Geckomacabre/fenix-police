@@ -36,6 +36,90 @@ carjacking provenance note below.
 
 ---
 
+## Unreleased
+
+### Fixed: ambient patrols were spawning but almost never seen
+
+Scenes were spawning normally (confirmed from a live client), but patrol and
+convoy scenes started `TaskVehicleDriveWander` from a spawn point chosen to be
+out of view, so about half drove straight away, crossed `cleanupDistance`
+(320m) and were deleted about 20-30s later. Seen from the player: no cops on
+the road. They now drive to where the player was when they spawned
+(`TaskVehicleDriveToCoordLongrange`) and only switch to wandering within
+`roamPassDistance` (40m) of that point or after `roamApproachTimeout` (60s).
+The first live test convoy lasted 101s where patrols used to last about 24s.
+`Config.Ambient.roamPastPlayer = false` restores the old behaviour.
+
+Also: `/ambientpolice` with no argument now only prints status. It used to
+toggle, so checking the status once switched ambient police off for the rest
+of the session; `/ambientpolice toggle` does that explicitly now. Ambient
+director errors, plus the debug trace when `Config.Ambient.debug` is on, are
+relayed to the server console (`fenix-police:clientDiag`, print-only, 1
+line/s per player), and the `fenixdiag` server-console command dumps the last
+50 lines.
+
+### Changed: police response is paced instead of instant
+
+Going wanted used to spawn the whole `Config.maxUnitsPerLevel` allowance in the
+same second, 80-140m away and possibly on screen — a lockpick alert
+(`qbx_vehiclekeys` → `um_fenix_bridge` → 1 star) put two cruisers round the
+corner immediately. New `Config.Response`: an initial delay before the first
+ground unit or heli (35s at 1 star down to 0 at 5), then one unit per
+`unitInterval`, spawned further out at low levels (180-280m at 1 star) and
+never inside the player's view unless nowhere else qualifies. The delay is
+skipped if the player shoots or an officer already has contact. Losing the
+wanted level inside the delay means nobody comes.
+
+`qbx_vehiclekeys`' lockpick police-alert chance lowered from 0.75/0.50
+(day/night) to 0.40/0.25 alongside this.
+
+### Added: optional support for add-on cruiser packs
+
+New `client/livery.lua`, for servers that swap the base-game cruisers in
+`Config.vehiclesByRegion` for an add-on pack. It does two things:
+
+- A pack that ships one model per car with every agency's paint as a livery mod
+  gets the right one applied at spawn, matched by label rather than index so a
+  pack update reordering its liveries cannot break it (`Config.Liveries`, empty
+  by default). An entry flagged `unmarked = true` is stripped instead: livery
+  removed, roof lightbar off, plain paint.
+- A model that is not installed on a client (pack stopped, entitlement lapsed)
+  falls back to that entry's own `fallback` model, and then to a stock cruiser
+  from `Config.Ambient.vehicleFallback`, instead of the unit never spawning at
+  all. `server/guard.lua` allowlists entry fallbacks.
+
+The resource still ships with base-game police cars, and with those both halves
+are no-ops: stock cars have no livery mods and are always installed.
+Helicopters are created server-side, where the livery mod natives do not exist,
+so they are never touched.
+
+### Removed: wrong-way driving violation
+
+Officers were citing players for driving against traffic while they were on
+the correct side of an ordinary road. The check trusted `GET_CLOSEST_ROAD`'s
+lane counts and heading to decide a segment was one-directional, and that data
+isn't reliable enough for it. The check (`client/violations.lua`) and its
+`Config.Violations.wrongWay` block are gone; helmet, wheelie and phone checks
+are unchanged.
+
+### Changed: K9s deploy from a real car and handler, and go back to it
+
+Dogs used to spawn 18m behind the player the instant the wanted level rose,
+with no car or officer anywhere near. Now a dog only comes out of a ground unit
+that is within `deployRange` of the player, stopped (`maxDeploySpeed`), and
+still has a living officer with it (`handlerRange`); it gets out at that car's
+tailgate. When called off (surrender, the player back in a car, too far from
+its car via `leashDistance`, car and handler both gone, field revive), it runs
+back to the car, or to the handler if the car is gone, and is loaded up on
+arrival instead of vanishing. `vehicleModels` optionally restricts which cars
+carry a dog.
+
+The dog is now tracked globally rather than on its unit's `vehicleData`, so a
+unit dropping out of `spawnedVehicles` can't orphan it. That also fixes the
+old global dog never being called off on surrender or field revive. The unused
+legacy per-unit path (`handleK9Backup`/`spawnK9`) and the
+`releaseAfterFootChaseMs`/`spawnDistance` settings are removed.
+
 ## 2.7.0 (2026-09-10): event-driven backup, officer morale/retreat, jurisdiction handoff, arrest escort
 
 `client/backup.lua` (new), `client/morale.lua` (new), `client/jurisdiction.lua`

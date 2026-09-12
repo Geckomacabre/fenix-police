@@ -1,8 +1,9 @@
 -------------------------------------------------------------------------------
--- Moving violations: wrong-way driving, no helmet, wheelie/stoppie, phone use.
+-- Moving violations: no helmet, wheelie/stoppie, phone use.
 --
 -- See Config.Violations in config.lua for what this covers and why red
--- lights / stop signs / sidewalk driving are deliberately not attempted.
+-- lights / stop signs / sidewalk driving / wrong-way driving are deliberately
+-- not attempted.
 --
 -- Each check requires an ambient officer to actually be able to see the
 -- player (exports('fenix-police'):IsWitnessed, added in client/ambient.lua) --
@@ -63,39 +64,6 @@ local function cite(kind, wantedLevel, message)
         -- chat message is a harmless fallback, never a reason to skip the cite.
         TriggerEvent('chat:addMessage', { args = { 'Police', message } })
     end
-end
-
--------------------------------------------------------------------------------
--- Wrong-way driving
--------------------------------------------------------------------------------
-
---- Angle between two headings, 0-180.
-local function headingDiff(a, b)
-    local d = math.abs(a - b) % 360.0
-    return d > 180.0 and (360.0 - d) or d
-end
-
-local function checkWrongWay(ped, veh, coords)
-    local c = cfg().wrongWay
-    if not c or not c.enabled then return end
-    if GetPedInVehicleSeat(veh, -1) ~= ped then return end -- driver only
-    if GetEntitySpeed(veh) * MPS_TO_MPH < (c.minSpeedMph or 15) then return end
-    if type(FenixRoads) ~= 'table' or type(FenixRoads.roadInfoAt) ~= 'function' then return end
-
-    local road = FenixRoads.roadInfoAt(coords)
-    -- Only trust a real GET_CLOSEST_ROAD segment, and only a genuinely
-    -- one-directional one -- an ordinary two-way street can't be "wrong way"
-    -- here, only a one-way street or one carriageway of a divided road.
-    if not road or road.approximate then return end
-    if road.fwdLanes > 0 and road.bwdLanes > 0 then return end
-    if road.fwdLanes == 0 and road.bwdLanes == 0 then return end
-
-    local diff = headingDiff(GetEntityHeading(veh), road.heading)
-    local travellingWithA = diff < 90.0
-    local legal = travellingWithA and (road.fwdLanes > 0) or ((not travellingWithA) and road.bwdLanes > 0)
-    if legal then return end
-
-    cite('wrongWay', c.wantedLevel, 'Driving against the flow of traffic.')
 end
 
 -------------------------------------------------------------------------------
@@ -168,7 +136,6 @@ CreateThread(function()
             if not isWitnessed(coords) then goto continue end
             if playerIsOnDutyPolice() then goto continue end
 
-            if not onCooldown('wrongWay') then checkWrongWay(ped, veh, coords) end
             if not onCooldown('noHelmet') then checkNoHelmet(ped, veh) end
             if not onCooldown('wheelie') then checkWheelie(ped, veh) end
             if not onCooldown('phone') then checkPhoneUse(ped, veh) end

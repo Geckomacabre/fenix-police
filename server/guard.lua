@@ -100,6 +100,9 @@ local function buildAllowlist()
     for _, region in pairs(Config.vehiclesByRegion or {}) do
         for _, entry in ipairs(region) do
             allowVehicle(entry.model)
+            -- Stock stand-in the client spawns instead when the add-on model
+            -- isn't installed (client/livery.lua's resolveModel).
+            allowVehicle(entry.fallback)
             for _, ped in ipairs(entry.peds or {}) do allowPed(ped) end
         end
     end
@@ -128,7 +131,9 @@ local function buildAllowlist()
     local ambientCfg = Config.Ambient or {}
     for _, pool in ipairs({ ambientCfg.vehicles, ambientCfg.vehicleFallback }) do
         for _, list in pairs(pool or {}) do
-            for _, model in ipairs(list) do allowVehicle(model) end
+            -- Both shapes client/ambient.lua accepts: an array of names, or a
+            -- `model = weight` map (ipairs alone skipped the map form entirely).
+            for k, v in pairs(list) do allowVehicle(type(k) == 'string' and k or v) end
         end
     end
     for _, list in pairs(ambientCfg.peds or {}) do
