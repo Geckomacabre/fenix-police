@@ -165,6 +165,27 @@ showed up for calls where no patrol was nearby to reuse.
 `FenixLivery.apply` after, same as the marked pursuit fleet. Both models
 are on `server/guard.lua`'s allowlist.
 
+### Fixed: a reused ambient patrol could wear the wrong agency's livery
+
+The fresh-spawn fix above liveries correctly because it paints the vehicle
+right after creating it AT the incident. The reuse-a-nearby-patrol path
+(added earlier this session) doesn't create anything — it repurposes a
+vehicle that was already liveried back when the ambient patrol scene
+originally spawned, possibly somewhere else entirely. In practice this was
+usually fine (`Config.Investigate.reuseNearbyPatrolRadius`, 120m by
+default, means the vehicle is already close to the incident by the time
+it's eligible for reuse, and jurisdiction zones are large), but nothing
+enforced it — a patrol that wandered near a jurisdiction boundary before
+being claimed could end up investigating a call in the wrong paint.
+
+New `FenixLivery.labelsFor(vehicle, coords)` (`client/livery.lua`) answers
+"what livery would this vehicle get if it were standing at `coords` right
+now" — the same byModel/byRegion precedence `FenixLivery.apply` already
+uses internally, just evaluated at a caller-given location instead of the
+vehicle's actual current position. `client/investigate.lua`'s reuse path
+now repaints with it immediately after promotion, so a reused patrol always
+reflects the jurisdiction it's actually being sent to investigate.
+
 New commands: `/fenixincidents`, `/fenixdispatch`, `/fenixunits`,
 `/fenixems`, `/fenixfire`, `/fenixinvestigate`, `/fenixwitness` (client,
 self-status only).

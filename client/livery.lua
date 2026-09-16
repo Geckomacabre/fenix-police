@@ -76,6 +76,27 @@ local function styleUnmarked(vehicle)
     end
 end
 
+--- The livery label(s) FenixLivery.apply would pick for `vehicle` if it were
+--- standing at `coords` right now -- byModel precedence, then byRegion for
+--- `coords` (NOT the vehicle's actual current position). Exposed for
+--- callers that re-purpose an already-liveried vehicle for use somewhere
+--- other than where it happens to be standing (client/investigate.lua's
+--- ambient-patrol reuse: the vehicle's livery reflects wherever it was
+--- originally spawned, which may not be the incident it's now being sent
+--- to). Returns nil when Config.Liveries is disabled or nothing matches.
+function FenixLivery.labelsFor(vehicle, coords)
+    if cfg().enabled == false then return nil end
+
+    local byModel = cfg().byModel or {}
+    for name, labels in pairs(byModel) do
+        if GetEntityModel(vehicle) == GetHashKey(name) then return labels end
+    end
+
+    local byRegion = cfg().byRegion or {}
+    local region = FenixLivery.regionAt(coords)
+    return byRegion[region] or byRegion.losSantos
+end
+
 --- Paints `vehicle` with an agency livery. `override` (a label or a list of
 --- labels, e.g. a Config.vehiclesByRegion entry's `livery`) wins, then
 --- Config.Liveries.byModel, then Config.Liveries.byRegion for wherever the car

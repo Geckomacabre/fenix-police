@@ -87,6 +87,12 @@ AddEventHandler('fenix-police:client:policeInvestigateIncident', function(data)
         if veh then
             local vehNetID, driverNetID, passengerNetIDs = PromoteAmbientUnitForInvestigation(veh, driver, passengers)
             if vehNetID then
+                -- Repaint for the incident's actual jurisdiction: this
+                -- vehicle's livery reflects wherever the ambient patrol
+                -- originally spawned, not necessarily this scene (see
+                -- FenixLivery.labelsFor's header).
+                FenixLivery.apply(veh, FenixLivery.labelsFor(veh, data.coords))
+
                 local peds, pedSeats = { [driverNetID] = driver }, { [driverNetID] = -1 }
                 for i, pedNetID in ipairs(passengerNetIDs or {}) do
                     peds[pedNetID] = passengers[i]
