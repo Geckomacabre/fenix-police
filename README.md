@@ -85,9 +85,9 @@ rather than PITting a vehicle that has already pulled over.
 
 ### Moving violations
 
-Speeding was never the only thing worth pulling someone over for. Wrong-way
-driving, riding without a helmet, wheelies/stoppies, and using a phone at the
-wheel are now enforced the same way — gated on an ambient officer actually
+Speeding was never the only thing worth pulling someone over for. Riding
+without a helmet, wheelies/stoppies, and using a phone at the wheel are now
+enforced the same way — gated on an ambient officer actually
 witnessing it, feeding the same wanted-level pipeline radar enforcement uses
 rather than a separate system bolted on the side. See `client/violations.lua`.
 

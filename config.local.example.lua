@@ -203,3 +203,20 @@ Config.Ambient.convoyCooldownSeconds = 480
 Config.Roads.crossCheckDistance = 15.0
 Config.Roads.crossCheckAngle    = 30.0
 ]]
+
+-- Turning on the incident/dispatch layer (server/dispatch.lua and
+-- everything built on it: civilian witnessing, EMS, fire, police
+-- investigation). Off by default -- an unconfigured server behaves exactly
+-- as it did before this system existed. Config.Dispatch.enabled is the
+-- master switch; each subsystem below it is ALSO independently gated, so
+-- you can turn on, say, EMS without turning on fire or civilian witnessing.
+--[[
+Config.Dispatch.enabled    = true
+Config.Witness.enabled     = true   -- civilian gunfire reports
+Config.FireWatch.enabled   = true   -- civilian fire reports
+Config.Collision.enabled   = true   -- crash detection (your own vehicle only)
+Config.EMS.enabled         = true
+Config.Fire.enabled        = true
+Config.Investigate.enabled = true   -- responds to witnessed calls with no known suspect
+Config.UnitRegistry.enabled = true  -- optional: /fenixunits live unit positions
+]]

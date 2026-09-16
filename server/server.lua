@@ -260,6 +260,33 @@ AddEventHandler('playerDropped', function()
     cleanupIfNoPlayersWanted()
 end)
 
+-- [Upstate Mafia] Client diagnostics relay: client/ambient.lua mirrors its
+-- debug trace and any director error here, so they can be read from the server
+-- console when a client's F8 console isn't reachable. Print-only, one line per
+-- player per second, truncated -- nothing a client sends here does anything
+-- but log.
+local lastClientDiag = {}
+local clientDiagLines = {} -- last 50, for the fenixdiag console command
+RegisterNetEvent('fenix-police:clientDiag', function(msg)
+    local src = source
+    if type(msg) ~= 'string' then return end
+    local now = GetGameTimer()
+    if lastClientDiag[src] and now - lastClientDiag[src] < 1000 then return end
+    lastClientDiag[src] = now
+    local line = ('[FENIX-CLIENT %d %s] %s'):format(src, os.date('%H:%M:%S'), msg:sub(1, 300))
+    print(line)
+    clientDiagLines[#clientDiagLines + 1] = line
+    if #clientDiagLines > 50 then table.remove(clientDiagLines, 1) end
+end)
+AddEventHandler('playerDropped', function() lastClientDiag[source] = nil end)
+
+-- Server console / RCON only (source 0): dumps the buffered relay lines.
+RegisterCommand('fenixdiag', function(src)
+    if src ~= 0 then return end
+    if #clientDiagLines == 0 then print('[FENIX-CLIENT] nothing relayed yet') return end
+    for _, line in ipairs(clientDiagLines) do print(line) end
+end, true)
+
 RegisterNetEvent('fenix-police:updateWantedStatus')
 AddEventHandler('fenix-police:updateWantedStatus', function(isWanted)
     local src = source
@@ -1291,7 +1318,7 @@ AddEventHandler('fenix:server:trigger', function(pdata, alertData)
         end
     end
 
-    local coords = { x = x, y = y, z = z }
+    local coords = vector3(x, y, z)
     local wantedlevel = GetWantedLevelFromCoords(coords) or 0
 
     -- Was unconditional. Five console lines per call is a flood vector by
@@ -1301,11 +1328,22 @@ AddEventHandler('fenix:server:trigger', function(pdata, alertData)
             :format(x, y, z, wantedlevel))
     end
 
-    for _, playerId in ipairs(GetPlayersInRadius(coords, 10.0)) do
-        if Config.isDebug then
-            print(('[fenix-police]   applying wanted %d to %s'):format(wantedlevel, tostring(playerId)))
+    -- Routed through FenixDispatch (server/dispatch.lua) so every incident,
+    -- whether it came from this legacy event or a newer call site, goes
+    -- through the same FenixIncident lifecycle. wantedLevel from
+    -- Config.locations is passed straight through as the severity so
+    -- existing per-location tuning keeps working unchanged; when a location
+    -- has no configured wanted level this falls back to Config.Dispatch's
+    -- default severity for 'LEGACY_ALERT'.
+    if (Config.Dispatch or {}).enabled and FenixDispatch then
+        FenixDispatch.createIncident('LEGACY_ALERT', coords, nil, {
+            wantedRadius = 10.0,
+            directWanted = wantedlevel,
+        })
+    else
+        for _, playerId in ipairs(GetPlayersInRadius(coords, 10.0)) do
+            TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
         end
-        TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
     end
 end)
 

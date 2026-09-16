@@ -100,6 +100,9 @@ local function buildAllowlist()
     for _, region in pairs(Config.vehiclesByRegion or {}) do
         for _, entry in ipairs(region) do
             allowVehicle(entry.model)
+            -- Stock stand-in the client spawns instead when the add-on model
+            -- isn't installed (client/livery.lua's resolveModel).
+            allowVehicle(entry.fallback)
             for _, ped in ipairs(entry.peds or {}) do allowPed(ped) end
         end
     end
@@ -128,12 +131,35 @@ local function buildAllowlist()
     local ambientCfg = Config.Ambient or {}
     for _, pool in ipairs({ ambientCfg.vehicles, ambientCfg.vehicleFallback }) do
         for _, list in pairs(pool or {}) do
-            for _, model in ipairs(list) do allowVehicle(model) end
+            -- Both shapes client/ambient.lua accepts: an array of names, or a
+            -- `model = weight` map (ipairs alone skipped the map form entirely).
+            for k, v in pairs(list) do allowVehicle(type(k) == 'string' and k or v) end
         end
     end
     for _, list in pairs(ambientCfg.peds or {}) do
         for _, model in ipairs(list) do allowPed(model) end
     end
+
+    -- EMS (server/ems.lua, client/ems.lua). Same reasoning as ambient scene
+    -- models above: whatever Config.EMS spawns must be allowlisted or its
+    -- later register/delete calls get silently refused.
+    local emsCfg = Config.EMS or {}
+    allowVehicle(emsCfg.vehicle)
+    for _, model in ipairs(emsCfg.peds or {}) do allowPed(model) end
+
+    -- Fire (server/fire.lua, client/fire.lua). Same reasoning again.
+    local fireCfg = Config.Fire or {}
+    allowVehicle(fireCfg.vehicle)
+    for _, model in ipairs(fireCfg.peds or {}) do allowPed(model) end
+
+    -- Investigation units (server/investigate.lua, client/investigate.lua).
+    -- Same reasoning again -- both the ONX model and its stock fallback
+    -- (client/livery.lua's resolveModel) need to be allowlisted, same as
+    -- every entry in Config.vehiclesByRegion.
+    local invCfg = Config.Investigate or {}
+    allowVehicle(invCfg.vehicle)
+    allowVehicle(invCfg.vehicleFallback)
+    for _, model in ipairs(invCfg.peds or {}) do allowPed(model) end
 
     local v, p = 0, 0
     for _ in pairs(allowedVehicles) do v = v + 1 end

@@ -36,6 +36,234 @@ carjacking provenance note below.
 
 ---
 
+## Unreleased
+
+### Added: opt-in incident/dispatch layer, civilian witness reports, EMS and fire response
+
+New central incident registry (`server/incident.lua`, `FenixIncident`) and
+dispatch reasoning (`server/dispatch.lua`, `FenixDispatch`) sitting alongside
+the existing wanted-level pipeline rather than replacing it — the legacy
+`fenix:server:trigger` handler in `server/server.lua` now routes through
+`FenixDispatch.createIncident` when `Config.Dispatch.enabled` is true, and
+falls back to the old direct `SetWantedLevel` broadcast otherwise (default:
+false, so this changes nothing on an unconfigured server).
+
+Built on top of that, all individually opt-in via their own config flags:
+
+- **Civilian gunfire/fire witnessing** (`client/witness.lua`,
+  `client/firewatch.lua`) — clients poll `IS_ANY_PED_SHOOTING_IN_AREA` /
+  `GET_NUMBER_OF_FIRES_IN_RANGE` near the local player and report to the
+  server, which creates a `SHOOTING`/`FIRE` incident. Deliberately does not
+  identify a suspect or apply a wanted level from these reports — see the
+  header comment in `server/dispatch.lua`'s `reportGunshot` handler for why.
+  Reports within a radius/time window of an existing unresolved incident of
+  the same type are folded into it rather than creating duplicates, so
+  several nearby witnesses produce one call, not several.
+- **EMS ground response** (`server/ems.lua`, `client/ems.lua`) — an
+  ambulance + paramedics spawn (same ticket/ownership handshake as police
+  ground units, `server/guard.lua`), drive to the incident, run a treatment
+  beat (`CODE_HUMAN_MEDIC_KNEEL`), then transport to Pillbox Hospital (the
+  same coordinate `qbx_ambulancejob`'s own config uses) and clear.
+  Dangerous-severity calls hold the ambulance back for a fixed timer before
+  it approaches — an explicit stand-in for real "has police secured the
+  scene" detection, which isn't implementable yet (see below).
+- **Fire ground response** (`server/fire.lua`, `client/fire.lua`) — a fire
+  truck + crew spawn the same way, drive to the scene, and suppress using
+  the actual game fire system (`STOP_FIRE_IN_RANGE`,
+  `GET_NUMBER_OF_FIRES_IN_RANGE`) rather than a scripted approximation.
+- **`shared/unit_fsm.lua`** (`FenixFSM`) — a small generic per-unit state
+  machine, formalizing the informal phase-string pattern already used by
+  `client/ambient.lua`'s scenes and `client/morale.lua`'s retreat states.
+  EMS and fire units are its first users. The existing police officer
+  tasking in `client.lua` (`officerTasks`) is deliberately NOT migrated onto
+  this in this pass — it works, and this stays consistent with not
+  replacing a working system for architectural purity alone.
+
+Known limitation, stated in `server/dispatch.lua`'s header rather than
+hidden: the server has no registry of where the AI units it spawns actually
+end up (ground units are created and tasked entirely client-side), so real
+nearest-unit / workload-aware dispatch across a shared unit pool isn't
+implementable yet. EMS/fire responses are instead handed to whichever
+connected player is currently nearest the incident (a real, current
+position the server can see), which is what stops a naive broadcast from
+spawning one ambulance per nearby player for the same call. A proper
+unit-position registry is the prerequisite for true multi-role/cross-agency
+coordination.
+
+Also added: `server/unit_registry.lua` (`FenixUnitRegistry`), the
+unit-position registry described as the missing prerequisite above. Each
+client now optionally reports its own ground/heli/air units' live positions
+(a small append to the end of `client/client.lua`, reading the existing
+`spawnedVehicles`/`spawnedHeliUnits`/`spawnedAirUnits` tables -- no existing
+logic in that file touched) via `Config.UnitRegistry.enabled`. This pass
+only collects the data (`/fenixunits` to inspect it) and exposes
+`FenixUnitRegistry.nearest(coords, radius, kind)` -- nothing yet reroutes a
+live unit based on it, that's the next step once this data source has been
+observed to actually be reliable.
+
+Also added, closing gaps identified after the first pass above:
+
+- **Police investigation response** (`server/investigate.lua`,
+  `client/investigate.lua`) — the actual consumer for a police-needing
+  incident that has no known suspect (`applyWanted = false`, e.g. a
+  civilian gunfire report). Until this, a witnessed `SHOOTING` did nothing
+  visible at all. A single officer drives to the scene and runs
+  `CODE_HUMAN_POLICE_INVESTIGATE` for a while, then clears — no chase, no
+  arrest, nothing found (see the file's own header for why "finds
+  something" isn't real yet).
+- **Crash detection** (`client/collision.lua`) — the `TRAFFIC_COLLISION`
+  sibling of the gunfire/fire witnessing above. No single native answers
+  "did a crash just happen nearby" the way `IS_ANY_PED_SHOOTING_IN_AREA`
+  does for gunfire, so this only watches the local player's own vehicle
+  (`GET_VEHICLE_BODY_HEALTH` dropping sharply while `GET_ENTITY_SPEED` was
+  above a threshold) — documented as narrower than "any nearby collision."
+- **Incident resolution actually resolves** — EMS/fire/investigation units
+  now report their assignment to `FenixIncident` on spawn and release on
+  clear (`fenix-police:server:assignIncidentUnit` /
+  `releaseIncidentUnit`), so an incident reaches `RESOLVED` for real instead
+  of only aging out.
+- **EMS staging prefers a real signal over a timer** — while staged on a
+  dangerous call, an ambulance now asks the server
+  (`fenix-police:server:queryIncidentHasRole`) whether an investigation
+  unit is actually assigned to the same incident, and proceeds as soon as
+  that's true. `Config.EMS.stagingHoldMs` remains as a hard ceiling for
+  calls nobody responds to, not the primary mechanism anymore.
+
+Also added: **investigation units reuse a nearby ambient patrol** instead of
+always spawning fresh (`ClaimNearbyPatrolForInvestigation` in
+`client/ambient.lua`, `PromoteAmbientUnitForInvestigation` appended to the
+end of `client/client.lua`). This is the same handoff `tryPromoteScene`
+already uses to turn a patrol scene into a pursuit unit
+(`handOffScene` — drop the scene's own bookkeeping, entities untouched),
+applied to investigation instead. Deliberately uses its own independent
+ticket handshake (`awaitingInvestigationPromotionTicket` /
+`investigationPromotionTicketResult`, and a dedicated
+`fenix-police:server:promoteAmbientUnitForInvestigation` server event)
+rather than sharing state with the existing pursuit-promotion path's
+single-slot ticket variables, so the two can never race each other.
+`Config.Investigate.reuseNearbyPatrolRadius` (0 disables reuse).
+
+Both `client.lua` and `client/ambient.lua` were only ever appended to for
+this — every existing function in both files (the pursuit/combat loop, the
+scene state machine) is untouched.
+
+### Fixed: investigation units spawned as a plain base-game cruiser
+
+`client/investigate.lua`'s fresh-spawn path (used when there's no nearby
+ambient patrol to reuse) built its vehicle straight from
+`Config.Investigate.vehicle`, defaulted to stock `'police'`, with no call
+into `client/livery.lua` at all — so it never got the ONX EVP model or
+agency paint job every other marked unit in this resource uses, and never
+ran the "is this add-on model actually installed" fallback check either.
+The reused-ambient-patrol path was unaffected (`client/ambient.lua`'s own
+`createVehicle` already calls `FenixLivery.apply`), which is why this only
+showed up for calls where no patrol was nearby to reuse.
+
+`Config.Investigate.vehicle` is now `'onx_polbuff'` with
+`vehicleFallback = 'police'`, and the fresh-spawn path runs
+`FenixLivery.resolveModel` before creating the vehicle and
+`FenixLivery.apply` after, same as the marked pursuit fleet. Both models
+are on `server/guard.lua`'s allowlist.
+
+New commands: `/fenixincidents`, `/fenixdispatch`, `/fenixunits`,
+`/fenixems`, `/fenixfire`, `/fenixinvestigate`, `/fenixwitness` (client,
+self-status only).
+
+Not yet load-tested against a running client — verified with `luac -p`
+(syntax only) on every new/changed file, and an RCON `restart fenix-police`
+against a live FXServer returned no errors, but that server's console log
+didn't reflect the restart at all (a stale/mismatched log path, not
+evidence of a clean load) so treat this as unverified until someone actually
+drives a car past a witnessed gunshot.
+
+### Fixed: ambient patrols were spawning but almost never seen
+
+Scenes were spawning normally (confirmed from a live client), but patrol and
+convoy scenes started `TaskVehicleDriveWander` from a spawn point chosen to be
+out of view, so about half drove straight away, crossed `cleanupDistance`
+(320m) and were deleted about 20-30s later. Seen from the player: no cops on
+the road. They now drive to where the player was when they spawned
+(`TaskVehicleDriveToCoordLongrange`) and only switch to wandering within
+`roamPassDistance` (40m) of that point or after `roamApproachTimeout` (60s).
+The first live test convoy lasted 101s where patrols used to last about 24s.
+`Config.Ambient.roamPastPlayer = false` restores the old behaviour.
+
+Also: `/ambientpolice` with no argument now only prints status. It used to
+toggle, so checking the status once switched ambient police off for the rest
+of the session; `/ambientpolice toggle` does that explicitly now. Ambient
+director errors, plus the debug trace when `Config.Ambient.debug` is on, are
+relayed to the server console (`fenix-police:clientDiag`, print-only, 1
+line/s per player), and the `fenixdiag` server-console command dumps the last
+50 lines.
+
+### Changed: police response is paced instead of instant
+
+Going wanted used to spawn the whole `Config.maxUnitsPerLevel` allowance in the
+same second, 80-140m away and possibly on screen — a lockpick alert
+(`qbx_vehiclekeys` → `um_fenix_bridge` → 1 star) put two cruisers round the
+corner immediately. New `Config.Response`: an initial delay before the first
+ground unit or heli (35s at 1 star down to 0 at 5), then one unit per
+`unitInterval`, spawned further out at low levels (180-280m at 1 star) and
+never inside the player's view unless nowhere else qualifies. The delay is
+skipped if the player shoots or an officer already has contact. Losing the
+wanted level inside the delay means nobody comes.
+
+`qbx_vehiclekeys`' lockpick police-alert chance lowered from 0.75/0.50
+(day/night) to 0.40/0.25 alongside this.
+
+### Changed: marked units are now ONX EVP cars with per-region agency liveries
+
+Marked pursuit units, ambient scenes and roadblocks now use the ONX Emergency
+Vehicle Pack (`[cars]/onx-evp-c-pack`, `-c-pack2`) instead of stock
+`police`/`sheriff`/`pranger`. Each ONX car carries every agency's paint as a
+livery mod, so new `client/livery.lua` applies one by label at spawn
+(`Config.Liveries`): LSPD in Los Santos, PBSD/BCSO in Paleto, BCSO in Sandy,
+BCSO/GSSD in the countryside, with the Buffalo Hellfire always SAHP and the
+Invictus Overland ranger unit always SASP. Matching by label rather than index
+survives a pack update reordering its liveries.
+
+If an ONX model isn't installed on a client (pack stopped, entitlement lapsed),
+pursuit units and roadblocks fall back to a stock cruiser from
+`Config.Ambient.vehicleFallback` instead of not spawning at all.
+
+Unmarked units (were `police3`/`police4`) are ONX cars too — Buffalo and Scout
+in Los Santos, Granger 3700 and Merit PPV in the county — flagged
+`unmarked = true`: livery removed, roof lightbar (extra 1) off, plain
+black/graphite/silver paint (`Config.Liveries.unmarked`). Each carries
+`fallback = 'police4'`, so a client without ONX still gets an unmarked car
+rather than a marked cruiser; `server/guard.lua` allowlists entry fallbacks.
+
+Riot, FBI, bike and helicopter units are unchanged: ONX has no equivalents for
+most of them, and helicopters are created server-side, where the livery mod
+natives don't exist.
+
+### Removed: wrong-way driving violation
+
+Officers were citing players for driving against traffic while they were on
+the correct side of an ordinary road. The check trusted `GET_CLOSEST_ROAD`'s
+lane counts and heading to decide a segment was one-directional, and that data
+isn't reliable enough for it. The check (`client/violations.lua`) and its
+`Config.Violations.wrongWay` block are gone; helmet, wheelie and phone checks
+are unchanged.
+
+### Changed: K9s deploy from a real car and handler, and go back to it
+
+Dogs used to spawn 18m behind the player the instant the wanted level rose,
+with no car or officer anywhere near. Now a dog only comes out of a ground unit
+that is within `deployRange` of the player, stopped (`maxDeploySpeed`), and
+still has a living officer with it (`handlerRange`); it gets out at that car's
+tailgate. When called off (surrender, the player back in a car, too far from
+its car via `leashDistance`, car and handler both gone, field revive), it runs
+back to the car, or to the handler if the car is gone, and is loaded up on
+arrival instead of vanishing. `vehicleModels` optionally restricts which cars
+carry a dog.
+
+The dog is now tracked globally rather than on its unit's `vehicleData`, so a
+unit dropping out of `spawnedVehicles` can't orphan it. That also fixes the
+old global dog never being called off on surrender or field revive. The unused
+legacy per-unit path (`handleK9Backup`/`spawnK9`) and the
+`releaseAfterFootChaseMs`/`spawnDistance` settings are removed.
+
 ## 2.7.0 (2026-09-10): event-driven backup, officer morale/retreat, jurisdiction handoff, arrest escort
 
 `client/backup.lua` (new), `client/morale.lua` (new), `client/jurisdiction.lua`

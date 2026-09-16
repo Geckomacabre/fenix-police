@@ -303,7 +303,12 @@ Config.Ambient = {
     -- one every couple of blocks in a dense area — enough that turning a
     -- corner into a fresh one felt less like a city with police in it and more
     -- like the slots were always full.
-    maxScenes = 3,
+    --
+    -- Lowered again from 3 (2026-09-15): still reported as constant ambient
+    -- chases even after the previous pass. Cutting the concurrent-scene cap
+    -- further is the most direct way to reduce how much is ever on screen at
+    -- once, independent of spawnInterval/cooldowns below.
+    maxScenes = 2,
 
     -- Seconds between scene spawn attempts.
     --
@@ -313,7 +318,10 @@ Config.Ambient = {
     -- than to ambient presence. This alone is the biggest lever on how often
     -- you encounter something; maxScenes and maxNearbyCops below cap how much
     -- is on screen at once, but this caps how fast a gap gets refilled.
-    spawnInterval = 15,
+    -- Raised again from 15 (2026-09-15), alongside maxScenes/pursuitCooldown/
+    -- weights.pursuit below, in response to "still way too many ambient
+    -- chases".
+    spawnInterval = 30,
 
     -- A scene must spawn between these distances from the player, and is deleted
     -- past cleanupDistance. Fixed-point scenes are also deleted when their point
@@ -330,6 +338,17 @@ Config.Ambient = {
     -- minutes `stop` and `pursuit` cannot even attempt to spawn.
     roamingLifetime = 130,
 
+    -- [Upstate Mafia] Patrols and convoys spawn out of view, then drive to
+    -- where you were when they spawned before wandering off. Without this
+    -- they wandered in a random direction from a spot you couldn't see, went
+    -- past cleanupDistance in ~20s and were deleted -- scenes were spawning
+    -- constantly but you almost never saw a cop drive by. They switch to
+    -- wandering within roamPassDistance metres of that spot, or after
+    -- roamApproachTimeout seconds.
+    roamPastPlayer = true,
+    roamPassDistance = 40.0,
+    roamApproachTimeout = 60,
+
     -- ── Pursuits ────────────────────────────────────────────────────────────
     -- A pursuit is an event, not background traffic. The scene weight alone
     -- can't express "rare but memorable", so this is a hard floor between them
@@ -339,7 +358,9 @@ Config.Ambient = {
     -- 8s/4-scene cadence this was tuned against no longer exists, and 5 minutes
     -- on top of a slot that's already hard to win made a pursuit a rare sight
     -- rather than an occasional one.
-    pursuitCooldownSeconds = 220,
+    -- Raised again from 220 (2026-09-15) alongside spawnInterval/maxScenes
+    -- and weights.pursuit below.
+    pursuitCooldownSeconds = 440,
 
     -- Pursuits get their own lifetime because they need room to run, resolve and
     -- be watched. Shortened automatically once the arrest tableau has held.
@@ -437,7 +458,8 @@ Config.Ambient = {
     -- not three small ones. If you want a deliberate multi-car look, that's
     -- now the `convoy` scene below rather than an accidental overlap of
     -- `patrol` and `stop`.
-    minSceneSpacing = 120.0,
+    -- Raised again from 120 (2026-09-15) alongside maxScenes/spawnInterval.
+    minSceneSpacing = 160.0,
 
     -- Hard ceiling on ambient OFFICERS within nearbyRadius of the player, on top
     -- of maxScenes. A couple of 4-officer foot posts reach "too many cops" long
@@ -450,7 +472,8 @@ Config.Ambient = {
     -- officers) and `stop` (1 officer) from spawning even when a scene slot
     -- was free. 5 leaves room for one of those alongside a convoy without
     -- undoing the reason this was lowered in the first place.
-    maxNearbyCops = 5,
+    -- Lowered again from 5 (2026-09-15) alongside maxScenes above.
+    maxNearbyCops = 3,
     nearbyRadius  = 260.0,
 
     -- Superseded by Config.Roads.shoulderOffset, below. That one is measured
@@ -596,7 +619,7 @@ Config.Ambient = {
         patrol   = 2,  -- cruiser driving a normal route, no siren
         convoy   = 1,  -- 2-3 cruisers travelling together, no lights — see below
         post     = 2,  -- officers on foot at a station/landmark doing scenarios
-        pursuit  = 2,  -- NPC vehicle fleeing, cruisers chasing with sirens
+        pursuit  = 1,  -- NPC vehicle fleeing, cruisers chasing with sirens -- lowered from 2 (2026-09-15)
         carjack  = 1,  -- suspect drags a driver out and takes off
     },
 
@@ -615,18 +638,10 @@ Config.Ambient = {
     --   array  { 'police', 'police2' }        picked uniformly
     --   map    { police = 4, police2 = 1 }    model -> relative weight
     --
-    -- Base-game models only, deliberately: this ships as stock so it works on any
-    -- server. The map form exists for add-on liveries — weights are how you get
-    -- one agency dominant in a region while another still turns up occasionally,
-    -- without hard-coded region rules. For example, if you ran a highway-patrol
-    -- pack and a sheriff pack:
-    --
-    --   sandyShores = {
-    --       ['yoursheriff_suv'] = 6,   -- the county's own units carry the region
-    --       ['yoursheriff_sedan'] = 4,
-    --       ['yourhwp_charger'] = 2,   -- highway patrol passes through
-    --       ['yourhwp_suv'] = 2,
-    --   },
+    -- [Upstate Mafia] ONX EVP cruisers ([cars]/onx-evp-c-pack / -c-pack2). One
+    -- model carries every agency's paint as a livery; the LSPD/BCSO/PBSD one is
+    -- applied at spawn by region -- see Config.Liveries -- so the same Alamo
+    -- reads as Paleto Bay SD up north and BCSO in Sandy.
     --
     -- A model that isn't installed is skipped when the pick is rolled rather than
     -- failing the spawn, so a mixed list degrades to whatever you actually have.
@@ -634,10 +649,10 @@ Config.Ambient = {
     -- used — which is what makes it safe to point this at packs without checking
     -- that every client has them.
     vehicles = {
-        losSantos   = { 'police', 'police2', 'police3' },
-        paletoBay   = { 'sheriff', 'sheriff2' },
-        sandyShores = { 'sheriff', 'sheriff2' },
-        countryside = { 'sheriff', 'sheriff2', 'pranger' },
+        losSantos   = { onx_polbuff = 4, onx_polscout = 4, onx_polmerit2 = 2, onx_poltavros = 1 },
+        paletoBay   = { onx_polalamo = 4, onx_polsand = 3, onx_polgrang = 2 },
+        sandyShores = { onx_polalamo = 4, onx_polbison = 3, onx_polsand = 3 },
+        countryside = { onx_polalamo = 3, onx_polsand = 3, onx_polgrang = 2 },
     },
 
     -- Used only when nothing in `vehicles` for the region resolves to a model
@@ -703,13 +718,15 @@ Config.Ambient = {
     -- Per-client trace of ambient spawning and radar enforcement. Off for
     -- release; turn on when diagnosing placement or detection, alongside the
     -- /ambientpolice and /radartrace commands.
+    -- With debug on, the trace is also relayed to the server console, and the
+    -- last 50 lines can be dumped there with the `fenixdiag` console command.
     debug = false,
 }
 
 
 -- MOVING VIOLATIONS --
--- [Upstate Mafia] Non-speed traffic offences: wrong-way driving, riding a
--- motorcycle without a helmet, wheelies/stoppies, and phone use while driving.
+-- [Upstate Mafia] Non-speed traffic offences: riding a motorcycle without a
+-- helmet, wheelies/stoppies, and phone use while driving.
 -- Modeled on inspiration from the "Pull Me Over" singleplayer mod, reimplemented
 -- from scratch against this resource's own witness/wanted pipeline rather than
 -- ported (that mod is a ScriptHookVDotNet plugin; nothing in it runs on FiveM).
@@ -729,6 +746,10 @@ Config.Ambient = {
 -- locations). Those three would need a hand-surveyed intersection dataset
 -- before they could be built without constant false positives -- a separate
 -- task, not attempted here.
+--
+-- Wrong-way driving was covered once and removed: GET_CLOSEST_ROAD's lane
+-- counts and heading aren't reliable enough to tell a one-way carriageway from
+-- the correct side of an ordinary road, so it cited players driving normally.
 Config.Violations = {
     -- How far / wide an ambient officer can notice one of these from, same
     -- shape as Config.Ambient.radar.copDetectRange (a plain radius, not an
@@ -737,20 +758,6 @@ Config.Violations = {
     witnessRange = 35.0,
 
     tickMs = 750,
-
-    wrongWay = {
-        enabled = true,
-        -- Below this the car could just be turning, parking, or nosing out of
-        -- a driveway -- not yet "driving" against traffic.
-        minSpeedMph = 15,
-        -- FenixRoads.roadInfoAt() is trusted only when it found a real
-        -- GET_CLOSEST_ROAD segment (road.approximate == false) AND that
-        -- segment is genuinely one-directional (one of fwdLanes/bwdLanes is
-        -- zero) -- an ordinary two-way street can't be "wrong way" by this
-        -- check, only a one-way street or one carriageway of a divided road.
-        wantedLevel = 1,
-        cooldownSeconds = 60,
-    },
 
     noHelmet = {
         enabled = true,
@@ -851,15 +858,16 @@ Config.FootChase = {
 -- Config.FootChase.giveUpDistance: without this, a player who can simply
 -- outrun a jogging officer for 80m gets away for free, every time.
 --
--- Triggered globally (client.lua's watchForGlobalK9Trigger thread): the
--- moment the wanted level rises while the player is on foot, past
--- minWantedLevel and the cooldown below, a dog is released -- not tied to
--- any specific unit having caught up and started its own foot chase first
--- (that older path, handleK9Backup, is still in client.lua but no longer
--- called -- see the comment where handleChaseBehavior used to invoke it).
--- It's client-local/non-networked the same way client/tactics.lua's
--- roadblock and spike-strip peds are -- see that file's header for why
--- that's the established pattern here.
+-- A dog never appears out of nowhere: it comes out of a real ground unit that
+-- is within deployRange of the player, stopped (maxDeploySpeed), and still has
+-- a living officer with it (handlerRange) -- it gets out at that car's
+-- tailgate. Called off (surrender, the player back in a car, too far from its
+-- car, car and handler both gone), it runs back to the car -- or the handler
+-- if the car is gone -- and is loaded up on arrival. No qualifying unit
+-- nearby means no dog, however wanted the player is. See client.lua's
+-- K9 UNITS section. It's client-local/non-networked the same way
+-- client/tactics.lua's roadblock and spike-strip peds are -- see that file's
+-- header for why that's the established pattern here.
 --
 -- The dog itself needs no bespoke "bite and arrest" scripting: TASK_COMBAT_PED
 -- on an animal ped is already GTA's own K9 attack (melee, no weapon), and a
@@ -879,20 +887,29 @@ Config.K9 = {
     -- A real department doesn't send a dog after a level-1 jaywalker.
     minWantedLevel = 2,
 
-    -- Vestigial: only read by the disabled legacy path (handleK9Backup in
-    -- client.lua, no longer called). The active global trigger releases a
-    -- dog immediately on the wanted-level rise, not after a delay.
-    releaseAfterFootChaseMs = 25000,
+    -- A unit's car must be within this many metres of the player to deploy
+    -- its dog, and moving no faster than maxDeploySpeed (m/s, ~3 = crawling)
+    -- -- a dog doesn't jump out of a cruiser doing 40.
+    deployRange = 60.0,
+    maxDeploySpeed = 3.0,
 
-    -- Spawned this far behind the player along their current heading, so it
-    -- isn't just standing there in view the instant it's released.
-    spawnDistance = 18.0,
+    -- The handler: a living officer of that unit, in the car or on foot within
+    -- this many metres of it. No handler, no dog.
+    handlerRange = 20.0,
 
-    -- Give up (and delete) if the player somehow pulls back ahead of it by
-    -- this much -- got back in a car and drove off, mainly. A dog chasing a
-    -- car forever is a straggling ped, same reasoning as
-    -- Config.FootChase.giveUpDistance.
+    -- Optional whitelist of vehicle model names that carry a dog, e.g.
+    -- { 'yourcity_k9' }. Empty = any ground unit can.
+    vehicleModels = {},
+
+    -- Recall the dog if the player pulls this far ahead of it -- got back in a
+    -- car and drove off, mainly -- or if the chase drags it this far from its
+    -- own car/handler (leashDistance).
     giveUpDistance = 60.0,
+    leashDistance = 90.0,
+
+    -- How long (ms) a recalled dog gets to reach its car before it's removed
+    -- the moment it's off screen (and unconditionally 15s after that).
+    returnTimeoutMs = 20000,
 
     -- Cooldown (ms) before another dog can be released after the last one is
     -- lost, killed or given up on.
@@ -1154,6 +1171,41 @@ Config.controlWaitCount = 6
 Config.maxUnitsPerLevel = {2, 3, 4, 6, 10} -- Maximum ground units for each wanted level
 Config.maxHeliUnitsPerLevel = {0, 1, 1, 2, 4} -- Maximum heli units for each wanted level
 Config.maxAirUnitsPerLevel = {0, 0, 0, 0, 1} -- Maximum plane units for each wanted level
+
+-- RESPONSE PACING (Upstate Mafia) --
+-- How quickly units actually show up once you're wanted. Without this the full
+-- allowance above spawned the same second the star appeared, 80-140m away --
+-- break into a car, and two cruisers were already round the corner. Each list
+-- is indexed by wanted level 1..5.
+Config.Response = {
+    enabled = true,
+
+    -- Seconds from first going wanted until the first ground unit (or heli) is
+    -- sent. Lose the wanted level inside this window and nobody comes at all.
+    initialDelay = { 35, 20, 10, 5, 0 },
+
+    -- Seconds between each further ground unit, so they arrive one by one.
+    unitInterval = { 20, 12, 8, 4, 2 },
+
+    -- { min, max } ground-unit spawn distance in metres. A missing level falls
+    -- back to Config.minPoliceSpawnDistance / maxPoliceSpawnDistance.
+    spawnDistance = {
+        { 180.0, 280.0 },
+        { 140.0, 240.0 },
+        { 100.0, 180.0 },
+        { 80.0, 140.0 },
+        { 80.0, 140.0 },
+    },
+
+    -- The delay is for a unit driving in after a call-in. Skip it if you open
+    -- fire, or if an officer already has eyes on you (they watched it happen).
+    skipDelayWhenShooting = true,
+    skipDelayOnContact = true,
+
+    -- Never spawn a pursuit unit inside your view unless there's genuinely
+    -- nowhere else to put it.
+    avoidVisibleSpawns = true,
+}
 
 -- This controls whether ground units will spawn if the player is in a helicopter, already spawned units aren't removed.
 Config.spawnGroundUnitsInHeli = true
@@ -1585,6 +1637,33 @@ Config.Driving = {
     -- standing in the road forever is worse than one visible teleport.
     reboardPatience        = 12,
     reboardGiveUpDistance  = 45.0,
+
+    -- SEARCH SWEEP WAYPOINTS --
+    -- A unit that's lost contact and is within the current search radius used
+    -- to get one TaskVehicleDriveWander for the whole search -- a genuine
+    -- random wander, no memory of where it had already looked. This is what
+    -- turns that into a series of directed stops instead: see the 'Sweep'
+    -- branch of handleChaseBehavior in client.lua.
+    sweepArriveDistance    = 12.0,  -- close enough to the current waypoint to pick a new one
+    sweepWaypointTimeoutMs = 9000,  -- give up on the current waypoint and pick another after this long
+    sweepMinSeparation     = 25.0,  -- don't pick a point this close to one of the unit's own recent waypoints
+    sweepHistorySize       = 3,     -- how many recent waypoints per unit count as "recently visited"
+    sweepSampleAttempts    = 6,     -- candidate points tried before falling back to a plain wander for one cycle
+
+    -- Ideal following distance for the close-range TaskVehicleChase state
+    -- (SET_TASK_VEHICLE_CHASE_IDEAL_PURSUIT_DISTANCE), indexed by wanted
+    -- level like ability/aggression above. Never called before this existed,
+    -- so every unit followed at the native's own unscaled default regardless
+    -- of how serious the pursuit actually was. Tight at high wanted levels --
+    -- a unit that's decided to end this now -- looser at low ones, where a
+    -- real patrol car is still mostly just following.
+    pursuitDistance = {
+        [1] = 14.0,
+        [2] = 12.0,
+        [3] = 10.0,
+        [4] = 8.0,
+        [5] = 6.0,
+    },
 }
 
 
@@ -1646,7 +1725,9 @@ Config.Tactics = {
     -- One car per blocked lane, parked broadside. Officers stand behind the
     -- line, facing back down the road, and hold position — the block is the
     -- obstacle, it is not an ambush.
-    roadblockVehicles = { 'police', 'police2', 'police3', 'sheriff' },
+    -- ONX EVP cruisers; each gets the livery for wherever the block is placed
+    -- (Config.Liveries), and falls back to a stock cruiser if not installed.
+    roadblockVehicles = { 'onx_polbuff', 'onx_polscout', 'onx_polalamo', 'onx_polmerit2' },
     roadblockOfficers = 2,
 
     -- ── Spike strips ────────────────────────────────────────────────────────
@@ -1932,6 +2013,259 @@ Config.Jurisdiction = {
     handoffRadio = true,
 }
 
+-- Central incident/dispatch layer (server/incident.lua, server/dispatch.lua).
+-- Off by default: the legacy fenix:server:trigger -> wanted-level pipeline
+-- keeps working unchanged (Config.Dispatch.enabled = false), so turning
+-- this on is opt-in rather than a behavior change for existing servers.
+Config.Dispatch = {
+    enabled = false,
+    debug = false,
+
+    -- How long a resolved/cancelled incident is kept around before the
+    -- registry drops it (so /fenixincidents keeps showing recent history
+    -- briefly instead of vanishing immediately on resolution).
+    incidentMaxAgeMs = 30 * 60 * 1000,
+
+    -- How long a CREATED/DISPATCHING incident can sit with zero assigned
+    -- units before it's treated as abandoned and cleaned up.
+    abandonedIncidentMs = 5 * 60 * 1000,
+
+    -- How far from an EMS/fire incident the server will look for a player
+    -- to host that unit's simulation (see nearestPlayer() in
+    -- server/dispatch.lua). No player within range means the call goes
+    -- unanswered rather than being handed to someone who can't plausibly
+    -- see it.
+    maxHostSearchRadius = 300.0,
+
+    -- Which agencies a given incident type calls for. Anything not listed
+    -- defaults to {'police'} (see server/dispatch.lua agenciesFor()).
+    unitsNeeded = {
+        LEGACY_ALERT = { 'police' },
+        SHOOTING = { 'police', 'ems' },
+        ROBBERY = { 'police' },
+        ASSAULT = { 'police', 'ems' },
+        STOLEN_VEHICLE = { 'police' },
+        MEDICAL = { 'ems' },
+        FIRE = { 'fire', 'ems' },
+        VEHICLE_FIRE = { 'fire' },
+        TRAFFIC_COLLISION = { 'police', 'ems' },
+    },
+
+    -- Severity (1-5) an incident type gets when the caller doesn't specify
+    -- one explicitly.
+    defaultSeverity = {
+        LEGACY_ALERT = 1,
+        SHOOTING = 4,
+        ROBBERY = 3,
+        ASSAULT = 2,
+        STOLEN_VEHICLE = 2,
+        MEDICAL = 2,
+        FIRE = 3,
+        VEHICLE_FIRE = 2,
+        TRAFFIC_COLLISION = 2,
+    },
+
+    -- severity (index) -> wanted level applied to nearby players, for
+    -- incidents whose agency list includes 'police'. Index 1 = severity 1.
+    severityToWanted = { 1, 1, 2, 3, 5 },
+}
+
+-- Civilian gunfire witnessing (client/witness.lua). Requires
+-- Config.Dispatch.enabled = true as well -- this only feeds incidents into
+-- that system, it does nothing on its own.
+Config.Witness = {
+    enabled = false,
+    debug = false,
+
+    -- Box half-extent (metres) checked around each client for gunfire.
+    radius = 60.0,
+
+    -- How often each client polls for gunfire.
+    intervalMs = 4000,
+
+    -- Minimum time between reports from the SAME client, so a sustained
+    -- firefight doesn't spam one report per poll.
+    reportCooldownMs = 20000,
+
+    -- Server-side: how far a reported location may be from the reporting
+    -- player (anti-spoofing, same idea as Config.Security.maxAlertDistance).
+    maxReportDistance = 80.0,
+
+    -- Server-side: how many reports per minute a single player may send
+    -- before FenixGuard starts dropping them.
+    reportsPerMinute = 6,
+
+    -- Server-side: reports within this radius/time of an existing
+    -- unresolved SHOOTING incident are folded into it instead of creating a
+    -- new one, so N witnesses near the same gunfire produce one incident.
+    dedupeRadius = 60.0,
+    dedupeWindowMs = 30000,
+}
+
+-- EMS ground response (server/ems.lua, client/ems.lua). Requires
+-- Config.Dispatch.enabled = true -- EMS units are only ever spawned in
+-- response to an incident that FenixDispatch decided needs the 'ems'
+-- agency (see Config.Dispatch.unitsNeeded).
+Config.EMS = {
+    enabled = false,
+    debug = false,
+
+    -- First entry rides the driver seat, the rest fill passenger seats --
+    -- see client/ems.lua's spawn handler.
+    vehicle = 'ambulance',
+    peds = { 's_m_m_paramedic_01', 's_m_m_paramedic_01' },
+
+    -- How many EMS units a single client may be hosting at once (see the
+    -- host-selection note in server/dispatch.lua -- one player's client
+    -- simulates each EMS response).
+    maxUnits = 2,
+
+    spawnMinDistance = 60.0,
+    spawnMaxDistance = 140.0,
+    arriveDistance = 8.0,
+    driveSpeed = 20.0,
+
+    -- How long the treatment beat (CODE_HUMAN_MEDIC_KNEEL) runs before the
+    -- medic re-boards and the unit heads to hospital.
+    treatmentTimeMs = 8000,
+
+    -- Incidents at or above this severity hold the ambulance back
+    -- (STAGING) for stagingHoldMs before it approaches -- a fixed timer
+    -- standing in for real "has police secured the scene" detection, which
+    -- needs the unit-position registry noted in server/dispatch.lua's
+    -- header comment. Set stagingHoldMs to 0 to disable staging entirely.
+    dangerousSeverity = 3,
+    stagingHoldMs = 8000,
+
+    -- Pillbox Hospital, the same coordinate qbx_ambulancejob's own config
+    -- uses (resources/[qbx]/qbx_ambulancejob/config/shared.lua) so patients
+    -- end up at the hospital players already know as "the" hospital.
+    hospitalCoords = vector3(304.27, -600.33, 43.28),
+
+    tickMs = 1500,
+}
+
+-- Fire ground response (server/fire.lua, client/fire.lua). Requires
+-- Config.Dispatch.enabled = true, same as EMS.
+Config.Fire = {
+    enabled = false,
+    debug = false,
+
+    vehicle = 'firetruk',
+    peds = { 's_m_y_fireman_01', 's_m_y_fireman_01' },
+
+    maxUnits = 1,
+    spawnMinDistance = 60.0,
+    spawnMaxDistance = 140.0,
+    arriveDistance = 10.0,
+    driveSpeed = 20.0,
+
+    -- Suppression polls FIRE::GET_NUMBER_OF_FIRES_IN_RANGE and calls
+    -- STOP_FIRE_IN_RANGE every tick within this radius until it reads zero
+    -- or maxSuppressMs elapses (whichever first -- a fire started by a
+    -- large explosion can outlast a single truck's crew).
+    suppressRadius = 15.0,
+    maxSuppressMs = 30000,
+
+    tickMs = 1500,
+}
+
+-- Civilian fire witnessing (client/firewatch.lua) -- the FIRE-incident
+-- counterpart to Config.Witness (gunfire).
+Config.FireWatch = {
+    enabled = false,
+    debug = false,
+
+    radius = 50.0,
+    intervalMs = 5000,
+    reportCooldownMs = 20000,
+
+    maxReportDistance = 80.0,
+    reportsPerMinute = 6,
+
+    dedupeRadius = 50.0,
+    dedupeWindowMs = 30000,
+}
+
+-- Police investigation response (server/investigate.lua,
+-- client/investigate.lua) -- what handles a police-needing incident that
+-- has no known suspect (applyWanted = false), most commonly a civilian
+-- gunfire report from client/witness.lua. Requires
+-- Config.Dispatch.enabled = true.
+Config.Investigate = {
+    enabled = false,
+    debug = false,
+
+    -- Same ONX EVP cruiser the marked pursuit fleet uses
+    -- (Config.vehiclesByRegion), not a plain base-game car -- falls back to
+    -- stock 'police' if the ONX pack isn't installed on a given client
+    -- (client/livery.lua's resolveModel/apply, same as everywhere else).
+    vehicle = 'onx_polbuff',
+    vehicleFallback = 'police',
+    peds = { 's_m_y_cop_01' },
+
+    maxUnits = 1,
+    spawnMinDistance = 60.0,
+    spawnMaxDistance = 140.0,
+    arriveDistance = 10.0,
+    driveSpeed = 15.0,
+
+    -- Before spawning a fresh unit, look for an already-wandering ambient
+    -- patrol (client/ambient.lua) within this radius and reuse it instead
+    -- (client/investigate.lua's ClaimNearbyPatrolForInvestigation). 0
+    -- disables reuse and always spawns fresh.
+    reuseNearbyPatrolRadius = 120.0,
+
+    -- How long the CODE_HUMAN_POLICE_INVESTIGATE beat runs before the
+    -- officer re-boards and clears -- see client/investigate.lua's header
+    -- for why this never actually finds anything yet.
+    investigateTimeMs = 15000,
+
+    tickMs = 1500,
+}
+
+-- Crash detection (client/collision.lua) -- see that file's header for why
+-- this only watches the local player's own vehicle. Requires
+-- Config.Dispatch.enabled = true.
+Config.Collision = {
+    enabled = false,
+    debug = false,
+
+    intervalMs = 1000,
+
+    -- A body-health drop of at least this much within one poll, while the
+    -- vehicle was moving at least minSpeedForCrash, is treated as a crash.
+    healthDropThreshold = 150.0,
+    minSpeedForCrash = 15.0, -- m/s, ~54 km/h
+
+    reportCooldownMs = 20000,
+    maxReportDistance = 60.0,
+    reportsPerMinute = 6,
+
+    dedupeRadius = 40.0,
+    dedupeWindowMs = 30000,
+}
+
+-- Live unit position registry (server/unit_registry.lua). The prerequisite
+-- server/dispatch.lua's header comment describes for real nearest-unit
+-- dispatch -- collects data only in this pass, nothing yet reroutes a live
+-- unit based on it. Off by default; even when off, client.lua's reporting
+-- thread costs nothing beyond one idle Wait().
+Config.UnitRegistry = {
+    enabled = false,
+
+    -- How often each client reports its own units' positions.
+    reportIntervalMs = 5000,
+
+    -- Server-side: an entry not refreshed within this window is dropped
+    -- (unit despawned, player disconnected, etc).
+    staleAfterMs = 20000,
+
+    -- Server-side: cap on entries processed from a single report batch, so
+    -- a client can't inflate the registry with a huge table.
+    maxReportsPerBatch = 20,
+}
+
 
 -- SPAWN DISTANCES ETC --
 
@@ -2125,6 +2459,47 @@ Config.zones = {
     ZQ_UAR = { name = 'Davis Quartz', location = 'Countryside' }
 }
 
+-- LIVERIES (Upstate Mafia) --
+-- Which agency paint job a multi-livery add-on cruiser (the ONX EVP cars) gets
+-- at spawn. Labels are the pack's own carcols.meta livery names; every ONX
+-- police car carries the full set -- LIV_LSPD, LIV_LSSD, LIV_BCSO, LIV_PBSD,
+-- LIV_GSSD, LIV_SAHP, LIV_SASP, LIV_DPPD, LIV_DPD, LIV_RHPD, LIV_DOC, plus a
+-- "2" single-colour variant of most (LIV_LSPD2, ...). Precedence: a
+-- Config.vehiclesByRegion entry's own `livery` field, then byModel, then
+-- byRegion for wherever the car spawns. Listing several picks one at random.
+-- Stock base-game cars have no livery mods and are never touched.
+Config.Liveries = {
+    enabled = true,
+
+    byRegion = {
+        losSantos   = { 'LIV_LSPD' },
+        paletoBay   = { 'LIV_PBSD', 'LIV_BCSO' },
+        sandyShores = { 'LIV_BCSO' },
+        countryside = { 'LIV_BCSO', 'LIV_GSSD' },
+    },
+
+    -- Units that belong to one agency wherever they turn up.
+    byModel = {
+        onx_polbuffhf  = { 'LIV_SAHP' }, -- Buffalo Hellfire interceptor: highway patrol
+        onx_polinvict2 = { 'LIV_SASP' }, -- Invictus Overland: state parks rangers
+    },
+
+    -- How a Config.vehiclesByRegion entry with `unmarked = true` is dressed:
+    -- livery removed, these extras switched off (1 = roof lightbar on every
+    -- ONX car, per the pack README), and one of these paint colours (GTA colour
+    -- indices: 0 black, 1 graphite, 2 black steel, 3 dark silver, 4 silver).
+    -- Only applied to a car that actually has ONX-style liveries -- a stock
+    -- `fallback` model like police4 is already unmarked and is left alone.
+    unmarked = {
+        extrasOff = { 1 },
+        colours   = { 0, 1, 2, 3, 4 },
+    },
+
+    -- Prints when a model is missing (fallback used) or has none of the
+    -- requested liveries.
+    debug = false,
+}
+
 -- The ZoneEnum maps location names from the above table to the Config.vehiclesByRegion key from the table below. 
 -- This shouldn't be changed unless you know what you're doing. The location names above, enum list, and Config.vehiclesByRegion must be kept in sync.
 -- Make sure any changes you make are reflected in all three. 
@@ -2147,57 +2522,73 @@ Config.ZoneEnum = {
 -- Peds should include the model codes for peds you want to possibly spawn with the car, they are selected randomly.
 -- primaryWeaponGroup corresponds to the weapon table you'd like the primary weapon from. Peds will always have a primary weapon.
 -- secondaryWeaponGroup corresponds to the weapon table you'd like the 
+-- [Upstate Mafia] Marked units are ONX EVP cars; their agency livery comes
+-- from Config.Liveries (by region, or by model for the highway-patrol and
+-- state-parks units), or an entry's own `livery = 'LIV_...'` field if set. A
+-- client missing the pack spawns a stock cruiser from
+-- Config.Ambient.vehicleFallback instead -- or the entry's own `fallback` model
+-- if it sets one. `unmarked = true` spawns the car with no agency livery, its
+-- lightbar off and a plain paint colour (Config.Liveries.unmarked). Riot,
+-- motorcycle and helicopter units stay base-game -- ONX has no equivalent, and
+-- only the CARS were meant to change. FIB units are unmarked ONX cars with the
+-- base-game FIB car as their `fallback`, so a client without the pack still
+-- gets the stock fbi/fbi2.
 Config.vehiclesByRegion = {
     losSantos = {
-        { model = 'police', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol' },
-        { model = 'police2', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol'  },
-        { model = 'police3', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'patrol'  },
-        { model = 'police4', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover'  },
+        { model = 'onx_polbuff', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol' },
+        { model = 'onx_polscout', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol'  },
+        { model = 'onx_polmerit2', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'patrol'  },
+        { model = 'onx_poltavros', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'patrol'  },
+        { model = 'onx_polbuffhf', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 2, spawnChance = 2, numPeds = 2, loadout = 'patrol' },
+        { model = 'onx_polbuff', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
         -- [Upstate Mafia] policet (police transporter) removed entirely
-        { model = 'police3', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover' },
+        { model = 'onx_polscout', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
-        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
+        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
+        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
 
     },
     -- [Upstate Mafia] Rebalanced: riot at wantedLevel=5 only, sheriff boosted, FBI reduced
     paletoBay = {
         { model = 'policeb', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 1, loadout = 'bike' },
-        { model = 'sheriff', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
-        { model = 'sheriff2', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
-        { model = 'police3', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover' },
+        { model = 'onx_polalamo', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polsand', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polgrang', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polgrang2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
-        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
+        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
+        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
     },
     -- [Upstate Mafia] Rebalanced: riot at wantedLevel=5 only, sheriff boosted, FBI reduced
     sandyShores = {
         { model = 'policeb', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 1, loadout = 'bike' },
-        { model = 'sheriff', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
-        { model = 'sheriff2', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
-        { model = 'police3', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover' },
+        { model = 'onx_polalamo', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 4, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polbison', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polsand', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polgrang2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
-        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
+        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
+        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
     },
     -- [Upstate Mafia] Rebalanced: riot at wantedLevel=5 only, sheriff/ranger boosted, FBI reduced
     countryside = {
         { model = 'policeb', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 1, loadout = 'bike' },
-        { model = 'sheriff', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 4, numPeds = 2, loadout = 'sheriff' },
-        { model = 'sheriff2', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 4, numPeds = 2, loadout = 'sheriff' },
-        { model = 'pranger', peds = { 's_m_y_ranger_01', 's_f_y_ranger_01'}, wantedLevel = 1, spawnChance = 8, numPeds = 2, loadout = 'ranger' },
-        { model = 'police4', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover' },
-        { model = 'police3', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 4, numPeds = 2, loadout = 'undercover' },
+        { model = 'onx_polalamo', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polsand', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
+        { model = 'onx_polbuffhf', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'patrol' },
+        { model = 'onx_polinvict2', peds = { 's_m_y_ranger_01', 's_f_y_ranger_01'}, wantedLevel = 1, spawnChance = 8, numPeds = 2, loadout = 'ranger' },
+        { model = 'onx_polmerit2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
+        { model = 'onx_polgrang2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 4, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
-        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
+        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
+        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
     }
 }
 
 Config.polHelis = {
-    { model = 'polmav', pilots = {"S_M_M_Pilot_02"}, numPilots = 2, peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, numPeds = 2, wantedLevel = 3, spawnChance = 1, loadout = 'airPatrol' },   
-    { model = 'buzzard2', pilots = {"S_M_M_Pilot_02"}, numPilots = 2, peds = {'S_M_M_CIASec_01'}, numPeds = 2, wantedLevel = 3, spawnChance = 1, loadout = 'airPatrol' },   
-    { model = 'polmav', pilots = {"S_M_M_Pilot_02"}, numPilots = 2, peds = {'S_M_Y_Swat_01'}, numPeds = 2, wantedLevel = 4, spawnChance = 1, loadout = 'airPatrol' }, 
+    { model = 'polmav', pilots = {"S_M_M_Pilot_02"}, numPilots = 2, peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, numPeds = 2, wantedLevel = 3, spawnChance = 1, loadout = 'airPatrol' },
+    { model = 'buzzard2', pilots = {"S_M_M_Pilot_02"}, numPilots = 2, peds = {'S_M_M_CIASec_01'}, numPeds = 2, wantedLevel = 3, spawnChance = 1, loadout = 'airPatrol' },
+    { model = 'polmav', pilots = {"S_M_M_Pilot_02"}, numPilots = 2, peds = {'S_M_Y_Swat_01'}, numPeds = 2, wantedLevel = 4, spawnChance = 1, loadout = 'airPatrol' },
 }
 
 Config.milHelis = {

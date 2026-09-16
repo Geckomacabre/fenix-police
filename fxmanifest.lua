@@ -13,6 +13,12 @@ shared_scripts {
     'config.lua',
     'data/ambient_points.lua',
 
+    -- Generic per-unit state machine (FenixFSM). No natives, no networking --
+    -- just state + timing, so both sides can load it. Not yet used by the
+    -- existing officer AI (see the file's own header comment for why); new
+    -- unit types (EMS, fire) are built on it from the start.
+    'shared/unit_fsm.lua',
+
     -- Per-server overrides, loaded last so they win over everything above.
     -- The directory is gitignored and absent from a clean checkout — a glob that
     -- matches nothing is a no-op, which is the whole reason this is a directory
@@ -32,6 +38,10 @@ client_scripts {
     -- Shared road/lane/no-go-zone helper. Loaded first: both scripts below call
     -- into the FenixRoads global it defines.
     'client/roads.lua',
+
+    -- Agency livery + installed-model fallback for add-on cruisers. Loaded
+    -- before every spawner (tactics/client/ambient) that calls FenixLivery.
+    'client/livery.lua',
 
     -- GPS tracker model. Loaded before pursuit.lua, whose contact thread
     -- calls into the FenixTracker global this defines.
@@ -55,10 +65,29 @@ client_scripts {
     'client/client.lua',
     'client/ambient.lua',
 
-    -- Moving violations (wrong-way, no helmet, wheelie, phone use). Loaded
-    -- last: reads the FenixRoads global from roads.lua, ApplyWantedLevel from
-    -- client.lua, and calls exports('fenix-police'):IsWitnessed, added in
-    -- ambient.lua.
+    -- Civilian gunfire witnessing -> FenixDispatch incident creation. Reads
+    -- Config.Dispatch/Config.Witness only; no dependency on the files above,
+    -- placed here purely to keep all the "opt-in incident system" files
+    -- together.
+    'client/witness.lua',
+
+    -- Crash detection, same "opt-in incident system" grouping.
+    'client/collision.lua',
+
+    -- EMS ground response. Reads FenixRoads (loaded above) and FenixFSM
+    -- (shared/unit_fsm.lua, shared_scripts).
+    'client/ems.lua',
+
+    -- Fire witnessing + ground response, same shape as the EMS pair above.
+    'client/firewatch.lua',
+    'client/fire.lua',
+
+    -- Police investigation response (no-suspect calls), same shape again.
+    'client/investigate.lua',
+
+    -- Moving violations (no helmet, wheelie, phone use). Loaded last: reads
+    -- ApplyWantedLevel from client.lua and calls
+    -- exports('fenix-police'):IsWitnessed, added in ambient.lua.
     'client/violations.lua'
 }
 
@@ -67,6 +96,16 @@ server_scripts {
     -- server.lua's net event handlers call into the FenixGuard global it
     -- defines, and a handler that ran before it existed would be an open door.
     'server/guard.lua',
+
+    -- Incident registry and dispatch reasoning (FenixIncident/FenixDispatch).
+    -- Loaded before server.lua, whose fenix:server:trigger handler calls
+    -- into FenixDispatch when Config.Dispatch.enabled is true.
+    'server/incident.lua',
+    'server/dispatch.lua',
+    'server/unit_registry.lua',
+    'server/ems.lua',
+    'server/fire.lua',
+    'server/investigate.lua',
 
     'server/server.lua',
 
