@@ -68,8 +68,18 @@ end
 --- are the reason this exists: the region lists name models from packs a given
 --- server may not run, and a missing pack has to be an entry that's skipped, not
 --- a spawn that fails.
+---
+--- Delegates to FenixLivery.isInstalled (IsModelInCdimage + IsModelAVehicle)
+--- rather than IS_MODEL_VALID, which this used to call directly. The two are
+--- not equivalent: IS_MODEL_VALID can report true for a model hash the
+--- streaming system doesn't actually have full data for yet, which meant
+--- ambient scenes could pick an ONX model regionVehicle() then failed to
+--- properly livery -- the same client's own wanted-level pursuit spawn
+--- (client.lua, via FenixLivery.resolveModel) uses the CdImage check and
+--- worked correctly, which is what pointed at this being the divergence
+--- rather than the pack simply not being installed.
 local function modelInstalled(modelName)
-    return type(modelName) == 'string' and IsModelValid(GetHashKey(modelName))
+    return FenixLivery.isInstalled(modelName)
 end
 
 --- Pick from a model table, skipping anything `valid` rejects.

@@ -147,6 +147,25 @@ Both `client.lua` and `client/ambient.lua` were only ever appended to for
 this — every existing function in both files (the pursuit/combat loop, the
 scene state machine) is untouched.
 
+### Fixed: ambient cops (patrol, stop, radar, pursuit, etc.) all spawning as plain base-game cruisers
+
+The ONX EVP pack was actually installed and working — the player's own
+wanted-level pursuit units (`client.lua`, via `FenixLivery.resolveModel` /
+`isInstalled`, which checks `IsModelInCdimage` + `IsModelAVehicle`) picked
+up the correct model and livery every time. Every ambient cop vehicle
+(`client/ambient.lua`'s `createVehicle`, used by every scene kind —
+patrol, stop, radar, post, convoy, and the pursuit/carjack cop cars)
+instead went through a second, separate "is this model installed" check
+(`modelInstalled`, using `IS_MODEL_VALID`) that isn't equivalent: it could
+report a model valid before the streaming system actually had full data
+for it, so `regionVehicle()` kept picking (and then failing to properly
+resolve/livery) an ONX model that the OTHER check would have caught.
+
+`modelInstalled` now delegates to `FenixLivery.isInstalled` instead of
+maintaining its own separate check — one implementation of "can this
+client actually spawn this add-on model" for the whole resource, matching
+the path already proven to work.
+
 ### Fixed: investigation units spawned as a plain base-game cruiser
 
 `client/investigate.lua`'s fresh-spawn path (used when there's no nearby
