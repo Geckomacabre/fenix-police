@@ -147,7 +147,9 @@ end
 local function regionVehicle()
     local model = pickWeighted(regionList(cfg().vehicles), modelInstalled)
     if model then return model end
-    return pick(regionList(cfg().vehicleFallback)) or 'police'
+    local fallback = pick(regionList(cfg().vehicleFallback)) or 'police'
+    dbg(('regionVehicle: nothing in %s.vehicles resolved installed, using fallback %s'):format(regionKey(), fallback))
+    return fallback
 end
 
 --- Weighted pick over Config.Ambient.weights, skipping kinds weighted 0.

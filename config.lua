@@ -1523,7 +1523,8 @@ Config.Pursuit = {
     dispatchDuration = 6000,   -- how long the notification sits on screen
 
     -- Route radio traffic somewhere else (a scanner UI, a phone app, ox_lib).
-    -- Receives the finished string. Leave nil for QBCore notifications.
+    -- Receives the finished string. Leave nil for the built-in notification
+    -- (qb-core/qbx_core if running, otherwise a plain native fallback).
     -- dispatchHandler = function(text) exports['my_scanner']:Say(text) end,
     dispatchHandler = nil,
 

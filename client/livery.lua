@@ -107,7 +107,10 @@ end
 function FenixLivery.apply(vehicle, override, unmarked)
     if cfg().enabled == false then return end
     if not vehicle or vehicle == 0 or not DoesEntityExist(vehicle) then return end
-    if GetNumModKits(vehicle) <= 0 then return end
+    if GetNumModKits(vehicle) <= 0 then
+        dbg(('%s has no mod kits yet (spawned this tick?), skipping livery'):format(GetDisplayNameFromVehicleModel(GetEntityModel(vehicle))))
+        return
+    end
 
     SetVehicleModKit(vehicle, 0)
     local count = GetNumVehicleMods(vehicle, LIVERY_MOD)

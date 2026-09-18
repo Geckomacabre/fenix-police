@@ -38,6 +38,29 @@ carjacking provenance note below.
 
 ## Unreleased
 
+### Changed: qb-core/qbx_core is now optional, not required
+
+Every direct `QBCore.Functions.*` call (notifications, the on-duty
+police-job check, nearest-vehicle lookup, all vehicles, online-police
+counting, traffic-fine charging) now goes through a small compatibility
+layer instead — `client/framework.lua` and `server/framework.lua`, both
+loaded first among their respective scripts.
+
+`FenixFramework` looks for `qbx_core`/`qb-core` at startup (and re-checks on
+its start/stop) and uses it when present, for the same behaviour as before.
+With neither running, it falls back to plain natives: notifications use
+ox_lib if present, otherwise a native GTA feed message; vehicle lookups walk
+the native vehicle pool; there's no job system, so no connected player is
+ever treated as an on-duty officer; and traffic fines are issued as unpaid
+warnings rather than actually charged (`server/server.lua`'s existing
+`allowUnpaid` handling covers this the same way it already covers a broke
+player).
+
+Net effect: this resource now drops into a plain FiveM server, or any
+non-QBCore framework, and runs standalone with zero errors and zero
+dependency on a job/money system that isn't there. On a QBCore/QBX server
+nothing changes.
+
 ### Added: opt-in incident/dispatch layer, civilian witness reports, EMS and fire response
 
 New central incident registry (`server/incident.lua`, `FenixIncident`) and

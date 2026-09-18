@@ -393,8 +393,8 @@ local function checkSpikeHits()
 
             if burst > 0 then
                 dbg(('spikes hit: %d tyre(s)'):format(burst))
-                if cfg().spikeNotify ~= false and QBCore and QBCore.Functions then
-                    QBCore.Functions.Notify(cfg().spikeMessage or 'Spike strip!', 'error', 4000)
+                if cfg().spikeNotify ~= false then
+                    FenixFramework.Notify(cfg().spikeMessage or 'Spike strip!', 'error', 4000)
                 end
             end
         end

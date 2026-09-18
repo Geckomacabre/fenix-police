@@ -1,26 +1,12 @@
 -- POLICE JOB CHECKING LOGIC --
-QBCore = exports['qb-core']:GetCoreObject()
+-- Goes through FenixFramework (server/framework.lua, loaded first): counts
+-- real job holders when qb-core/qbx_core is running, 0 standalone -- the
+-- only sane count with no job system to check against.
 
 CreateThread(function()
     Wait(5000) -- Ensure clients are loaded first
     while true do
-        local polCount = 0
-        local players = QBCore.Functions.GetQBPlayers()
-        for _, Player in pairs(players) do
-            for _, job in ipairs(Config.PoliceJobsToCheck) do
-                if Player.PlayerData.job.name == job.jobName then
-
-                    -- Check if configured to only count on-duty players?
-                    if job.onDutyOnly then
-                        if Player.PlayerData.job.onduty then
-                            polCount = polCount + 1
-                        end
-                    else
-                        polCount = polCount + 1
-                    end
-                end
-            end
-        end
+        local polCount = FenixFramework.GetOnlinePoliceCount()
 
         -- -1 source tells ALL clients connected to update their cops online count and do logic pertaining to it.
         TriggerClientEvent('fenix-police:updateCopsOnline', -1, polCount)
@@ -1174,24 +1160,25 @@ AddEventHandler('fenix-police:server:issueTicket', function(level)
         return
     end
 
-    local Player = QBCore.Functions.GetPlayer(src)
-    if not Player then return end
-
+    -- FenixFramework.RemoveMoney/GetHeldMoney go through qb-core/qbx_core
+    -- when running; standalone (no framework, no money system to charge
+    -- against) they always report false/0, so the ticket is still issued
+    -- but never actually paid -- see the allowUnpaid handling below.
     local account = fine.account or 'bank'
     local reason  = fine.reason or 'traffic-citation'
-    local paid    = Player.Functions.RemoveMoney(account, amount, reason)
+    local paid    = FenixFramework.RemoveMoney(src, account, amount, reason)
 
     if not paid and fine.fallbackToCash ~= false and account ~= 'cash' then
-        paid = Player.Functions.RemoveMoney('cash', amount, reason)
+        paid = FenixFramework.RemoveMoney(src, 'cash', amount, reason)
     end
 
     if not paid and fine.allowUnpaid == false then
         -- Take what there is and write the rest off. Deliberately never an
         -- arrest: turning "you're broke" into a teleport to a station is exactly
         -- the outcome this whole feature exists to avoid.
-        local held = (Player.PlayerData.money and Player.PlayerData.money[account]) or 0
+        local held = FenixFramework.GetHeldMoney(src, account)
         if held > 0 then
-            Player.Functions.RemoveMoney(account, held, reason)
+            FenixFramework.RemoveMoney(src, account, held, reason)
             amount = held
             paid = true
         end

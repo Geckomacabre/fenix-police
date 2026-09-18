@@ -41,30 +41,10 @@
 
 -- ****BEGIN CODE**** --
 
--- Get the QBCore object so we can do notifications, check for nearest vehicle using their improved call, and handle isDying and isLastStand situations for the player.
-QBCore = exports['qb-core']:GetCoreObject()
-
--- [Upstate Mafia] qbx_core declares `provide 'qb-core'` (see its
--- fxmanifest.lua), so the export above transparently resolves there -- but
--- the object it returns is a snapshot from THAT resource's current script
--- environment. Restarting qbx_core (for any reason -- it happened here while
--- iterating on an unrelated admin command) invalidates every reference this
--- resource is still holding, and every subsequent call into it throws
--- "Execution of function reference in script host failed" every single tick
--- forever, since nothing here ever re-fetches it. Live-fire confirmed: this
--- is what filled a client's log with that exact error on a loop until the
--- connection timed out and the game crashed. Re-fetch whenever the resource
--- providing qb-core (co-core itself is never actually running here, only
--- qbx_core is) restarts, so a future qbx_core restart heals instead of
--- wedging every tick until this resource is also manually restarted.
-AddEventHandler('onClientResourceStart', function(resourceName)
-    if resourceName == 'qb-core' or resourceName == 'qbx_core' then
-        QBCore = exports['qb-core']:GetCoreObject()
-        if Config.isDebug then
-            print('[fenix-police] QBCore reference refreshed after ' .. resourceName .. ' restarted')
-        end
-    end
-end)
+-- Notifications, nearest-vehicle lookup, and dying/last-stand detection go
+-- through FenixFramework (client/framework.lua, loaded first) -- it prefers
+-- qb-core/qbx_core when running and falls back to plain natives when not, so
+-- this resource never hard-depends on either.
 
 -- [Upstate Mafia] Suppress policet (police transporter) globally on resource start
 Citizen.CreateThread(function()
@@ -2367,7 +2347,7 @@ local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerH
                 end
             else
                 -- Officer somehow on foot — fight or commandeer a vehicle
-                local nearbyVehicle = QBCore.Functions.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100, false)
+                local nearbyVehicle = FenixFramework.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100)
                 if nearbyVehicle then
                     local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
                     if taskStatus ~= 'EnterVehicle' then
@@ -2495,7 +2475,7 @@ local function handleAirChaseBehavior(vehicleData, playerPed, vehNetID, playerHa
                 end
             else
                 -- On foot somehow — commandeer a vehicle or fight
-                local nearbyVehicle = QBCore.Functions.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100, false)
+                local nearbyVehicle = FenixFramework.GetClosestVehicle(vector3(officerCoords.x, officerCoords.y, officerCoords.z), 100)
                 if nearbyVehicle then
                     local taskStatus = spawnedAirUnits[vehNetID].officerTasks[pedNetID]
                     if taskStatus ~= 'EnterVehicle' then
@@ -3229,7 +3209,7 @@ local function UpdateDispatchServices()
 
         if disableAIPolice == true then
 
-            QBCore.Functions.Notify('Fenix Police Response: Disabled')
+            FenixFramework.Notify('Fenix Police Response: Disabled')
             if Config.isDebug then print('Fenix Police Response: Disabled') end
 
 
@@ -3264,7 +3244,7 @@ local function UpdateDispatchServices()
 
         else
 
-            QBCore.Functions.Notify('Fenix Police Response: Enabled')
+            FenixFramework.Notify('Fenix Police Response: Enabled')
             if Config.isDebug then print('Fenix Police Response: Enabled') end
 
             SetAudioFlag('PoliceScannerDisabled', false)
@@ -3335,7 +3315,7 @@ end)
 -- this file (was `local function`, which made it invisible to everything above).
 function isPlayerPoliceOfficer()
 
-    local playerData = QBCore.Functions.GetPlayerData()
+    local playerData = FenixFramework.GetPlayerData()
     local isPolice = false
 
     if not playerData or not playerData.job then return false end
@@ -4785,13 +4765,7 @@ local function ticketMsg(key) return (ticketCfg().messages or {})[key] end
 
 local function ticketNotify(msg)
     if not msg or msg == '' then return end
-    -- QBCore is the only notification path this resource has. If it isn't there,
-    -- fall back to chat rather than swallowing the message — every one of these
-    -- is telling the player why something did or didn't happen.
-    local ok = pcall(function() QBCore.Functions.Notify(msg) end)
-    if not ok then
-        TriggerEvent('chat:addMessage', { args = { '[Police]', msg } })
-    end
+    FenixFramework.Notify(msg)
 end
 
 --- 12345 -> "12,345". Amounts are read at a glance off a notification.
@@ -5258,7 +5232,7 @@ local function isPlayerIncapacitated(playerPed)
     -- isDead global onto this state bag; check it first since it is the one
     -- signal actually proven to reflect this server's EMS state.
     if LocalPlayer.state.wsbDeadOrLastStand == true then return true end
-    local pd = QBCore and QBCore.Functions and QBCore.Functions.GetPlayerData and QBCore.Functions.GetPlayerData()
+    local pd = FenixFramework.GetPlayerData()
     local md = pd and pd.metadata or nil
     return md ~= nil and (md['isdead'] or md['inlaststand'] or md['dead']) == true
 end
@@ -5785,7 +5759,7 @@ CreateThread(function ()
         if GetPlayerWantedLevel(PlayerId()) >= 1 then 
 
             cleanupCameras = true
-            local allVehicles = QBCore.Functions.GetVehicles()
+            local allVehicles = FenixFramework.GetVehicles()
 
             -- Loop through all cars and look for emergency vehicles driven by police.
             -- This will add a cameraman, disabling their vision cone to prevent duplicates on minimap. This will allow cops to actually

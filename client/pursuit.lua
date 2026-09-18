@@ -165,10 +165,8 @@ local function dispatch(message, force)
 
     if c.dispatchHandler and type(c.dispatchHandler) == 'function' then
         c.dispatchHandler(text)
-    elseif QBCore and QBCore.Functions and QBCore.Functions.Notify then
-        QBCore.Functions.Notify(text, 'police', c.dispatchDuration or 6000)
     else
-        print('[DISPATCH] ' .. text)
+        FenixFramework.Notify(text, 'police', c.dispatchDuration or 6000)
     end
 
     dbg('radio: ' .. text)

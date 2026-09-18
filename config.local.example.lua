@@ -140,8 +140,8 @@ Config.Pursuit.blipColour     = 3        -- blue rather than the default hostile
 Config.Pursuit.blipDriversOnly = true
 ]]
 
--- Send radio traffic somewhere other than QBCore notifications. Receives the
--- finished string.
+-- Send radio traffic somewhere other than the built-in notification. Receives
+-- the finished string.
 --[[
 Config.Pursuit.dispatchHandler = function(text)
     exports['my_scanner']:Say(text)

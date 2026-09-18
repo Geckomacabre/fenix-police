@@ -31,6 +31,11 @@ dependencies {
 }
 
 client_scripts {
+    -- Optional qb-core/qbx_core glue, with a native fallback for every call
+    -- when neither is running. Loaded first: everything below that used to
+    -- reach for QBCore directly now goes through FenixFramework instead.
+    'client/framework.lua',
+
     -- Applies ped combat/task natives on the server's behalf -- those natives
     -- don't exist server-side. Self-contained, no ordering requirement.
     'client/combat_bridge.lua',
@@ -92,6 +97,9 @@ client_scripts {
 }
 
 server_scripts {
+    -- Optional qb-core/qbx_core glue, server side. See client/framework.lua.
+    'server/framework.lua',
+
     -- Entity ownership, the model allowlist and rate limiting. Loaded first:
     -- server.lua's net event handlers call into the FenixGuard global it
     -- defines, and a handler that ran before it existed would be an open door.

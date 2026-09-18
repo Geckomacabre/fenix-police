@@ -537,11 +537,19 @@ abandoned stolen cruiser no longer sits in the world forever.
 
 ## Requirements
 
-**QBCore** (or QBX), used for notifications, counting online police, nearby
-vehicle checks, dying/last-stand detection, and charging traffic fines. In
-principle it could be removed by swapping the vehicle check to the native,
-dropping notifications and last-stand logic, and setting
-`Config.TicketSystem.fine.enabled = false`.
+**Standalone** — drop it in `resources/` and `ensure` it. No framework
+required. **ox_lib** is the only hard dependency (used for a couple of tracker
+UI prompts); everything else is a plain GTA/FiveM native.
+
+**qb-core / qbx_core** (optional): if either is running, notifications, the
+on-duty police-job check, nearby-vehicle lookups, and traffic-fine charging
+all use it automatically for a more integrated feel — see
+`client/framework.lua` and `server/framework.lua`. Without it, notifications
+fall back to a native GTA feed message, vehicle lookups fall back to the
+native vehicle pool, there is no job system so the resource treats no
+connected player as an on-duty officer, and traffic fines are issued as
+warnings rather than actually charged (`Config.TicketSystem.fine` still
+governs whether a citation happens at all).
 
 No vehicle add-ons are required — ambient units ship as base-game models, and
 [weighted selection](#weighted-vehicle-selection) skips anything a client can't
@@ -551,7 +559,13 @@ spawn if you point it at your own liveries.
 
 ## Installation
 
-### 1. Edit `qb-smallresources/client/ignore.lua`
+Drag the `fenix-police` folder into `resources/`, add `ensure fenix-police` to
+`server.cfg`, and start the server — that's the whole install on a standalone
+or non-QBCore server. Steps 1–2 below only apply if you're running
+`qb-smallresources` on a QBCore/QBX server, since it fights this resource for
+control of the same police services.
+
+### 1. Edit `qb-smallresources/client/ignore.lua` (QBCore/QBX + qb-smallresources only)
 
 `qb-smallresources` disables the police services this mod needs to control
 directly.
@@ -596,7 +610,7 @@ end)
 -- end)
 ```
 
-### 2. Edit `qb-smallresources/config.lua`
+### 2. Edit `qb-smallresources/config.lua` (QBCore/QBX + qb-smallresources only)
 
 **a)** `hudComponents` contains `1` by default, which hides the wanted stars.
 Remove it — note the example below has no `1`:
