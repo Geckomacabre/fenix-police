@@ -1,16 +1,16 @@
 -------------------------------------------------------------------------------
 -- Agency liveries for multi-livery add-on cruisers (Upstate Mafia).
 --
--- The ONX EVP cars ([cars]/onx-evp-c-pack, onx-evp-c-pack2) are one model per
--- car with every agency's paint job on it as a livery MOD (mod type 48,
--- VMT_LIVERY_MOD), each labelled LIV_LSPD / LIV_BCSO / LIV_SAHP / ... in the
--- pack's carcols.meta. Spawned bare, a car carries no agency at all, so the
--- same model would read as the wrong department half the map away.
+-- Some add-on cruiser packs ship one model per car with every agency's paint
+-- job on it as a livery MOD (mod type 48, VMT_LIVERY_MOD), each labelled in the
+-- pack's carcols.meta. Spawned bare, such a car carries no agency at all, so
+-- the same model would read as the wrong department half the map away.
 --
 -- This picks the livery by LABEL, not by index -- GET_MOD_TEXT_LABEL returns
 -- the carcols modShopLabel, so the lookup survives a pack update reordering its
 -- liveries, and a stock car (no type-48 mods) is a silent no-op. See
--- Config.Liveries for which label goes where.
+-- Config.Liveries for which label goes where; with the base-game cars this
+-- resource ships with, there is nothing for it to do.
 --
 -- Also owns the "is this add-on model actually here" fallback, so a pack that
 -- fails to start (entitlement lapsed, resource stopped) degrades to stock

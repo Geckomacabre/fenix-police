@@ -153,9 +153,9 @@ local function buildAllowlist()
     for _, model in ipairs(fireCfg.peds or {}) do allowPed(model) end
 
     -- Investigation units (server/investigate.lua, client/investigate.lua).
-    -- Same reasoning again -- both the ONX model and its stock fallback
-    -- (client/livery.lua's resolveModel) need to be allowlisted, same as
-    -- every entry in Config.vehiclesByRegion.
+    -- Same reasoning again -- both the configured model and its stock
+    -- fallback (client/livery.lua's resolveModel) need to be allowlisted,
+    -- same as every entry in Config.vehiclesByRegion.
     local invCfg = Config.Investigate or {}
     allowVehicle(invCfg.vehicle)
     allowVehicle(invCfg.vehicleFallback)

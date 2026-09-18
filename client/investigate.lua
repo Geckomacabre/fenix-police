@@ -143,7 +143,7 @@ AddEventHandler('fenix-police:spawnInvestigateUnitClient', function(requestId, v
     if not incidentData then return end
 
     -- Same install-check/fallback chain the marked pursuit fleet uses
-    -- (client/livery.lua) -- without this, a missing/renamed ONX model
+    -- (client/livery.lua) -- without this, a missing/renamed add-on model
     -- would silently fail to load rather than falling back to stock.
     local modelName = FenixLivery.resolveModel(vehicleInfo.vehicle, spawnPoint, vehicleInfo.vehicleFallback)
     local vehicleHash = GetHashKey(modelName)

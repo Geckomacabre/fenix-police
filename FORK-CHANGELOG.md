@@ -201,11 +201,11 @@ The reused-ambient-patrol path was unaffected (`client/ambient.lua`'s own
 `createVehicle` already calls `FenixLivery.apply`), which is why this only
 showed up for calls where no patrol was nearby to reuse.
 
-`Config.Investigate.vehicle` is now `'onx_polbuff'` with
-`vehicleFallback = 'police'`, and the fresh-spawn path runs
-`FenixLivery.resolveModel` before creating the vehicle and
-`FenixLivery.apply` after, same as the marked pursuit fleet. Both models
-are on `server/guard.lua`'s allowlist.
+The fresh-spawn path now runs `FenixLivery.resolveModel` before creating the
+vehicle and `FenixLivery.apply` after, same as the marked pursuit fleet, so
+whatever `Config.Investigate.vehicle`/`vehicleFallback` is pointed at (a
+livery pack car on this server; stock `'police'` by default) gets the same
+treatment.
 
 ### Fixed: a reused ambient patrol could wear the wrong agency's livery
 
@@ -274,31 +274,36 @@ wanted level inside the delay means nobody comes.
 `qbx_vehiclekeys`' lockpick police-alert chance lowered from 0.75/0.50
 (day/night) to 0.40/0.25 alongside this.
 
-### Changed: marked units are now ONX EVP cars with per-region agency liveries
+### Added: per-region agency liveries for multi-livery add-on cruiser packs
 
-Marked pursuit units, ambient scenes and roadblocks now use the ONX Emergency
-Vehicle Pack (`[cars]/onx-evp-c-pack`, `-c-pack2`) instead of stock
-`police`/`sheriff`/`pranger`. Each ONX car carries every agency's paint as a
-livery mod, so new `client/livery.lua` applies one by label at spawn
-(`Config.Liveries`): LSPD in Los Santos, PBSD/BCSO in Paleto, BCSO in Sandy,
-BCSO/GSSD in the countryside, with the Buffalo Hellfire always SAHP and the
-Invictus Overland ranger unit always SASP. Matching by label rather than index
-survives a pack update reordering its liveries.
-
-If an ONX model isn't installed on a client (pack stopped, entitlement lapsed),
-pursuit units and roadblocks fall back to a stock cruiser from
+New `Config.Liveries` and `client/livery.lua` (`FenixLivery`): for a cruiser
+pack that ships one model per car with every agency's paint as a livery mod,
+this applies the right one by label at spawn — `byRegion` for wherever the
+car is, `byModel` for a unit that belongs to one agency wherever it turns up,
+or an entry's own `livery` field. Matching by label (`GET_MOD_TEXT_LABEL`)
+rather than index survives a pack update reordering its liveries. Also owns
+the "is this add-on model actually installed" fallback: a pack that isn't
+running degrades pursuit units and roadblocks to a stock cruiser from
 `Config.Ambient.vehicleFallback` instead of not spawning at all.
 
-Unmarked units (were `police3`/`police4`) are ONX cars too — Buffalo and Scout
-in Los Santos, Granger 3700 and Merit PPV in the county — flagged
-`unmarked = true`: livery removed, roof lightbar (extra 1) off, plain
-black/graphite/silver paint (`Config.Liveries.unmarked`). Each carries
-`fallback = 'police4'`, so a client without ONX still gets an unmarked car
-rather than a marked cruiser; `server/guard.lua` allowlists entry fallbacks.
+`Config.vehiclesByRegion` entries gained two optional fields for this:
+`unmarked = true` strips a multi-livery car back to a plain look (no livery,
+lightbar off, a plain paint colour — `Config.Liveries.unmarked`) instead of
+using a separate stock unmarked model; `fallback` names the stock model a
+client without the pack gets instead (both are on `server/guard.lua`'s
+allowlist).
 
-Riot, FBI, bike and helicopter units are unchanged: ONX has no equivalents for
-most of them, and helicopters are created server-side, where the livery mod
-natives don't exist.
+`Config.Liveries` ships empty and every default vehicle list stays stock
+`police`/`sheriff`/`pranger` — this resource has no livery pack of its own,
+so all of it is a no-op out of the box. Turning it on (and swapping in a
+pack's own model names, in `Config.vehiclesByRegion`,
+`Config.Tactics.roadblockVehicles`, `Config.Investigate.vehicle`) is a
+`config.local/` matter, same as any other server-specific vehicle choice —
+see `config.local.example.lua`.
+
+Riot, FBI, bike and helicopter units are untouched by any of this — not every
+pack has equivalents for them, and helicopters are created server-side, where
+the livery mod natives don't exist.
 
 ### Removed: wrong-way driving violation
 

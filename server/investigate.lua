@@ -21,7 +21,7 @@ AddEventHandler('fenix-police:server:spawnInvestigateUnit', function(requestId, 
     local ticket = FenixGuard.issueTicket(src)
 
     TriggerClientEvent('fenix-police:spawnInvestigateUnitClient', src, requestId, {
-        vehicle = invCfg.vehicle or 'onx_polbuff',
+        vehicle = invCfg.vehicle or 'police',
         vehicleFallback = invCfg.vehicleFallback or 'police',
         peds = invCfg.peds or { 's_m_y_cop_01' },
     }, spawnPoint, spawnHeading, ticket)

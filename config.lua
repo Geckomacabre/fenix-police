@@ -638,10 +638,18 @@ Config.Ambient = {
     --   array  { 'police', 'police2' }        picked uniformly
     --   map    { police = 4, police2 = 1 }    model -> relative weight
     --
-    -- [Upstate Mafia] ONX EVP cruisers ([cars]/onx-evp-c-pack / -c-pack2). One
-    -- model carries every agency's paint as a livery; the LSPD/BCSO/PBSD one is
-    -- applied at spawn by region -- see Config.Liveries -- so the same Alamo
-    -- reads as Paleto Bay SD up north and BCSO in Sandy.
+    -- Base-game models only, deliberately: this ships as stock so it works on any
+    -- server. The map form exists for add-on liveries — weights are how you get
+    -- one agency dominant in a region while another still turns up occasionally,
+    -- without hard-coded region rules. For example, if you ran a highway-patrol
+    -- pack and a sheriff pack:
+    --
+    --   sandyShores = {
+    --       ['yoursheriff_suv'] = 6,   -- the county's own units carry the region
+    --       ['yoursheriff_sedan'] = 4,
+    --       ['yourhwp_charger'] = 2,   -- highway patrol passes through
+    --       ['yourhwp_suv'] = 2,
+    --   },
     --
     -- A model that isn't installed is skipped when the pick is rolled rather than
     -- failing the spawn, so a mixed list degrades to whatever you actually have.
@@ -649,10 +657,10 @@ Config.Ambient = {
     -- used — which is what makes it safe to point this at packs without checking
     -- that every client has them.
     vehicles = {
-        losSantos   = { onx_polbuff = 4, onx_polscout = 4, onx_polmerit2 = 2, onx_poltavros = 1 },
-        paletoBay   = { onx_polalamo = 4, onx_polsand = 3, onx_polgrang = 2 },
-        sandyShores = { onx_polalamo = 4, onx_polbison = 3, onx_polsand = 3 },
-        countryside = { onx_polalamo = 3, onx_polsand = 3, onx_polgrang = 2 },
+        losSantos   = { 'police', 'police2', 'police3' },
+        paletoBay   = { 'sheriff', 'sheriff2' },
+        sandyShores = { 'sheriff', 'sheriff2' },
+        countryside = { 'sheriff', 'sheriff2', 'pranger' },
     },
 
     -- Used only when nothing in `vehicles` for the region resolves to a model
@@ -1726,9 +1734,7 @@ Config.Tactics = {
     -- One car per blocked lane, parked broadside. Officers stand behind the
     -- line, facing back down the road, and hold position — the block is the
     -- obstacle, it is not an ambush.
-    -- ONX EVP cruisers; each gets the livery for wherever the block is placed
-    -- (Config.Liveries), and falls back to a stock cruiser if not installed.
-    roadblockVehicles = { 'onx_polbuff', 'onx_polscout', 'onx_polalamo', 'onx_polmerit2' },
+    roadblockVehicles = { 'police', 'police2', 'police3', 'sheriff' },
     roadblockOfficers = 2,
 
     -- ── Spike strips ────────────────────────────────────────────────────────
@@ -2197,11 +2203,11 @@ Config.Investigate = {
     enabled = false,
     debug = false,
 
-    -- Same ONX EVP cruiser the marked pursuit fleet uses
-    -- (Config.vehiclesByRegion), not a plain base-game car -- falls back to
-    -- stock 'police' if the ONX pack isn't installed on a given client
+    -- Base-game car by default. Point this at whatever add-on cruiser the
+    -- marked pursuit fleet uses (Config.vehiclesByRegion) if you run one --
+    -- vehicleFallback is what a client without that pack gets instead
     -- (client/livery.lua's resolveModel/apply, same as everywhere else).
-    vehicle = 'onx_polbuff',
+    vehicle = 'police',
     vehicleFallback = 'police',
     peds = { 's_m_y_cop_01' },
 
@@ -2460,36 +2466,36 @@ Config.zones = {
     ZQ_UAR = { name = 'Davis Quartz', location = 'Countryside' }
 }
 
--- LIVERIES (Upstate Mafia) --
--- Which agency paint job a multi-livery add-on cruiser (the ONX EVP cars) gets
--- at spawn. Labels are the pack's own carcols.meta livery names; every ONX
--- police car carries the full set -- LIV_LSPD, LIV_LSSD, LIV_BCSO, LIV_PBSD,
--- LIV_GSSD, LIV_SAHP, LIV_SASP, LIV_DPPD, LIV_DPD, LIV_RHPD, LIV_DOC, plus a
--- "2" single-colour variant of most (LIV_LSPD2, ...). Precedence: a
--- Config.vehiclesByRegion entry's own `livery` field, then byModel, then
--- byRegion for wherever the car spawns. Listing several picks one at random.
--- Stock base-game cars have no livery mods and are never touched.
+-- LIVERIES --
+-- Which agency paint job a multi-livery add-on cruiser gets at spawn, for
+-- packs that ship one model per car with every agency's paint as a livery
+-- mod (see client/livery.lua's header). Labels are the pack's own
+-- carcols.meta livery names. Precedence: a Config.vehiclesByRegion entry's
+-- own `livery` field, then byModel, then byRegion for wherever the car
+-- spawns. Listing several picks one at random. Stock base-game cars (what
+-- this resource ships with) have no livery mods and are never touched, so
+-- both tables below are empty by default -- fill them in with your own
+-- pack's labels if you use one.
 Config.Liveries = {
     enabled = true,
 
     byRegion = {
-        losSantos   = { 'LIV_LSPD' },
-        paletoBay   = { 'LIV_PBSD', 'LIV_BCSO' },
-        sandyShores = { 'LIV_BCSO' },
-        countryside = { 'LIV_BCSO', 'LIV_GSSD' },
+        -- losSantos   = { 'LIV_LSPD' },
+        -- paletoBay   = { 'LIV_PBSD', 'LIV_BCSO' },
+        -- sandyShores = { 'LIV_BCSO' },
+        -- countryside = { 'LIV_BCSO', 'LIV_GSSD' },
     },
 
     -- Units that belong to one agency wherever they turn up.
     byModel = {
-        onx_polbuffhf  = { 'LIV_SAHP' }, -- Buffalo Hellfire interceptor: highway patrol
-        onx_polinvict2 = { 'LIV_SASP' }, -- Invictus Overland: state parks rangers
+        -- yourhwp_charger = { 'LIV_SAHP' },
     },
 
     -- How a Config.vehiclesByRegion entry with `unmarked = true` is dressed:
-    -- livery removed, these extras switched off (1 = roof lightbar on every
-    -- ONX car, per the pack README), and one of these paint colours (GTA colour
+    -- livery removed, these extras switched off (1 = roof lightbar on most
+    -- multi-livery packs), and one of these paint colours (GTA colour
     -- indices: 0 black, 1 graphite, 2 black steel, 3 dark silver, 4 silver).
-    -- Only applied to a car that actually has ONX-style liveries -- a stock
+    -- Only applied to a car that actually has multi-livery mods -- a stock
     -- `fallback` model like police4 is already unmarked and is left alone.
     unmarked = {
         extrasOff = { 1 },
@@ -2523,66 +2529,57 @@ Config.ZoneEnum = {
 -- Peds should include the model codes for peds you want to possibly spawn with the car, they are selected randomly.
 -- primaryWeaponGroup corresponds to the weapon table you'd like the primary weapon from. Peds will always have a primary weapon.
 -- secondaryWeaponGroup corresponds to the weapon table you'd like the 
--- [Upstate Mafia] Marked units are ONX EVP cars; their agency livery comes
--- from Config.Liveries (by region, or by model for the highway-patrol and
--- state-parks units), or an entry's own `livery = 'LIV_...'` field if set. A
--- client missing the pack spawns a stock cruiser from
--- Config.Ambient.vehicleFallback instead -- or the entry's own `fallback` model
--- if it sets one. `unmarked = true` spawns the car with no agency livery, its
--- lightbar off and a plain paint colour (Config.Liveries.unmarked). Riot,
--- motorcycle and helicopter units stay base-game -- ONX has no equivalent, and
--- only the CARS were meant to change. FIB units are unmarked ONX cars with the
--- base-game FIB car as their `fallback`, so a client without the pack still
--- gets the stock fbi/fbi2.
+-- [Upstate Mafia] Marked units use an add-on cruiser pack's livery if
+-- Config.Liveries is configured for one (by region, by model, or an entry's
+-- own `livery = 'LIV_...'` field) -- a no-op with the base-game cars below.
+-- A client missing a configured pack spawns a stock cruiser from
+-- Config.Ambient.vehicleFallback instead -- or the entry's own `fallback`
+-- model if it sets one. `unmarked = true` spawns the car with no agency
+-- livery, its lightbar off and a plain paint colour
+-- (Config.Liveries.unmarked) -- again a no-op on a stock car, which has
+-- none of that to strip.
 Config.vehiclesByRegion = {
     losSantos = {
-        { model = 'onx_polbuff', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol' },
-        { model = 'onx_polscout', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol'  },
-        { model = 'onx_polmerit2', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'patrol'  },
-        { model = 'onx_poltavros', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'patrol'  },
-        { model = 'onx_polbuffhf', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 2, spawnChance = 2, numPeds = 2, loadout = 'patrol' },
-        { model = 'onx_polbuff', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
+        { model = 'police', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol' },
+        { model = 'police2', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'patrol'  },
+        { model = 'police3', peds = {'s_m_y_cop_01', 's_f_y_cop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'patrol'  },
+        { model = 'police4', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover'  },
         -- [Upstate Mafia] policet (police transporter) removed entirely
-        { model = 'onx_polscout', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
-        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
-
+        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
+        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
     },
     -- [Upstate Mafia] Rebalanced: riot at wantedLevel=5 only, sheriff boosted, FBI reduced
     paletoBay = {
         { model = 'policeb', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 1, loadout = 'bike' },
-        { model = 'onx_polalamo', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polsand', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polgrang', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polgrang2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
+        { model = 'sheriff', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
+        { model = 'sheriff2', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
+        { model = 'police3', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
-        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
+        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
+        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
     },
     -- [Upstate Mafia] Rebalanced: riot at wantedLevel=5 only, sheriff boosted, FBI reduced
     sandyShores = {
         { model = 'policeb', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 1, loadout = 'bike' },
-        { model = 'onx_polalamo', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 4, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polbison', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polsand', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polgrang2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
+        { model = 'sheriff', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
+        { model = 'sheriff2', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 5, numPeds = 2, loadout = 'sheriff' },
+        { model = 'police3', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
-        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
+        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
+        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
     },
     -- [Upstate Mafia] Rebalanced: riot at wantedLevel=5 only, sheriff/ranger boosted, FBI reduced
     countryside = {
         { model = 'policeb', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 1, loadout = 'bike' },
-        { model = 'onx_polalamo', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polsand', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 3, numPeds = 2, loadout = 'sheriff' },
-        { model = 'onx_polbuffhf', peds = {'S_M_Y_HwayCop_01'}, wantedLevel = 1, spawnChance = 2, numPeds = 2, loadout = 'patrol' },
-        { model = 'onx_polinvict2', peds = { 's_m_y_ranger_01', 's_f_y_ranger_01'}, wantedLevel = 1, spawnChance = 8, numPeds = 2, loadout = 'ranger' },
-        { model = 'onx_polmerit2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
-        { model = 'onx_polgrang2', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 4, numPeds = 2, loadout = 'undercover', unmarked = true, fallback = 'police4' },
+        { model = 'sheriff', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 4, numPeds = 2, loadout = 'sheriff' },
+        { model = 'sheriff2', peds = {'s_m_y_sheriff_01', 's_f_y_sheriff_01'}, wantedLevel = 1, spawnChance = 4, numPeds = 2, loadout = 'sheriff' },
+        { model = 'pranger', peds = { 's_m_y_ranger_01', 's_f_y_ranger_01'}, wantedLevel = 1, spawnChance = 8, numPeds = 2, loadout = 'ranger' },
+        { model = 'police4', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 3, numPeds = 2, loadout = 'undercover' },
+        { model = 'police3', peds = {'S_M_M_CIASec_01'}, wantedLevel = 2, spawnChance = 4, numPeds = 2, loadout = 'undercover' },
         { model = 'riot', peds = {'S_M_Y_Swat_01'}, wantedLevel = 5, spawnChance = 3, numPeds = 4, loadout = 'riot' },
-        { model = 'onx_polbuff', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi', unmarked = true, fallback = 'fbi' },
-        { model = 'onx_polgrang2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi', unmarked = true, fallback = 'fbi2' },
+        { model = 'fbi', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 2, loadout = 'fbi' },
+        { model = 'fbi2', peds = {'S_M_M_FIBSec_01'}, wantedLevel = 5, spawnChance = 5, numPeds = 4, loadout = 'fbi' },
     }
 }
 
