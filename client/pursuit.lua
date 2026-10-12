@@ -221,7 +221,10 @@ end
 --- with vehicles in the mask the ray stops on the officer's own car and on the
 --- car the player is sitting in, and nothing would ever be seen again. Here the
 --- officer's car is excluded outright, and a hit on the player's own car (or
---- anything right where the player is) counts as reaching them.
+--- anything right where the player is) counts as reaching them. A car right
+--- beside the officer doesn't count either: that's an officer on foot using
+--- a car as cover, who looks over or round it, and treating it as a wall
+--- blinded every officer in a shootout at once.
 local function trafficInTheWay(ped, playerPed, pedCoords, playerCoords)
     local ownVeh = GetVehiclePedIsIn(ped, false)
     local probe = StartExpensiveSynchronousShapeTestLosProbe(
@@ -232,7 +235,10 @@ local function trafficInTheWay(ped, playerPed, pedCoords, playerCoords)
     if status ~= 2 or not (hit == true or hit == 1) then return false end
 
     if entityHit ~= 0 and entityHit == GetVehiclePedIsIn(playerPed, false) then return false end
-    if hitCoords and #(vector3(hitCoords.x, hitCoords.y, hitCoords.z) - playerCoords) < 3.0 then return false end
+    if hitCoords then
+        local at = vector3(hitCoords.x, hitCoords.y, hitCoords.z)
+        if #(at - playerCoords) < 3.0 or #(at - pedCoords) < 3.0 then return false end
+    end
     return true
 end
 
