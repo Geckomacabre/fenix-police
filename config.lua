@@ -2029,8 +2029,8 @@ Config.Dispatch = {
     -- briefly instead of vanishing immediately on resolution).
     incidentMaxAgeMs = 30 * 60 * 1000,
 
-    -- How long a CREATED/DISPATCHING incident can sit with zero assigned
-    -- units before it's treated as abandoned and cleaned up.
+    -- How long an incident can sit with zero assigned units, and nothing
+    -- happening on it, before it's treated as abandoned and cleaned up.
     abandonedIncidentMs = 5 * 60 * 1000,
 
     -- How far from an EMS/fire incident the server will look for a player
@@ -2039,6 +2039,24 @@ Config.Dispatch = {
     -- unanswered rather than being handed to someone who can't plausibly
     -- see it.
     maxHostSearchRadius = 300.0,
+
+    -- The host's client spawns the unit up to that responder's
+    -- spawnMaxDistance from the scene, and anything much past ~400 m from the
+    -- host is outside what its game has loaded (no collision, the unit never
+    -- arrives). The search radius above is cut to this minus spawnMaxDistance.
+    hostScopeRadius = 400.0,
+
+    -- A host can decline a call without saying so (already at its maxUnits,
+    -- nowhere legal to spawn). If no unit is assigned for a role this long
+    -- after asking, the next-nearest player who hasn't been asked gets it, up
+    -- to maxOffersPerRole players per role.
+    reofferAfterMs = 20000,
+    maxOffersPerRole = 3,
+
+    -- Gunfire and crash reports within this many metres of a wanted player
+    -- are dropped: they're the pursuit itself (the police shooting, PIT and
+    -- ram damage), not a fresh call.
+    wantedSuppressRadius = 80.0,
 
     -- Which agencies a given incident type calls for. Anything not listed
     -- defaults to {'police'} (see server/dispatch.lua agenciesFor()).
@@ -2251,9 +2269,12 @@ Config.Collision = {
 
 -- Live unit position registry (server/unit_registry.lua). The prerequisite
 -- server/dispatch.lua's header comment describes for real nearest-unit
--- dispatch -- collects data only in this pass, nothing yet reroutes a live
--- unit based on it. Off by default; even when off, client.lua's reporting
--- thread costs nothing beyond one idle Wait().
+-- dispatch. Nothing reroutes a live unit based on it; when on, dispatch
+-- prefers the player whose own ground unit is nearest a call as that call's
+-- host. Reports are only accepted for units the server already knows are the
+-- reporting player's, at the position the server itself sees. Off by
+-- default; even when off, client.lua's reporting thread costs nothing beyond
+-- one idle Wait().
 Config.UnitRegistry = {
     enabled = false,
 
