@@ -93,8 +93,8 @@ local troubleSince = {}
 local lossesAtRejoin = {}
 
 -- vehNetID -> retreat record: { phase, since, officers = {pedNetID=ped,...},
--- boarding = {pedNetID=seat,...}, vehicle, reason }. Presence in this table
--- IS "this unit is retreating".
+-- boarding = {pedNetID=seat,...}, vehicle, reason, data }. Presence in this
+-- table IS "this unit is retreating".
 local retreating = {}
 
 -- vehNetID -> reason. A released unit is finished with this pursuit: it drives
@@ -396,6 +396,9 @@ function FenixMorale.beginRetreat(vehNetID, vehicleData, liveOfficers, reason)
         officers = {},
         boarding = {},
         reason   = reason,
+        -- client.lua's own entry, for handing the officers back on rejoin
+        -- (see finishRegroup).
+        data     = type(vehicleData) == 'table' and vehicleData or nil,
     }
 
     local playerPed = PlayerPedId()
@@ -566,6 +569,16 @@ local function finishRegroup(vehNetID, r)
     end
 
     dbg(('unit %s regrouped, back in the fight'):format(vehNetID))
+
+    -- client.lua only re-tasks an officer when its cached task changes, and
+    -- the cache still names whatever they were doing before this file cleared
+    -- their tasks: a rejoined driver kept wandering off and its passengers sat
+    -- idle. Forget it for them, so the next cycle tasks them afresh.
+    local tasks = r.data and r.data.officerTasks
+    if type(tasks) == 'table' then
+        for pedNetID in pairs(r.officers) do tasks[pedNetID] = nil end
+    end
+
     retreating[vehNetID] = nil
     lossesAtRejoin[vehNetID] = losses
     troubleSince[vehNetID] = nil
@@ -589,9 +602,14 @@ local function tickRetreats()
         end
 
         if next(r.officers) == nil and not unitVehicle(vehNetID, r) then
-            -- Car and crew are both gone: the unit was removed without anyone
-            -- telling this file. Nothing left to drive or regroup.
-            FenixMorale.clearUnit(vehNetID)
+            -- Car and crew are both gone from here, but client.lua still holds
+            -- the unit (removing it calls clearUnit). Released, not forgotten:
+            -- forgetting would hand a unit nobody can task back to the chase
+            -- loop, where it would hold a slot for the rest of the pursuit,
+            -- and a released one is what client.lua removes and backfills.
+            if r.phase ~= 'released' then
+                FenixMorale.release(vehNetID, 'gone')
+            end
 
         elseif r.phase == 'fleeing' then
             -- Give the flee/cower task a few seconds to actually put distance
