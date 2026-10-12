@@ -35,9 +35,10 @@
          told us anything truthful.
 
       3. OWNERSHIP. Entities are recorded against the player they were spawned
-         for. Stops player A interfering with player B's units — griefing rather
-         than catastrophe, which is why this is the layer that gets to be lenient
-         about gaps (see Config.Security.strictOwnership).
+         for, and an unrecorded one is only accepted from the player whose
+         client created it. Without this, the allowlist alone waves through
+         every player's own police/EMS job car -- same stock models -- for
+         anybody counting net IDs (see Config.Security.strictOwnership).
 
     Ground units are created client-side, so the server can't record them at
     creation the way it does for helicopters and planes. Instead it issues a
@@ -142,24 +143,33 @@ local function buildAllowlist()
 
     -- EMS (server/ems.lua, client/ems.lua). Same reasoning as ambient scene
     -- models above: whatever Config.EMS spawns must be allowlisted or its
-    -- later register/delete calls get silently refused.
+    -- later register/delete calls get silently refused. Only while the
+    -- feature is on, though -- 'ambulance' and 'firetruk' are exactly what
+    -- player EMS/fire jobs drive, and a disabled feature spawns nothing that
+    -- needs them listed.
     local emsCfg = Config.EMS or {}
-    allowVehicle(emsCfg.vehicle)
-    for _, model in ipairs(emsCfg.peds or {}) do allowPed(model) end
+    if emsCfg.enabled then
+        allowVehicle(emsCfg.vehicle)
+        for _, model in ipairs(emsCfg.peds or {}) do allowPed(model) end
+    end
 
     -- Fire (server/fire.lua, client/fire.lua). Same reasoning again.
     local fireCfg = Config.Fire or {}
-    allowVehicle(fireCfg.vehicle)
-    for _, model in ipairs(fireCfg.peds or {}) do allowPed(model) end
+    if fireCfg.enabled then
+        allowVehicle(fireCfg.vehicle)
+        for _, model in ipairs(fireCfg.peds or {}) do allowPed(model) end
+    end
 
     -- Investigation units (server/investigate.lua, client/investigate.lua).
     -- Same reasoning again -- both the configured model and its stock
     -- fallback (client/livery.lua's resolveModel) need to be allowlisted,
     -- same as every entry in Config.vehiclesByRegion.
     local invCfg = Config.Investigate or {}
-    allowVehicle(invCfg.vehicle)
-    allowVehicle(invCfg.vehicleFallback)
-    for _, model in ipairs(invCfg.peds or {}) do allowPed(model) end
+    if invCfg.enabled then
+        allowVehicle(invCfg.vehicle)
+        allowVehicle(invCfg.vehicleFallback)
+        for _, model in ipairs(invCfg.peds or {}) do allowPed(model) end
+    end
 
     local v, p = 0, 0
     for _ in pairs(allowedVehicles) do v = v + 1 end
@@ -179,9 +189,10 @@ CreateThread(buildAllowlist)
 --- the model allowlist safe on a stolen cruiser: the model says "police", so
 --- layer 2 would wave it through, and this is what stops the car being deleted
 --- from under whoever is driving it.
-local function belongsToAPlayer(entity)
+--- @param ignoreSrc? number a player to leave out (one who is disconnecting)
+local function belongsToAPlayer(entity, ignoreSrc)
     for _, playerId in ipairs(GetPlayers()) do
-        local ped = GetPlayerPed(playerId)
+        local ped = tonumber(playerId) ~= tonumber(ignoreSrc) and GetPlayerPed(playerId) or 0
         if ped and ped ~= 0 then
             if ped == entity then return true end
             if GetVehiclePedIsIn(ped, false) == entity then return true end
@@ -211,6 +222,55 @@ function FenixGuard.release(netID)
     if netID then owned[netID] = nil end
 end
 
+-- Network IDs are recycled. Without this, an entity that disappears any way
+-- other than through this resource's own delete handlers (despawned out of
+-- scope, deleted by another script) leaves its record behind, and whatever
+-- entity gets that net ID next arrives already "owned" by a player who never
+-- spawned it. Fires for every entity on the server, ambient traffic
+-- included, so it stays a single lookup; pcall because a native error here
+-- would print once per despawn.
+AddEventHandler('entityRemoved', function(entity)
+    local ok, netID = pcall(NetworkGetNetworkIdFromEntity, entity)
+    if ok and netID and netID ~= 0 then owned[netID] = nil end
+end)
+
+--- The player an entity is recorded against, or nil.
+function FenixGuard.ownerOf(netID)
+    local rec = owned[netID]
+    return rec and rec.src or nil
+end
+
+--- Did this player's client create the entity? The server's own record of
+--- who first owned it, so nothing the client says goes into it. Helicopters
+--- and planes are created by the server and recorded at creation instead, and
+--- a record always wins over this (see heldBy). nil when this server build
+--- predates NETWORK_GET_FIRST_ENTITY_OWNER and can't say.
+local function createdBy(entity, src)
+    if not NetworkGetFirstEntityOwner then return nil end
+    local first = NetworkGetFirstEntityOwner(entity)
+    return first ~= nil and first > 0 and first == tonumber(src)
+end
+
+--- Is `src` entitled to act on this entity: recorded against them, or, with
+--- no record at all, created by their own client. The second half covers the
+--- window between a client creating a unit and its registration landing --
+--- client.lua re-arms each officer the moment it is seated, before the
+--- registration for the unit has even been sent.
+local function heldBy(src, netID, entity)
+    local rec = owned[netID]
+    if rec then return rec.src == src end
+    return createdBy(entity, src) == true
+end
+
+--- Same test for callers outside this file; false for anything that no longer
+--- exists.
+function FenixGuard.isHeldBy(src, netID)
+    if type(netID) ~= 'number' then return false end
+    local entity = NetworkGetEntityFromNetworkId(netID)
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return false end
+    return heldBy(src, netID, entity)
+end
+
 --- Snapshot of every currently-owned net ID, for a resource-stop sweep that
 --- has to find everything this resource ever spawned without keeping its own
 --- second copy of the same registry. Returns {netID, kind} pairs; callers
@@ -233,6 +293,13 @@ local function ownedCountFor(src)
         if rec.src == src then n = n + 1 end
     end
     return n
+end
+
+FenixGuard.ownedCount = ownedCountFor
+
+--- The per-player ceiling ownedCountFor is checked against.
+function FenixGuard.ownedCap()
+    return cfg().maxOwnedEntities or 150
 end
 
 --- Issue a single-use spawn ticket. The server calls this when it authorises a
@@ -295,7 +362,6 @@ local DEFAULT_LIMITS = {
     delete   = 600,
     unlock   = 600,
     rearm    = 600,
-    alert    = 30,
 }
 
 --- Sliding-window counter. The spawn events had no limit at all, so a client
@@ -381,20 +447,43 @@ function FenixGuard.resolve(src, netID, kind, what)
         if rec.src ~= src then
             return nil, refuse(src, what, 'entity belongs to another player')
         end
-    elseif cfg().strictOwnership == true then
+    elseif cfg().strictOwnership ~= false and not createdBy(entity, src) then
         return nil, refuse(src, what, 'entity has no ownership record')
     end
 
     return entity
 end
 
---- Everything a disconnecting player owned stops being theirs. Their units are
---- cleaned up by the existing sweep; this just stops the table growing and stops
---- a recycled server id inheriting somebody else's entities.
+--- Is one of `src`'s own officers -- an allowlisted, non-player ped held by
+--- them -- within `radius` of `coords`? For actions that only make sense with
+--- an officer physically there (a field revive, a citation at the window), so
+--- that sending the event from anywhere else does nothing.
+function FenixGuard.officerNear(src, coords, radius)
+    for _, ped in ipairs(GetAllPeds()) do
+        if allowedPeds[GetEntityModel(ped)] and not IsPedAPlayer(ped)
+            and #(GetEntityCoords(ped) - coords) <= radius
+            and heldBy(src, NetworkGetNetworkIdFromEntity(ped), ped) then
+            return true
+        end
+    end
+    return false
+end
+
+--- A disconnecting player's units go with them. Helicopters and planes are
+--- server-created, so nothing ties them to the requester's connection: left
+--- alone they fly on with nobody tracking them, and with their records gone
+--- even the resource-stop sweep in server.lua can't find them. Records go
+--- too, so a recycled server id can't inherit somebody else's entities.
 AddEventHandler('playerDropped', function()
     local src = source
     for netID, rec in pairs(owned) do
-        if rec.src == src then owned[netID] = nil end
+        if rec.src == src then
+            local entity = NetworkGetEntityFromNetworkId(netID)
+            if entity and entity ~= 0 and DoesEntityExist(entity) and not belongsToAPlayer(entity, src) then
+                DeleteEntity(entity)
+            end
+            owned[netID] = nil
+        end
     end
     for id, rec in pairs(tickets) do
         if rec.src == src then tickets[id] = nil end
@@ -411,7 +500,9 @@ end)
 --- Everything is re-checked here rather than trusted: the ticket proves the
 --- server asked for a spawn, but it does not prove the client made what it was
 --- told to. Each reported net ID has to resolve to an allowlisted police model
---- that nobody already owns.
+--- that nobody already owns and that this player's own client created --
+--- promoteAmbientUnit hands a ticket to anyone who asks, so without that last
+--- check a ticket would be a licence to claim any unowned cruiser on the map.
 RegisterNetEvent('fenix-police:registerSpawnedUnit')
 AddEventHandler('fenix-police:registerSpawnedUnit', function(ticket, vehNetID, pedNetIDs)
     local src = source
@@ -424,16 +515,37 @@ AddEventHandler('fenix-police:registerSpawnedUnit', function(ticket, vehNetID, p
         return
     end
 
-    local cap = cfg().maxOwnedEntities or 60
-    if ownedCountFor(src) >= cap then
-        refuse(src, 'unit registration', ('already owns %d entities'):format(cap))
+    -- One vehicle's crew. Sixteen is more seats than anything in the game has.
+    if pedNetIDs ~= nil and (type(pedNetIDs) ~= 'table' or #pedNetIDs > 16) then
+        refuse(src, 'unit registration', 'crew list is not a list of at most 16 ids')
         return
     end
+
+    local cap = FenixGuard.ownedCap()
 
     local function register(netID, kind)
         if type(netID) ~= 'number' then return end
         local entity = NetworkGetEntityFromNetworkId(netID)
         if not entity or entity == 0 or not DoesEntityExist(entity) then return end
+
+        -- Checked per entity, not once up front: one registration can carry a
+        -- vehicle and its whole crew.
+        if ownedCountFor(src) >= cap then
+            refuse(src, 'unit registration', ('already owns %d entities'):format(cap))
+            return
+        end
+
+        -- Unknown (an older server build) is let through: refusing every
+        -- registration would leave nothing recorded to clean up.
+        if createdBy(entity, src) == false then
+            refuse(src, 'unit registration', 'entity was not created by this player')
+            return
+        end
+
+        if belongsToAPlayer(entity) then
+            refuse(src, 'unit registration', 'entity is a player, or a vehicle a player is in')
+            return
+        end
 
         local entityType = GetEntityType(entity)
         local model = GetEntityModel(entity)
@@ -486,7 +598,7 @@ RegisterCommand('fenixguard', function(source)
 
     print(('[FENIX-GUARD] allowlist %d vehicle / %d ped model(s)'):format(v, p))
     print(('[FENIX-GUARD] %d entity/entities owned, %d ticket(s) outstanding'):format(total, pending))
-    print(('[FENIX-GUARD] strictOwnership = %s'):format(tostring(cfg().strictOwnership == true)))
+    print(('[FENIX-GUARD] strictOwnership = %s'):format(tostring(cfg().strictOwnership ~= false)))
     for src, n in pairs(perPlayer) do
         print(('  %s (%s): %d'):format(GetPlayerName(src) or 'gone', tostring(src), n))
     end
