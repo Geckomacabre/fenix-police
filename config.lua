@@ -396,7 +396,9 @@ Config.Ambient = {
     -- How long a traffic stop runs before the officer wraps up and walks back to
     -- the car, and how long the scene is then kept alive so both vehicles can
     -- actually drive away. Applies to procedural stops and to radar traps that
-    -- have pulled an NPC over. Without these a stop never ends.
+    -- have pulled an NPC over. Without these a stop never ends. The departure
+    -- window is also what a pursuit's transport, and a car that clocked you and
+    -- then stood down, get to drive off before they're released.
     stopDurationSeconds  = 60,
     stopDepartureSeconds = 25,
 
