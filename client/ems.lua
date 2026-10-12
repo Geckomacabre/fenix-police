@@ -65,6 +65,12 @@ local ROAD_END_ARRIVE_DISTANCE = 60.0
 -- How long crew get to climb back aboard before the unit moves on anyway.
 local BOARD_TIMEOUT_MS = 15000
 
+-- On a fire call the scene coordinates are the fire itself
+-- (client/firewatch.lua reports the fire's own position), so with anything
+-- still burning there the medic treats this far back from it instead of
+-- kneeling in the flames.
+local FIRE_STANDOFF_DISTANCE = 8.0
+
 -- A departing unit is deleted once it's out of sight this far from the
 -- player, or after DEPART_DELETE_MS regardless.
 local DEPART_DELETE_DISTANCE = 150.0
@@ -293,6 +299,21 @@ local function exitIntoScenario(ped, vehicle, scenario, coords)
     ClearSequenceTask(taskSequence)
 end
 
+-- Where the medic treats: the scene itself, unless a live fire sits on it,
+-- in which case FIRE_STANDOFF_DISTANCE back from that fire on the
+-- ambulance's side (or right by the ambulance if it is closer than that).
+local function treatmentSpot(vehicle, coords)
+    local found, firePos = GetClosestFirePos(coords.x, coords.y, coords.z)
+    if not found or #(firePos - coords) > FIRE_STANDOFF_DISTANCE then return coords end
+
+    local from = GetEntityCoords(vehicle)
+    local dx, dy = from.x - firePos.x, from.y - firePos.y
+    local len = math.sqrt(dx * dx + dy * dy)
+    if len < 0.1 then return from end
+    local k = math.min(FIRE_STANDOFF_DISTANCE, len) / len
+    return vector3(firePos.x + dx * k, firePos.y + dy * k, coords.z)
+end
+
 local function driveTaskFinished(driver)
     return GetScriptTaskStatus(driver, DRIVE_TASK) == TASK_FINISHED
 end
@@ -399,7 +420,7 @@ CreateThread(function()
                                 or (GetSequenceProgress(medic) == -1 and not IsPedUsingScenario(medic, MEDIC_SCENARIO))
                             then
                                 fsm.data.treatmentStarted = true
-                                exitIntoScenario(medic, vehicle, MEDIC_SCENARIO, fsm.data.incidentCoords)
+                                exitIntoScenario(medic, vehicle, MEDIC_SCENARIO, treatmentSpot(vehicle, fsm.data.incidentCoords))
                             end
                             if not fsm.data.treatingSince and IsPedUsingScenario(medic, MEDIC_SCENARIO) then
                                 fsm.data.treatingSince = GetGameTimer()
