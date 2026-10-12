@@ -92,8 +92,8 @@ client_scripts {
     'client/investigate.lua',
 
     -- Moving violations (no helmet, wheelie, phone use). Loaded last: reads
-    -- ApplyWantedLevel from client.lua and calls
-    -- exports('fenix-police'):IsWitnessed, added in ambient.lua.
+    -- SetWantedLevel from client.lua and calls this resource's IsWitnessed
+    -- export, added in ambient.lua.
     'client/violations.lua'
 }
 
