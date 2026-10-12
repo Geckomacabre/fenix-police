@@ -437,9 +437,16 @@ end
 --- the car around right next to the player every few seconds. Nor is it ever
 --- the monitor's place to drive a car a player is sitting in -- a stolen
 --- cruiser's driver is the player.
+local SCRIPT_TASK_ANY = GetHashKey('SCRIPT_TASK_ANY')
+
 local function unstickAllowed(vehicle, driver, vehNetID)
     if not driver or driver == 0 or not DoesEntityExist(driver) or IsPedDeadOrDying(driver, true) then return false end
     if IsPedAPlayer(driver) then return false end
+
+    -- Only a driver still trying to get somewhere can be stuck. One with no
+    -- script task running (3) has arrived -- at the last known position, a
+    -- sweep waypoint -- or been halted, and is parked on purpose.
+    if GetScriptTaskStatus(driver, SCRIPT_TASK_ANY) == 3 then return false end
     if isPullingOver or isBeingTicketed or ticketWrapUp or isSurrendering or isBeingArrested or aftermath.active then
         return false
     end
