@@ -16,10 +16,10 @@
     event.
 
     There was a registry these could have been validated against —
-    `activeGroundUnits` in server.lua — but it is only ever assigned nil. It is a
+    `activeGroundUnits` in server.lua — but it was only ever assigned nil, a
     leftover from the server-side ground spawn path that the client-side
-    delegation replaced, so the server holds no record of what this resource
-    created. That is the hole. This file is the record.
+    delegation replaced, so the server held no record of what this resource
+    created. That was the hole. This file is the record.
 
     ── Three layers, outermost first ───────────────────────────────────────────
 
