@@ -286,7 +286,9 @@ Config.Ambient = {
     -- client.lua's PromoteAmbientUnit) — the cop that was already patrolling
     -- turns and joins the chase, rather than vanishing and being replaced by
     -- a freshly spawned one. Radar traps, static posts and traffic stops are
-    -- never promoted, only despawned as before.
+    -- never promoted, only despawned as before — with one exception: the car
+    -- that clocked you itself (radar below) joins as a real unit once you
+    -- ignore its lights. Setting this false turns that off too.
     promoteOnWanted = true,
     -- How close (metres) a patrol/convoy scene has to be to the player the
     -- moment a wanted level appears to be a candidate for promotion.
@@ -384,9 +386,10 @@ Config.Ambient = {
     pursuitHoldSeconds = 20,
 
     -- After the tableau holds, walk the suspect to the nearest scene vehicle
-    -- and put them in the back seat before the scene tears down/drives off,
-    -- instead of the suspect just standing there until the whole thing blinks
-    -- out of existence. false reverts to the old instant-teardown ending.
+    -- and put them in the back seat, then the officers get back in and drive
+    -- off with them, instead of the suspect just standing there until the
+    -- whole thing blinks out of existence. false reverts to the old
+    -- instant-teardown ending.
     pursuitEscortToVehicle = true,
     pursuitEscortSeconds = 6,      -- time budget for the walk-and-enter beat
 
@@ -412,7 +415,9 @@ Config.Ambient = {
     -- Chance the group is three cars instead of two.
     convoyThirdCarChance = 0.35,
 
-    -- Nose-to-tail spacing between cars in the group, in metres.
+    -- Nose-to-tail spacing between cars in the group, in metres — where they
+    -- spawn, and the gap each one then keeps to the car in front as it
+    -- follows it.
     convoySpacing = 9.0,
 
     -- Seconds before the group is torn down regardless of distance. Falls back
@@ -557,7 +562,11 @@ Config.Ambient = {
         -- Players: hands off to this resource's own pursuit stack. Units spawn,
         -- dispatch reacts, and the ArrestSystem (if enabled) ends it in a bust.
         -- The catching cruiser joins the chase and is exempted from
-        -- despawnWhenWanted so it doesn't vanish mid-catch.
+        -- despawnWhenWanted so it doesn't vanish mid-catch. If you keep
+        -- driving past pulloverGraceMs it becomes a real pursuit unit
+        -- (promoteOnWanted); once you're no longer wanted it kills its lights
+        -- and drives on. Never fires while you're already wanted — each catch
+        -- would add another star to a pursuit that is already running.
         catchPlayers = true,
         playerWantedLevel = 1,
 
@@ -590,6 +599,11 @@ Config.Ambient = {
         -- officer at the window. NPCs are judged against the trap's own limit
         -- rather than the posted sign — resolving a street name for every
         -- vehicle in the pool every tick isn't worth it for background traffic.
+        -- Only plain world traffic is ever pulled over: never a vehicle another
+        -- script owns (pursuit, EMS, fire and investigation units, other
+        -- resources' job cars, other ambient scenes), an emergency or
+        -- military vehicle, an aircraft or boat, or a car this client doesn't
+        -- control.
         catchNpcs = true,
         npcYieldSeconds = 15,
 
@@ -625,8 +639,6 @@ Config.Ambient = {
 
     -- Peds used as carjackers. Defaults to civPeds when unset; give it a
     -- rougher-looking list if you want them to read as criminals on sight.
-    -- The getaway is driven fast on purpose, so a suspect who passes a radar
-    -- trap gets clocked and chased with no extra wiring.
     carjackSuspects = {
         'a_m_y_skater_01', 'a_m_m_farmer_01', 'a_m_y_hipster_01',
         'a_m_y_stwhi_01', 'a_m_m_soucent_01',
