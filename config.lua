@@ -742,9 +742,11 @@ Config.Ambient = {
 -- Every check requires an ambient officer to actually be able to see the
 -- player first (client/violations.lua calls exports('fenix-police'):IsWitnessed,
 -- the same cone/radius test radar enforcement uses) -- "the police only know
--- what they can see" applies here too, not just to pursuits. A hit calls the
--- same ApplyWantedLevel() radar enforcement uses, so dispatch, the pursuit
--- stack and the roadside-citation flow all pick it up with no extra wiring.
+-- what they can see" applies here too, not just to pursuits. A hit raises the
+-- wanted level to the violation's wantedLevel (SetWantedLevel: never stacked
+-- on an existing one, and nothing is cited while already wanted), so
+-- dispatch, the pursuit stack and the roadside-citation flow all pick it up
+-- with no extra wiring.
 --
 -- Deliberately NOT covered: running red lights, stop-sign violations, and
 -- driving on the sidewalk. FiveM has no native that reports a traffic light's
@@ -771,6 +773,10 @@ Config.Violations = {
         enabled = true,
         -- GetVehicleClass(veh) == 8 is motorcycles.
         minSpeedMph = 5,
+        -- How long the rider has to be seen bare-headed, continuously,
+        -- before it counts -- covers the game's own helmet going on a moment
+        -- after setting off. Any head prop counts as a helmet.
+        dwellMs = 4000,
         wantedLevel = 1,
         cooldownSeconds = 90,
     },
@@ -2132,22 +2138,37 @@ Config.EMS = {
     arriveDistance = 8.0,
     driveSpeed = 20.0,
 
-    -- How long the treatment beat (CODE_HUMAN_MEDIC_KNEEL) runs before the
-    -- medic re-boards and the unit heads to hospital.
+    -- Lights-and-siren driving: steers and changes lanes around traffic and
+    -- doesn't wait at red lights. Style 1 (stop for cars, nothing else)
+    -- just queues behind anything stopped in its lane.
+    drivingStyle = 786469,
+
+    -- A unit that hasn't reached the scene in this long (wedged in traffic,
+    -- no road to it) is stood down, so it can't hold a maxUnits slot forever.
+    maxDriveMs = 120000,
+
+    -- How long the treatment beat (CODE_HUMAN_MEDIC_KNEEL) runs, counted
+    -- from when the medic is actually kneeling, before the medic re-boards
+    -- and the unit heads to hospital.
     treatmentTimeMs = 8000,
 
-    -- Incidents at or above this severity hold the ambulance back
-    -- (STAGING) for stagingHoldMs before it approaches -- a fixed timer
-    -- standing in for real "has police secured the scene" detection, which
-    -- needs the unit-position registry noted in server/dispatch.lua's
-    -- header comment. Set stagingHoldMs to 0 to disable staging entirely.
+    -- Incidents at or above this severity that police are also responding
+    -- to hold the ambulance back stagingDistance short of the scene
+    -- (STAGING) until a police unit is assigned to the call, or for
+    -- stagingHoldMs at most, before it approaches. Set stagingHoldMs to 0 to
+    -- disable staging entirely.
     dangerousSeverity = 3,
     stagingHoldMs = 8000,
+    stagingDistance = 60.0,
 
-    -- Pillbox Hospital, the same coordinate qbx_ambulancejob's own config
-    -- uses (resources/[qbx]/qbx_ambulancejob/config/shared.lua) so patients
-    -- end up at the hospital players already know as "the" hospital.
-    hospitalCoords = vector3(304.27, -600.33, 43.28),
+    -- Pillbox Hospital's ambulance bay on the street out front (where
+    -- qb/qbx_ambulancejob spawn their ambulances) -- a point an ambulance
+    -- can actually drive up to, unlike the check-in desk inside the lobby.
+    hospitalCoords = vector3(294.58, -574.76, 43.18),
+
+    -- Ceiling on the hospital run. The run also ends early as soon as the
+    -- ambulance is out of the player's sight, since nobody sees the rest.
+    maxHospitalDriveMs = 180000,
 
     tickMs = 1500,
 }
@@ -2167,11 +2188,18 @@ Config.Fire = {
     arriveDistance = 10.0,
     driveSpeed = 20.0,
 
-    -- Suppression polls FIRE::GET_NUMBER_OF_FIRES_IN_RANGE and calls
-    -- STOP_FIRE_IN_RANGE every tick within this radius until it reads zero
-    -- or maxSuppressMs elapses (whichever first -- a fire started by a
-    -- large explosion can outlast a single truck's crew).
+    -- Same lights-and-siren driving and stand-down timer as Config.EMS.
+    drivingStyle = 786469,
+    maxDriveMs = 120000,
+
+    -- A crew member works the fire with an extinguisher; once they've been
+    -- on it for suppressDelayMs, STOP_FIRE_IN_RANGE is called every tick
+    -- within suppressRadius until FIRE::GET_NUMBER_OF_FIRES_IN_RANGE reads
+    -- zero or maxSuppressMs (counted from arrival) elapses -- whichever
+    -- first, since a fire started by a large explosion can outlast a single
+    -- truck's crew.
     suppressRadius = 15.0,
+    suppressDelayMs = 6000,
     maxSuppressMs = 30000,
 
     tickMs = 1500,
@@ -2217,14 +2245,21 @@ Config.Investigate = {
     arriveDistance = 10.0,
     driveSpeed = 15.0,
 
+    -- No lights and siren on this unit, so it drives like a patrol: stops at
+    -- red lights, steers around stopped traffic. A unit that hasn't reached
+    -- the scene in maxDriveMs is stood down.
+    drivingStyle = 786603,
+    maxDriveMs = 120000,
+
     -- Before spawning a fresh unit, look for an already-wandering ambient
     -- patrol (client/ambient.lua) within this radius and reuse it instead
     -- (client/investigate.lua's ClaimNearbyPatrolForInvestigation). 0
     -- disables reuse and always spawns fresh.
     reuseNearbyPatrolRadius = 120.0,
 
-    -- How long the CODE_HUMAN_POLICE_INVESTIGATE beat runs before the
-    -- officer re-boards and clears -- see client/investigate.lua's header
+    -- How long the CODE_HUMAN_POLICE_INVESTIGATE beat runs, counted from
+    -- when the officer is actually on scene, before the officer re-boards
+    -- and clears -- see client/investigate.lua's header
     -- for why this never actually finds anything yet.
     investigateTimeMs = 15000,
 

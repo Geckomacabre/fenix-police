@@ -31,6 +31,11 @@ end
 local lastReportAt = 0
 
 local function checkForGunfire()
+    -- A wanted player never calls gunfire in: mid-pursuit the shots in the box
+    -- are this resource's own officers (or the player shooting back), and each
+    -- report would send an ambulance and an investigation unit into the chase.
+    if GetPlayerWantedLevel(PlayerId()) > 0 then return end
+
     local playerPed = PlayerPedId()
     local coords = GetEntityCoords(playerPed)
     local radius = cfg().radius or 60.0
