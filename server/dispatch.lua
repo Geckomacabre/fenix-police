@@ -433,6 +433,20 @@ local function validRole(role)
     return false
 end
 
+-- A responder reports its assignment straight after creating the unit, and
+-- the event can reach the server before the entity does -- the two travel
+-- separately. Judged at once, an honest unit reads as "not one of theirs",
+-- and the role is re-offered to somebody else on top of it.
+local function awaitUnit(unitId)
+    local waited = 0
+    while waited < 2000 do
+        local entity = NetworkGetEntityFromNetworkId(unitId)
+        if entity and entity ~= 0 and DoesEntityExist(entity) then return end
+        Wait(100)
+        waited = waited + 100
+    end
+end
+
 RegisterNetEvent('fenix-police:server:assignIncidentUnit')
 AddEventHandler('fenix-police:server:assignIncidentUnit', function(incidentId, unitId, role)
     local src = source
@@ -440,6 +454,9 @@ AddEventHandler('fenix-police:server:assignIncidentUnit', function(incidentId, u
 
     incidentId, unitId = tonumber(incidentId), tonumber(unitId)
     if not incidentId or not unitId or not validRole(role) then return end
+    if not FenixIncident.get(incidentId) then return end
+
+    awaitUnit(unitId)
 
     local incident = FenixIncident.get(incidentId)
     if not incident or incident.status == 'RESOLVED' or incident.status == 'CANCELLED' then return end
