@@ -56,9 +56,9 @@ function FenixLivery.resolveModel(model, coords, fallback)
 
     local pool = Config.Ambient and Config.Ambient.vehicleFallback
     local list = pool and (pool[FenixLivery.regionAt(coords)] or pool.losSantos)
-    local fallback = (list and #list > 0) and list[math.random(#list)] or 'police'
-    dbg(('%s is not installed, using %s'):format(tostring(model), fallback))
-    return fallback
+    local stock = (list and #list > 0) and list[math.random(#list)] or 'police'
+    dbg(('%s is not installed, using %s'):format(tostring(model), stock))
+    return stock
 end
 
 --- Strips a multi-livery car back to an unmarked look: no livery, the
