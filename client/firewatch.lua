@@ -26,13 +26,20 @@ local function checkForFire()
 
     if GetNumberOfFiresInRange(coords.x, coords.y, coords.z, radius) <= 0 then return end
 
+    -- Report where the fire is, not where the witness is standing: the truck
+    -- works (and STOP_FIRE_IN_RANGE clears) a radius around the reported
+    -- point, so a fire 30m from the witness would never be put out and
+    -- would keep being re-reported.
+    local found, firePos = GetClosestFirePos(coords.x, coords.y, coords.z)
+    if not found or #(firePos - coords) > radius then return end
+
     local now = GetGameTimer()
     local cooldownMs = cfg().reportCooldownMs or 20000
     if now - lastReportAt < cooldownMs then return end
     lastReportAt = now
 
-    dbg(('fire detected within %.0fm, reporting'):format(radius))
-    TriggerServerEvent('fenix-police:server:reportFire', coords)
+    dbg(('fire detected %.0fm away, reporting'):format(#(firePos - coords)))
+    TriggerServerEvent('fenix-police:server:reportFire', firePos)
 end
 
 CreateThread(function()

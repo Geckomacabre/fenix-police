@@ -39,15 +39,65 @@ local function loadModel(hash)
 end
 
 local units = {} -- vehNetID -> { vehicle, peds, pedSeats, fsm, incidentId }
-local pendingRequests = {}
+local pendingRequests = {} -- requestId -> { data = incidentData, at = GetGameTimer() }
 local nextRequestId = 1
 
 local UNIT_STATES = { 'DRIVING_TO_SCENE', 'INVESTIGATING', 'CLEARING' }
+
+local OFFICER_SCENARIO = 'CODE_HUMAN_POLICE_INVESTIGATE'
+
+-- GetScriptTaskStatus reports TaskVehicleDriveToCoordLongrange under this
+-- hash; 7 means the task has finished (or isn't running at all).
+local DRIVE_TASK = GetHashKey('SCRIPT_TASK_VEHICLE_DRIVE_TO_COORD_LONGRANGE')
+local TASK_FINISHED = 7
+
+-- A long-range drive ends at the nearest road node, which for a call placed
+-- off-road, indoors or up on a roof can be well short of the coordinates
+-- themselves -- without this the unit sits there forever, never "arriving".
+-- Within this distance a finished drive counts as arrived.
+local ROAD_END_ARRIVE_DISTANCE = 60.0
+
+-- How long the officer gets to climb back aboard before the car leaves anyway.
+local BOARD_TIMEOUT_MS = 15000
+
+-- A departing unit is deleted once it's out of sight this far from the
+-- player, or after DEPART_DELETE_MS regardless.
+local DEPART_DELETE_DISTANCE = 150.0
+local DEPART_DELETE_MS = 60000
+
+-- The server drops a refused spawn request without replying, so a request
+-- only holds a maxUnits slot for this long.
+local PENDING_REQUEST_TTL_MS = 10000
 
 local function unitCount()
     local n = 0
     for _ in pairs(units) do n = n + 1 end
     return n
+end
+
+-- What counts against maxUnits: units still working a call (one already
+-- driving off doesn't), plus spawn requests and patrol promotions still
+-- waiting on the server -- without those, two calls a moment apart would
+-- both get past the cap.
+local function busyCount()
+    local n = 0
+    for _, unit in pairs(units) do
+        if not unit.departing then n = n + 1 end
+    end
+    local now = GetGameTimer()
+    for requestId, request in pairs(pendingRequests) do
+        if now - request.at > PENDING_REQUEST_TTL_MS then
+            pendingRequests[requestId] = nil
+        else
+            n = n + 1
+        end
+    end
+    return n
+end
+
+local function driveTo(driver, vehicle, coords)
+    TaskVehicleDriveToCoordLongrange(driver, vehicle, coords.x, coords.y, coords.z,
+        cfg().driveSpeed or 15.0, cfg().drivingStyle or 786603, cfg().arriveDistance or 10.0)
 end
 
 --- Common tail for both paths below: register the unit, start its FSM, and
@@ -62,8 +112,7 @@ local function beginInvestigating(vehNetID, vehicle, driver, peds, pedSeats, inc
 
     TriggerServerEvent('fenix-police:server:assignIncidentUnit', incidentData.id, vehNetID, 'investigating')
 
-    TaskVehicleDriveToCoordLongrange(driver, vehicle, incidentData.coords.x, incidentData.coords.y, incidentData.coords.z,
-        cfg().driveSpeed or 15.0, 1, cfg().arriveDistance or 10.0)
+    driveTo(driver, vehicle, incidentData.coords)
 
     dbg(('#%s investigation unit dispatched, veh %d'):format(tostring(incidentData.id), vehNetID))
 end
@@ -73,7 +122,7 @@ AddEventHandler('fenix-police:client:policeInvestigateIncident', function(data)
     if not cfg().enabled then return end
     if type(data) ~= 'table' or type(data.coords) ~= 'vector3' then return end
 
-    if unitCount() >= (cfg().maxUnits or 1) then
+    if busyCount() >= (cfg().maxUnits or 1) then
         dbg(('#%s ignored, at maxUnits'):format(tostring(data.id)))
         return
     end
@@ -85,7 +134,13 @@ AddEventHandler('fenix-police:client:policeInvestigateIncident', function(data)
     if reuseRadius > 0 and ClaimNearbyPatrolForInvestigation then
         local veh, driver, passengers = ClaimNearbyPatrolForInvestigation(data.coords, reuseRadius)
         if veh then
+            -- The promotion waits on a server ticket; hold a slot meanwhile
+            -- so a second call can't slip past maxUnits.
+            local requestId = nextRequestId
+            nextRequestId = nextRequestId + 1
+            pendingRequests[requestId] = { data = data, at = GetGameTimer() }
             local vehNetID, driverNetID, passengerNetIDs = PromoteAmbientUnitForInvestigation(veh, driver, passengers)
+            pendingRequests[requestId] = nil
             if vehNetID then
                 -- Repaint for the incident's actual jurisdiction: this
                 -- vehicle's livery reflects wherever the ambient patrol
@@ -114,6 +169,7 @@ AddEventHandler('fenix-police:client:policeInvestigateIncident', function(data)
             for _, p in ipairs(passengers or {}) do
                 if DoesEntityExist(p) then DeleteEntity(p) end
             end
+            if driver and DoesEntityExist(driver) then DeleteEntity(driver) end
             if DoesEntityExist(veh) then DeleteEntity(veh) end
             return
         end
@@ -131,16 +187,21 @@ AddEventHandler('fenix-police:client:policeInvestigateIncident', function(data)
 
     local requestId = nextRequestId
     nextRequestId = nextRequestId + 1
-    pendingRequests[requestId] = data
+    pendingRequests[requestId] = { data = data, at = GetGameTimer() }
 
     TriggerServerEvent('fenix-police:server:spawnInvestigateUnit', requestId, spawnPoint, heading)
 end)
 
 RegisterNetEvent('fenix-police:spawnInvestigateUnitClient')
 AddEventHandler('fenix-police:spawnInvestigateUnitClient', function(requestId, vehicleInfo, spawnPoint, spawnHeading, ticket)
-    local incidentData = pendingRequests[requestId]
-    pendingRequests[requestId] = nil
-    if not incidentData then return end
+    local request = pendingRequests[requestId]
+    if not request or request.spawning then return end
+    local incidentData = request.data
+
+    -- The request keeps its maxUnits slot while the models load (which
+    -- yields); if the spawn fails below, it simply ages out.
+    request.spawning = true
+    request.at = GetGameTimer()
 
     -- Same install-check/fallback chain the marked pursuit fleet uses
     -- (client/livery.lua) -- without this, a missing/renamed add-on model
@@ -203,27 +264,63 @@ AddEventHandler('fenix-police:spawnInvestigateUnitClient', function(requestId, v
 
     TriggerServerEvent('fenix-police:registerSpawnedUnit', ticket, vehNetID, pedNetIDs)
 
+    pendingRequests[requestId] = nil
     beginInvestigating(vehNetID, vehicle, driver, peds, pedSeats, incidentData)
 end)
 
 local function officerPed(unit)
     for pedNetID, ped in pairs(unit.peds) do
-        if DoesEntityExist(ped) and unit.pedSeats[pedNetID] ~= -1 then
+        if DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true) and unit.pedSeats[pedNetID] ~= -1 then
             return ped, unit.pedSeats[pedNetID]
         end
     end
     -- Single-officer units have no passenger -- fall back to the driver.
     for pedNetID, ped in pairs(unit.peds) do
-        if DoesEntityExist(ped) then return ped, unit.pedSeats[pedNetID] end
+        if DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true) then return ped, unit.pedSeats[pedNetID] end
     end
     return nil
+end
+
+-- Every living crew member is seated in the unit's own vehicle.
+local function crewAboard(unit)
+    for _, ped in pairs(unit.peds) do
+        if DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true) and not IsPedInVehicle(ped, unit.vehicle, false) then
+            return false
+        end
+    end
+    return true
+end
+
+-- Gets the ped out of the vehicle and into the scenario as ONE task
+-- sequence. Issued as two separate tasks, the scenario replaces the exit
+-- mid-animation, and re-issuing it every tick while the ped is still
+-- walking over keeps restarting the walk.
+local function exitIntoScenario(ped, vehicle, scenario, coords)
+    local taskSequence = OpenSequenceTask(0)
+    if IsPedInAnyVehicle(ped, false) then
+        TaskLeaveVehicle(0, vehicle, 0)
+    end
+    TaskStartScenarioAtPosition(0, scenario, coords.x, coords.y, coords.z, 0.0, -1, false, false)
+    CloseSequenceTask(taskSequence)
+    TaskPerformSequence(ped, taskSequence)
+    ClearSequenceTask(taskSequence)
+end
+
+local function driveTaskFinished(driver)
+    return GetScriptTaskStatus(driver, DRIVE_TASK) == TASK_FINISHED
+end
+
+local function releaseIncident(unit, vehNetID)
+    if unit.released then return end
+    unit.released = true
+    TriggerServerEvent('fenix-police:server:releaseIncidentUnit', unit.incidentId, vehNetID)
 end
 
 local function clearUnit(vehNetID)
     local unit = units[vehNetID]
     if not unit then return end
 
-    TriggerServerEvent('fenix-police:server:releaseIncidentUnit', unit.incidentId, vehNetID)
+    releaseIncident(unit, vehNetID)
 
     TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
     for pedNetID in pairs(unit.peds) do
@@ -252,8 +349,27 @@ CreateThread(function()
 
                     if fsm:is('DRIVING_TO_SCENE') then
                         local dist = #(GetEntityCoords(vehicle) - coords)
+
+                        -- Nothing else ever moves a unit on from here: one
+                        -- whose driver was dragged out of the seat, or that
+                        -- is wedged somewhere, would hold its maxUnits slot
+                        -- for good.
+                        if GetPedInVehicleSeat(vehicle, -1) ~= driver or fsm:timeInState() > (cfg().maxDriveMs or 120000) then
+                            dbg(('unit %d never reached the scene, clearing'):format(vehNetID))
+                            clearUnit(vehNetID)
+                            return
+                        end
+
                         if dist <= (cfg().arriveDistance or 10.0) + 4.0 then
                             fsm:transition('INVESTIGATING')
+                        elseif driveTaskFinished(driver) then
+                            if dist <= ROAD_END_ARRIVE_DISTANCE then
+                                fsm:transition('INVESTIGATING')
+                            else
+                                -- Knocked off its task short of the scene (an
+                                -- event reaction, a collision) -- carry on.
+                                driveTo(driver, vehicle, coords)
+                            end
                         end
                     elseif fsm:is('INVESTIGATING') then
                         -- officerPed falls back to the driver when there's no
@@ -265,29 +381,52 @@ CreateThread(function()
                         -- "the driver" -- there's nobody else to leave behind
                         -- minding the car, and there doesn't need to be; it
                         -- just sits parked until they re-board.
-                        if not fsm.data.officerDeployed then
-                            fsm.data.officerDeployed = true
-                            local officer = officerPed(unit)
-                            if officer then
-                                TaskLeaveVehicle(officer, vehicle, 0)
+                        local officer, seat = officerPed(unit)
+                        if officer then
+                            -- Re-issued only once the sequence has actually
+                            -- ended (cut short by an event reaction), never
+                            -- while it is still walking the officer over.
+                            if not fsm.data.officerDeployed
+                                or (GetSequenceProgress(officer) == -1 and not IsPedUsingScenario(officer, OFFICER_SCENARIO))
+                            then
+                                fsm.data.officerDeployed = true
+                                exitIntoScenario(officer, vehicle, OFFICER_SCENARIO, coords)
                             end
+                            if not fsm.data.investigatingSince and IsPedUsingScenario(officer, OFFICER_SCENARIO) then
+                                fsm.data.investigatingSince = GetGameTimer()
+                            end
+                        elseif not fsm.data.investigatingSince then
+                            fsm.data.investigatingSince = GetGameTimer()
                         end
 
-                        local officer = officerPed(unit)
-                        if officer and DoesEntityExist(officer) and not IsPedUsingScenario(officer, 'CODE_HUMAN_POLICE_INVESTIGATE') then
-                            TaskStartScenarioAtPosition(officer, 'CODE_HUMAN_POLICE_INVESTIGATE', coords.x, coords.y, coords.z, 0.0, -1, false, false)
-                        end
-
-                        if fsm:timeInState() >= (cfg().investigateTimeMs or 15000) then
-                            if officer and DoesEntityExist(officer) then
+                        -- Counts from when the officer is actually on scene
+                        -- looking around; otherwise getting out and walking
+                        -- over eats a good part of it. The ceiling covers an
+                        -- officer who never gets there.
+                        local investigateMs = cfg().investigateTimeMs or 15000
+                        local investigatedFor = fsm:msSince('investigatingSince')
+                        if (investigatedFor and investigatedFor >= investigateMs) or fsm:timeInState() >= investigateMs + 30000 then
+                            if officer then
                                 ClearPedTasks(officer)
-                                local _, seat = officerPed(unit)
-                                TaskEnterVehicle(officer, vehicle, 8000, seat, 1.0, 1, nil)
+                                TaskEnterVehicle(officer, vehicle, BOARD_TIMEOUT_MS, seat, 1.0, 1, 0)
                             end
                             fsm:transition('CLEARING')
                         end
                     elseif fsm:is('CLEARING') then
-                        if fsm:timeInState() >= 6000 then
+                        -- Back into service: drive away, and only disappear
+                        -- once nobody can see it, rather than the car and
+                        -- officer vanishing on the spot.
+                        if not fsm.data.departedAt then
+                            if crewAboard(unit) or fsm:timeInState() >= BOARD_TIMEOUT_MS then
+                                fsm.data.departedAt = GetGameTimer()
+                                unit.departing = true
+                                releaseIncident(unit, vehNetID)
+                                TaskVehicleDriveWander(driver, vehicle, 15.0, 786603)
+                            end
+                        elseif fsm:msSince('departedAt') >= DEPART_DELETE_MS
+                            or (not IsEntityOnScreen(vehicle)
+                                and #(GetEntityCoords(vehicle) - GetEntityCoords(PlayerPedId())) > DEPART_DELETE_DISTANCE)
+                        then
                             clearUnit(vehNetID)
                         end
                     end
