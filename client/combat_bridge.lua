@@ -5,7 +5,26 @@
 -- environment, so the server builds a profile table and fires this event
 -- instead of calling them directly. Broadcast to every client; whichever one
 -- has the ped streamed in applies it, the rest just no-op.
+
+--- The ped of the player with this server id, or 0 when that player isn't in
+--- this client's scope. GetPlayerFromServerId answers -1 for an out-of-scope
+--- player, and GetPlayerPed(-1) is THIS client's own ped -- so without the
+--- check, the client applying the profile tasked units against its own player
+--- instead of the intended target.
+local function targetPedOf(serverId)
+    serverId = tonumber(serverId)
+    if not serverId then return 0 end
+    local player = GetPlayerFromServerId(serverId)
+    if player == -1 then return 0 end
+    return GetPlayerPed(player)
+end
+
 RegisterNetEvent('fenix-police:client:applyCombatProfile', function(pedNetID, profile)
+    if type(profile) ~= 'table' then return end
+    -- Broadcast to every client, most of which don't have this ped at all:
+    -- the silent existence test, not a resolve that warns on every miss.
+    pedNetID = tonumber(pedNetID)
+    if not pedNetID or not NetworkDoesEntityExistWithNetworkId(pedNetID) then return end
     local ped = NetworkGetEntityFromNetworkId(pedNetID)
     if not DoesEntityExist(ped) then return end
 
@@ -40,20 +59,20 @@ RegisterNetEvent('fenix-police:client:applyCombatProfile', function(pedNetID, pr
     end
 
     if profile.heliChaseTarget then
-        local targetPed = GetPlayerPed(GetPlayerFromServerId(profile.heliChaseTarget))
-        if DoesEntityExist(targetPed) then
+        local targetPed = targetPedOf(profile.heliChaseTarget)
+        if targetPed ~= 0 and DoesEntityExist(targetPed) then
             TaskHeliChase(ped, targetPed, 0.0, 0.0, 120.0)
         end
     end
     if profile.planeChaseTarget then
-        local targetPed = GetPlayerPed(GetPlayerFromServerId(profile.planeChaseTarget))
-        if DoesEntityExist(targetPed) then
+        local targetPed = targetPedOf(profile.planeChaseTarget)
+        if targetPed ~= 0 and DoesEntityExist(targetPed) then
             TaskPlaneChase(ped, targetPed, 20.0, 20.0, 150.0)
         end
     end
     if profile.combatTarget then
-        local targetPed = GetPlayerPed(GetPlayerFromServerId(profile.combatTarget))
-        if DoesEntityExist(targetPed) then
+        local targetPed = targetPedOf(profile.combatTarget)
+        if targetPed ~= 0 and DoesEntityExist(targetPed) then
             TaskCombatPed(ped, targetPed, 0, 16)
         end
     end
@@ -68,8 +87,8 @@ RegisterNetEvent('fenix-police:client:applyCombatProfile', function(pedNetID, pr
     end
     if profile.vehicleChase then
         local vehicle = GetVehiclePedIsIn(ped, false)
-        local targetPed = GetPlayerPed(GetPlayerFromServerId(profile.vehicleChase))
-        if vehicle ~= 0 and DoesEntityExist(targetPed) then
+        local targetPed = targetPedOf(profile.vehicleChase)
+        if vehicle ~= 0 and targetPed ~= 0 and DoesEntityExist(targetPed) then
             TaskVehicleChase(ped, targetPed)
             SetTaskVehicleChaseBehaviorFlag(ped, 8, true)
         end

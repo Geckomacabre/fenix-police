@@ -52,6 +52,14 @@ CreateThread(buildTrackedModels)
 -- checking whoever is currently driving it. Absence means "still has one" —
 -- only an explicit server-set true means it's been pulled — so nothing has
 -- to be pre-seeded for every vehicle that spawns.
+--
+-- Except for vehicles that only exist on this client (ambient patrol cars,
+-- roadblock cars): they have no network id, so the server can neither find
+-- nor flag them, and a tracker on one could never be removed at all. Nothing
+-- but this client's own contact thread ever asks about them, so their removal
+-- is kept here instead -- handle -> model, the model so that a recycled
+-- handle on some other car doesn't inherit it.
+local localRemoved = {}
 
 --- Does this vehicle currently have a working tracker?
 --- @param vehicle number vehicle entity handle
@@ -71,6 +79,10 @@ function FenixTracker.hasTracker(vehicle)
     -- exception propagating up through ox_target's tick.
     local ok, model = pcall(GetEntityModel, vehicle)
     if not ok or not model or not trackedModels[model] then return false end
+
+    local okNet, networked = pcall(NetworkGetEntityIsNetworked, vehicle)
+    if not okNet then return false end
+    if not networked then return localRemoved[vehicle] ~= model end
 
     return Entity(vehicle).state.trackerRemoved ~= true
 end
@@ -117,8 +129,6 @@ local function removeTracker(vehicle)
         return
     end
 
-    local netId = NetworkGetNetworkIdFromEntity(vehicle)
-
     local done = lib.progressCircle({
         duration = cfg().removeMs or 12000,
         label = 'Removing tracker...',
@@ -138,7 +148,32 @@ local function removeTracker(vehicle)
         return
     end
 
-    TriggerServerEvent('fenix-police:removeTracker', netId)
+    if not NetworkGetEntityIsNetworked(vehicle) then
+        -- A car only this client has: nothing for the server to check or flag
+        -- (see localRemoved). Forget entries for cars that are gone while here.
+        for handle in pairs(localRemoved) do
+            if not DoesEntityExist(handle) then localRemoved[handle] = nil end
+        end
+        localRemoved[vehicle] = GetEntityModel(vehicle)
+        lib.notify({ type = 'success', description = 'Tracker removed.' })
+        return
+    end
+
+    TriggerServerEvent('fenix-police:removeTracker', NetworkGetNetworkIdFromEntity(vehicle))
+
+    -- The server has the final say and answers through the statebag. Wait
+    -- briefly for it, so a refusal at the end of a twelve-second job is at
+    -- least reported rather than leaving the player guessing.
+    local waited = 0
+    while waited < 3000 and DoesEntityExist(vehicle) and Entity(vehicle).state.trackerRemoved ~= true do
+        Wait(100)
+        waited = waited + 100
+    end
+    if DoesEntityExist(vehicle) and Entity(vehicle).state.trackerRemoved == true then
+        lib.notify({ type = 'success', description = 'Tracker removed.' })
+    else
+        lib.notify({ type = 'error', description = "Couldn't get the tracker out." })
+    end
 end
 
 exports('RemoveTracker', removeTracker)
