@@ -1359,15 +1359,17 @@ Config.Security = {
     -- Extra detail: allowlist size at boot, unit registrations as they land.
     debug = false,
 
-    -- Require an ownership record before acting on an entity.
+    -- Only act on an entity recorded against the requesting player, or, with no
+    -- record, one that player's own client created.
     --
-    -- Left OFF by default. With layers 1 and 2 in place, the worst an unowned
-    -- entity permits is one player interfering with another player's police
-    -- units -- griefing, not theft -- and turning this on before you have
-    -- confirmed registration works on your server converts every gap into a
-    -- police car that never gets cleaned up. Turn it on once `fenixguard` in the
-    -- server console shows entities being owned during a pursuit.
-    strictOwnership = false,
+    -- On by default. Layer 2 alone lets anyone unlock or delete any unoccupied
+    -- car whose model is on the allowlist -- and the stock police, sheriff, FBI,
+    -- ambulance and fire models are exactly what player job vehicles use. Every
+    -- unit this resource spawns passes layer 3 on its own: helicopters and
+    -- planes are recorded when the server creates them, everything else is
+    -- created by the requesting client. Set false only to go back to judging
+    -- unrecorded entities on model alone.
+    strictOwnership = true,
 
     -- Seconds a spawn ticket stays valid. A ticket is issued when the server
     -- authorises a ground spawn and consumed when the client reports back what
@@ -1376,9 +1378,11 @@ Config.Security = {
 
     -- Ceiling on how many entities one player can have recorded at once. The
     -- backstop against a client that passes every other check and simply asks
-    -- for units forever. Config.maxUnitsPerLevel tops out at 10 vehicles with
-    -- crews, so this has a lot of headroom before it can bite legitimately.
-    maxOwnedEntities = 60,
+    -- for units forever. Applies to helicopters and planes as well as ground
+    -- units. A five-star pursuit with every reinforcement and backup bonus is
+    -- 17 cars of up to 5 entities each plus 6 helicopters of 5, before dead
+    -- officers awaiting cleanup -- around 120 at the very worst.
+    maxOwnedEntities = 150,
 
     -- Requests per player per minute, per event group. These events are not
     -- called at remotely similar rates: `spawn` is a deliberate request made a
@@ -1396,23 +1400,15 @@ Config.Security = {
         delete   = 600,
         unlock   = 600,
         rearm    = 600,
-        alert    = 30,
     },
 
     -- Fallback for any event group not named above.
     maxRequestsPerMinute = 300,
 
-    -- `fenix:server:trigger` applies a wanted level to everyone standing near a
-    -- reported crime, and took the crime's coordinates from the client. Any
-    -- client could therefore pick a victim anywhere on the map and star them --
-    -- a wanted-level cannon aimed by whoever sent the event.
-    --
-    -- A player reporting a crime is reporting one they are AT, so coordinates
-    -- further than this from the caller are refused. Raise it if a resource of
-    -- yours legitimately reports crimes from a distance; 0 disables the check.
-    -- Calls from another resource server-side skip it either way, since there is
-    -- no caller to measure against.
-    maxAlertDistance = 100.0,
+    -- Minimum seconds between two field revives (Config.Aftermath) for the same
+    -- player. The revive itself is a server export, so this is what stops a
+    -- client asking for one over and over.
+    fieldReviveCooldown = 300,
 
     -- Models to allowlist that the config tables above don't mention. You only
     -- need these if something outside Config.vehiclesByRegion / Config.polHelis
