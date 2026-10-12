@@ -299,7 +299,8 @@ local function makingNoise(playerCoords)
 
     local range = c.gunfireRange or 120.0
     for ped in pairs(observers) do
-        if DoesEntityExist(ped) and #(GetEntityCoords(ped) - playerCoords) < range then
+        if DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true)
+            and #(GetEntityCoords(ped) - playerCoords) < range then
             return true
         end
     end
@@ -365,8 +366,9 @@ end
 -------------------------------------------------------------------------------
 
 --- Register (or refresh) an officer as somebody who can see for the pursuit.
---- Called from client.lua's chase loops every cycle. Entries not refreshed
---- inside `observerTimeout` are dropped, so a deleted officer removes itself.
+--- Called from client.lua's chase loops every cycle. An entry not refreshed
+--- inside `observerTimeout` loses its blip but keeps looking; a deleted or
+--- dead officer drops out of the set on its own.
 --- @param kind string 'ground' | 'heli' | 'air'
 function FenixPursuit.noteObserver(ped, kind)
     if not ped or ped == 0 or not DoesEntityExist(ped) then return end
@@ -659,10 +661,10 @@ CreateThread(function()
 
         -- With nobody registered as eyes there is still work to do while a
         -- pursuit that has had contact is live: contact has to be able to
-        -- LAPSE once every unit is dead, gone or regrouping. Skipping the state
-        -- machine entirely froze it -- hasContact() stayed true forever, the
-        -- search never started or gave up, and road tactics kept deploying
-        -- against a suspect nobody could see.
+        -- LAPSE once every unit is dead or gone. Skipping the state machine
+        -- entirely froze it -- hasContact() stayed true forever, the search
+        -- never started or gave up, and road tactics kept deploying against a
+        -- suspect nobody could see.
         local noEyes = next(observers) == nil
         if c.enabled == false or (noEyes and not (contact.everSeen and wanted > 0)) then
             -- Nothing is chasing you: idle at a slower tick rather than paying
@@ -679,7 +681,8 @@ CreateThread(function()
             local seen = false
 
             for ped, entry in pairs(observers) do
-                if (now - entry.seenAt) > timeout or not DoesEntityExist(ped) then
+                local stale = (now - entry.seenAt) > timeout
+                if not DoesEntityExist(ped) or (stale and IsPedDeadOrDying(ped, true)) then
                     clearBlip(ped)
                     observers[ped] = nil
                 elseif IsPedDeadOrDying(ped, true) then
@@ -693,7 +696,21 @@ CreateThread(function()
                         entry.blip = false
                     end
                 else
-                    updateBlip(ped, entry, c)
+                    if stale then
+                        -- No longer refreshed: client.lua has handed this
+                        -- officer's unit to something other than the chase --
+                        -- a foot chase, an arrest, a traffic stop, a retreat.
+                        -- Off the map, but still a pair of eyes until dead or
+                        -- gone. Dropping them made contact lapse ("lost
+                        -- visual") with an officer standing beside the player
+                        -- once every unit on scene was busy like that.
+                        if entry.blip then
+                            clearBlip(ped)
+                            entry.blip = false
+                        end
+                    else
+                        updateBlip(ped, entry, c)
+                    end
                     -- No break once somebody sees: the loop still has to prune
                     -- and blip the rest, it just stops paying for their rays.
                     if not seen and canSee(ped, entry.kind, playerPed, playerCoords) then
@@ -774,11 +791,11 @@ CreateThread(function()
                 -- the wanted level itself -- a full FenixPursuit.reset() only
                 -- happens once the level decays to 0. Deliberately NOT
                 -- clearing lastKnown: targetCoords() falls back to the
-                -- player's LIVE coords once lastKnown is nil, which would
-                -- make units omniscient again right when they're supposed to
-                -- be standing down. They keep sitting on the stale last-known
-                -- point (already the existing idle behaviour once a search
-                -- goes cold) instead.
+                -- original dispatch position once lastKnown is nil, which
+                -- would send every unit back to where the call first came
+                -- from right when they're supposed to be standing down. They
+                -- keep sitting on the stale last-known point (already the
+                -- existing idle behaviour once a search goes cold) instead.
                 contact.gaveUp = true
                 dispatch('No visual, no leads. Units resuming patrol.')
                 dbg('search called off')

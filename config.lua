@@ -1506,9 +1506,10 @@ Config.Pursuit = {
     -- wants to hear the street, not announce itself to it.
     quietSearch = true,
 
-    -- An officer who stops being refreshed by the chase loop for this long is
-    -- dropped from the perception set. This is how a deleted officer removes
-    -- itself without client.lua having to say so.
+    -- An officer who stops being refreshed by the chase loop for this long
+    -- (their unit is busy with a foot chase, an arrest, a stop or a retreat)
+    -- loses their blip but can still see you. A deleted or dead officer drops
+    -- out of the perception set without client.lua having to say so.
     observerTimeout = 4000,
 
     -- AI blips on responding officers, with the view cone that shows what each
