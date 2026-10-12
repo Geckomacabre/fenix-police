@@ -438,8 +438,11 @@ local function sceneFault(scene, where, err)
     print('[FENIX-AMBIENT] ' .. msg)
     relay(msg)
     scene.faults = (scene.faults or 0) + 1
-    if scene.faults >= 3 and not pcall(destroyScene, scene) and scene.id then
-        scenes[scene.id] = nil
+    if scene.faults >= 3 and not pcall(destroyScene, scene) then
+        -- Teardown itself threw: at least drop the record and its point claim,
+        -- or the fixed point stays taken for the rest of the session.
+        if scene.pointKey then claimedPoints[scene.pointKey] = nil end
+        if scene.id then scenes[scene.id] = nil end
     end
 end
 
@@ -1522,6 +1525,12 @@ exports('IsWitnessed', function(x, y, z, range)
     return isWitnessed(vector3(x, y, z), range)
 end)
 
+-- This resource's own exports, called by its real name: with a hard-coded
+-- 'fenix-police', every pcall through them fails quietly on a server that
+-- renamed the folder, and the on-duty exemption and traffic-stop stand-down
+-- below would never fire.
+local RESOURCE = GetCurrentResourceName()
+
 --- Is the local player on duty as police? Checked before enforcing so ambient
 --- officers never pull over a player who is themselves policing — that job
 --- belongs to night_ers, which owns player-side police RP on this server.
@@ -1531,7 +1540,7 @@ end)
 local function playerIsOnDutyPolice()
     if (cfg().radar or {}).exemptPolice == false then return false end
 
-    local ok, res = pcall(function() return exports['fenix-police']:IsPlayerPoliceOfficer() end)
+    local ok, res = pcall(function() return exports[RESOURCE]:IsPlayerPoliceOfficer() end)
     if ok and res == true then return true end
 
     ok, res = pcall(function() return exports['night_ers']:getIsPlayerOnShift() end)
@@ -1866,7 +1875,7 @@ end
 --- for as long as the officer is writing.
 local function playerAtTrafficStop()
     local ok, stopping = pcall(function()
-        return exports['fenix-police']:IsPlayerAtTrafficStop()
+        return exports[RESOURCE]:IsPlayerAtTrafficStop()
     end)
     return ok and stopping == true
 end
@@ -2163,8 +2172,8 @@ local function anyOnScreen(scene)
 end
 
 --- How long an enforcing scene may go on with the player not wanted before it
---- stands down. Covers the gap before the wanted level lands (ApplyWantedLevel
---- applies it from its own thread), and the case where it never does.
+--- stands down. Covers any gap before the wanted level lands, and the case
+--- where it never does (wanted levels blocked, or the player exempt).
 local ENFORCER_SETTLE_MS = 10000
 
 --- An enforcing scene whose job is over — the player is no longer wanted, or
@@ -2211,9 +2220,14 @@ local function cullScene(scene, playerCoords, now)
     end
 
     -- Track roaming scenes by their lead entity, not their spawn point —
-    -- a patrol car drives away from where it started.
+    -- a patrol car drives away from where it started. A scene chasing the
+    -- player is wherever its chase car is, and that isn't always slot 1 (a
+    -- convoy whose lead car is gone, a pursuit scene's abandoned suspect car):
+    -- measured from slot 1, the chase car read as out of range and was
+    -- deleted right behind the player.
     local reference = scene.anchor
-    local lead = scene.vehicles[1]
+    local e = scene.enforcer
+    local lead = (e and DoesEntityExist(e.copVeh)) and e.copVeh or scene.vehicles[1]
     if lead and DoesEntityExist(lead) then reference = GetEntityCoords(lead) end
 
     local tooFar = #(reference - playerCoords) > (c.cleanupDistance or 320.0)
@@ -2289,6 +2303,10 @@ local function tryPromoteScene(scene, budget)
     if scene.stop or scene.carjack or scene.pursuit then return 0 end
     if type(PromoteAmbientUnit) ~= 'function' then return 0 end
     budget = budget or math.huge
+    -- Each promotion waits seconds on a server handshake, and
+    -- ClaimNearbyPatrolForInvestigation runs on another thread: without this
+    -- it could hand the same car to an investigation in the meantime.
+    scene.promoting = true
 
     local promotedCount = 0
     local promotedPeds = {} -- ped entity -> true, so the leftover sweep below skips them
@@ -2338,7 +2356,7 @@ end
 --- it is the unit that started this, not a bystander being deputised.
 local function promoteEnforcer(scene, now)
     local e = scene.enforcer
-    if not e or scene.promoteTried or type(PromoteAmbientUnit) ~= 'function' then return end
+    if not e or e.promoteTried or type(PromoteAmbientUnit) ~= 'function' then return end
 
     local ps = scene.playerStop
     local due = (not ps) or ps.escalated
@@ -2347,14 +2365,19 @@ local function promoteEnforcer(scene, now)
     if not (isStanding(e.cop) and DoesEntityExist(e.copVeh)
         and GetPedInVehicleSeat(e.copVeh, -1) == e.cop) then return end
 
-    -- One attempt. A failed handshake leaves it an ambient chase car, which
-    -- retires at expiry like any other.
-    scene.promoteTried = true
+    -- One attempt per catch. A failed handshake leaves it an ambient chase
+    -- car, which retires at expiry like any other. Kept on the catch, not the
+    -- scene: a convoy whose lead was promoted can still clock the player
+    -- again later with one of the cars left behind.
+    e.promoteTried = true
     if not PromoteAmbientUnit(e.copVeh, e.cop, {}) then return end
 
     -- The car and officer now belong to client.lua's spawnedVehicles. Take
     -- them out of this scene so nothing here deletes or re-tasks them; what
     -- is left of the scene (often nothing) goes through the normal sweep.
+    -- A car stood down for a roadside stop had its wail muted, and a real
+    -- unit never unmutes it.
+    SetVehicleHasMutedSirens(e.copVeh, false)
     unlockForPlayers(e.copVeh)
     removeFrom(scene.vehicles, e.copVeh)
     removeFrom(scene.peds, e.cop)
@@ -2565,6 +2588,9 @@ RegisterCommand('ambientpolice', function(_, args)
             state = 'already triggered a pursuit'
         elseif scene.cops == 0 or not observerOf(scene) then
             state = 'no officer to enforce'
+        elseif scene.pursuit or scene.releaseOnTeardown then
+            -- Not armed either: see isArmed.
+            state = 'busy (chasing a suspect, or leaving)'
         elseif scene.radarSpeed then
             state = ('armed at %.0f mph (authored)'):format(scene.radarSpeed)
         elseif scene.kind == 'radar' then
@@ -2660,14 +2686,15 @@ end)
 --- Deliberately only 'patrol' scenes, and only ones not already mid-stop/
 --- carjack/pursuit -- the same guard tryPromoteScene uses, so this can never
 --- steal a scene something else is actively using. Also never one chasing or
---- pulling someone over (the player included), nor one already winding down.
+--- pulling someone over (the player included), one already winding down, or
+--- one the wanted sweep is part-way through promoting.
 ---
 --- @return vehicle, driverPed, passengerPeds or nil if nothing nearby qualifies.
 function ClaimNearbyPatrolForInvestigation(coords, radius)
     for _, scene in pairs(scenes) do
         if scene.kind == 'patrol' and not scene.stop and not scene.carjack and not scene.pursuit
             and not scene.enforcing and not scene.playerStop and not scene.chase
-            and not scene.releaseOnTeardown then
+            and not scene.releaseOnTeardown and not scene.promoting then
             local veh = scene.vehicles[1]
             if veh and DoesEntityExist(veh) then
                 local driver = GetPedInVehicleSeat(veh, -1)
