@@ -1455,9 +1455,10 @@ Config.Pursuit = {
     sightFov   = 160.0,
 
     -- Other vehicles block a ground officer's view: a bus or a truck between
-    -- you and a cruiser hides you the same way a wall does. Air crews look
-    -- down over traffic and are unaffected. Set false to let officers see
-    -- through traffic.
+    -- you and a cruiser hides you the same way a wall does. A car within a
+    -- few metres of the officer (the one they're taking cover behind) or of
+    -- you doesn't count. Air crews look down over traffic and are unaffected.
+    -- Set false to let officers see through traffic.
     vehiclesBlockSight = true,
 
     -- Air crews. No cone: a helicopter carries a spotter whose entire job is
