@@ -157,7 +157,10 @@ end
 RegisterNetEvent('fenix-police:aftermathState')
 AddEventHandler('fenix-police:aftermathState', function(active)
     local src = source
-    if not FenixGuard.allow(src, 'status', 120) then return end
+    -- Metered on its own, not with the wanted-status reports that arrive
+    -- every cycle: a hold refused for their sake lets the cleanup broadcast
+    -- delete the officers mid-revive. An honest client sends a few a minute.
+    if not FenixGuard.allow(src, 'aftermath', 30) then return end
 
     if active then
         aftermathHolding[src] = os.time() + aftermathHoldSeconds()
@@ -172,7 +175,10 @@ AddEventHandler('playerDropped', function()
     playerWantedStatus[src] = nil
     aftermathHolding[src] = nil
     cleanupOwed[src] = nil
-    cleanupIfNoPlayersWanted()
+    -- Deferred: the leaving player can still be listed by GetPlayers while
+    -- this event runs, with no report on file any more, and an unreported
+    -- player holds the broadcast back for everyone.
+    SetTimeout(1000, cleanupIfNoPlayersWanted)
 end)
 
 -- [Upstate Mafia] Client diagnostics relay: client/ambient.lua mirrors its
@@ -205,10 +211,18 @@ end, true)
 -- Clients may report every cycle, or only on a change plus a periodic
 -- heartbeat: this keeps the latest, and the cleanup above keys off the
 -- someone -> nobody transition, not off how often reports arrive.
+--
+-- Metered at twice the rate a client reporting every Config.scriptFrequency
+-- sends. Any tighter and a server running a faster cycle has reports
+-- refused, and a refused "no longer wanted" leaves that player counted as
+-- wanted, holding everyone's cleanup back until a later one gets through.
+local STATUS_PER_MINUTE = math.max(120,
+    math.ceil(120000 / math.max(tonumber(Config.scriptFrequency) or 1000, 100)))
+
 RegisterNetEvent('fenix-police:updateWantedStatus')
 AddEventHandler('fenix-police:updateWantedStatus', function(isWanted)
     local src = source
-    if not FenixGuard.allow(src, 'status', 120) then return end
+    if not FenixGuard.allow(src, 'status', STATUS_PER_MINUTE) then return end
 
     playerWantedStatus[src] = {
         wanted = isWanted == true,
@@ -216,6 +230,15 @@ AddEventHandler('fenix-police:updateWantedStatus', function(isWanted)
     }
 
     cleanupIfNoPlayersWanted()
+
+    -- The report and the synced wanted level travel separately, so "no
+    -- longer wanted" can land while the server still sees the old level,
+    -- which counts as wanted. Look again once the sync has caught up rather
+    -- than on the next report -- a heartbeat away for a client that only
+    -- reports changes.
+    if isWanted ~= true and (GetPlayerWantedLevel(src) or 0) > 0 then
+        SetTimeout(2000, cleanupIfNoPlayersWanted)
+    end
 end)
 
 -- Server event to delete a ped by network ID
@@ -516,7 +539,13 @@ AddEventHandler('spawnPoliceUnitNet', function(wantedLevel, _, regionCode, spawn
     if not regionCode then return fail() end
 
     -- Pick the vehicle to choose to spawn for this region, vehicle determines which peds spawn with it, and the peds determine combat behavior and weapons.
-    local selectedEntry = getRandomVehicle(regionCode, level)
+    -- pcall: an entry missing its spawnChance or peds would otherwise throw
+    -- here and the request would never be answered.
+    local ok, selectedEntry = pcall(getRandomVehicle, regionCode, level)
+    if not ok then
+        print(('[fenix-police] Config.vehiclesByRegion.%s: %s'):format(regionCode, tostring(selectedEntry)))
+        return fail()
+    end
     if not selectedEntry then
         if Config.isDebug then print('No suitable vehicle found for the given wanted level.') end
         return fail()
@@ -1324,17 +1353,21 @@ AddEventHandler('fenix:server:trigger', function(pdata, alertData)
     -- through the same FenixIncident lifecycle. wantedLevel from
     -- Config.locations is applied exactly as configured, so existing
     -- per-location tuning keeps working unchanged. The reporter's routing
-    -- bucket keeps the stars to players in the same one.
+    -- bucket keeps the stars to players in the same one, either way: an
+    -- instanced interior shares its coordinates with every other copy of it.
+    local reporter = tonumber(pdata)
+    local bucket = (reporter and GetPlayerName(reporter)) and GetPlayerRoutingBucket(reporter) or nil
     if (Config.Dispatch or {}).enabled and FenixDispatch then
-        local reporter = tonumber(pdata)
         FenixDispatch.createIncident('LEGACY_ALERT', coords, nil, {
             wantedRadius = 10.0,
             directWanted = wantedlevel,
-            bucket = (reporter and GetPlayerName(reporter)) and GetPlayerRoutingBucket(reporter) or nil,
+            bucket = bucket,
         })
     else
         for _, playerId in ipairs(GetPlayersInRadius(coords, 10.0)) do
-            TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
+            if bucket == nil or GetPlayerRoutingBucket(playerId) == bucket then
+                TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
+            end
         end
     end
 end)
