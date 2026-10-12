@@ -191,7 +191,7 @@ RegisterNetEvent('police:server:policeAlert', function(text, _, alertSrc)
 end)
 
 -- ps-dispatch catch-all. Off by default: the per-resource hooks already cover
--- the robberies, and this would also fire for EMS and low-grade alerts.
+-- the robberies, and this would also fire for low-grade alerts.
 --
 -- ps-dispatch raises its alerts from the client doing the thing the alert is
 -- about (TriggerServerEvent), so this has to be a net event here too -- a bare
@@ -202,6 +202,21 @@ end)
 RegisterNetEvent('ps-dispatch:server:notify', function(data)
     if not CRIME.catchAllDispatch then return end
     if type(data) ~= 'table' then return end
+
+    -- An alert only for medics or firefighters is about a casualty, raised
+    -- from the casualty's own client -- fenix-police's aftermath sends
+    -- InjuriedPerson for a player its officers just put down. Starring the
+    -- sender of one of those restarts the pursuit on whoever is lying there.
+    if type(data.jobs) == 'table' and #data.jobs > 0 then
+        local medicalOnly = true
+        for _, job in ipairs(data.jobs) do
+            if job ~= 'ems' and job ~= 'ambulance' and job ~= 'fire' then
+                medicalOnly = false
+                break
+            end
+        end
+        if medicalOnly then return end
+    end
 
     local src = source
     if isServer(src) then
