@@ -646,6 +646,23 @@ Config.Ambient = {
         'a_m_y_stwhi_01', 'a_m_m_soucent_01',
     },
 
+    -- A carjacking gets called in. A few seconds after the getaway the victim
+    -- reports it, and either a patrol or convoy car already nearby lights up
+    -- and goes after the stolen car, or cruisers are sent from out of sight.
+    -- From there it plays out like a `pursuit` scene and ends in the same
+    -- arrest. It shares pursuitCooldownSeconds with them, never fires while
+    -- you're wanted or when the getaway is beyond nearbyRadius, and spawned
+    -- units count against maxNearbyCops. If nobody catches up within a minute
+    -- the suspect gets away and the units go back to patrolling.
+    -- enabled = false leaves every carjacker to drive off unanswered.
+    carjackResponse = {
+        enabled     = true,
+        chance      = 0.75,      -- odds the call gets a response at all
+        reportDelay = { 6, 12 }, -- seconds from the getaway to the call
+        reuseRadius = 300.0,     -- metres from the stolen car a patrol/convoy can be sent from
+        chasers     = { 1, 2 },  -- cruisers sent when no patrol is close enough (at most 3)
+    },
+
     -- Vehicles used for ambient units, by region key (see Config.ZoneEnum).
     --
     -- Two accepted shapes per region:
