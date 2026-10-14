@@ -106,7 +106,7 @@ BridgeConfig.Crime = {
 
     -- ps-dispatch alerts are already covered by the per-resource hooks below.
     -- Turning this on responds to every other dispatch call too, which will
-    -- include things you may not want AI police for (EMS calls, minor alerts).
+    -- include things you may not want AI police for (minor alerts).
     catchAllDispatch = false,
 
     -- em_toolkit missions that should bring police. Every mission, heist finale
