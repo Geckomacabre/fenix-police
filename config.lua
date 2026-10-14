@@ -1688,6 +1688,18 @@ Config.Driving = {
     sweepHistorySize       = 3,     -- how many recent waypoints per unit count as "recently visited"
     sweepSampleAttempts    = 6,     -- candidate points tried before falling back to a plain wander for one cycle
 
+    -- A driver in contact switches from driving to the player's position to
+    -- TaskVehicleChase inside chaseEnterDistance, and only drops back to the
+    -- drive-to beyond chaseLeaveDistance. One line for both had units near it
+    -- flipping between the two every cycle.
+    chaseEnterDistance = 45.0,
+    chaseLeaveDistance = 90.0,
+
+    -- Minimum time between re-paths for a unit driving to a moving target, on
+    -- top of the target having moved 15 m. Every re-path is a road-node
+    -- request, and that pool is small enough for a busy pursuit to fill.
+    repathIntervalMs = 4000,
+
     -- Ideal following distance for the close-range TaskVehicleChase state
     -- (SET_TASK_VEHICLE_CHASE_IDEAL_PURSUIT_DISTANCE), indexed by wanted
     -- level like ability/aggression above. Never called before this existed,
@@ -2389,7 +2401,7 @@ Config.UnitRegistry = {
 Config.maxPoliceSpawnDistance = 140.0 -- This is the max distance around the player the spawn point for a new unit must be.
 Config.minPoliceSpawnDistance = 80.0 -- This is the min distance from the player a spawn point for a new unit must be.
 
-Config.maxHeliSpawnDistance = 500.0 -- This is the max distance around the player the spawn point for a new heli must be.
+Config.maxHeliSpawnDistance = 500.0 -- This is the max distance around the player the spawn point for a new heli must be. Pulled in to keep the heli inside OneSync scope (~400 m including its height).
 Config.minHeliSpawnDistance = 100.0 -- This is the min distance from the player a spawn point for a new heli must be. 
 Config.maxHeliSpawnHeight = 200.0 -- This is the max height the spawn point for a new heli must be.
 Config.minHeliSpawnHeight = 150.0 -- This is the min height the spawn point for a new heli must be.
@@ -2473,6 +2485,9 @@ Config.endWantedCleanupTimer = 5
 -- This is the number of times a driver will try to unstick a vehicle before being teleported to the nearest road. 
 Config.maxCloseUnstuckAttempts = 4 
 Config.maxFarUnstuckAttempts = 4
+-- A unit standing still within this many metres of the player isn't treated
+-- as stuck: it's parked behind a car that has stopped, or closing in on foot.
+Config.unstuckMinPlayerDistance = 25.0
 --------------------
 
 
