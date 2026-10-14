@@ -61,6 +61,15 @@ CreateThread(buildTrackedModels)
 -- handle on some other car doesn't inherit it.
 local localRemoved = {}
 
+-- The server answers every removal request with the outcome and, on a
+-- refusal, a reason the player can act on ("you need to be at the car").
+-- Kept so removeTracker can show that instead of a generic failure.
+local removeResult = nil
+
+RegisterNetEvent('fenix-police:client:trackerRemoveResult', function(ok, reason)
+    removeResult = { ok = ok == true, reason = type(reason) == 'string' and reason or nil }
+end)
+
 --- Does this vehicle currently have a working tracker?
 --- @param vehicle number vehicle entity handle
 function FenixTracker.hasTracker(vehicle)
@@ -159,20 +168,25 @@ local function removeTracker(vehicle)
         return
     end
 
+    removeResult = nil
     TriggerServerEvent('fenix-police:removeTracker', NetworkGetNetworkIdFromEntity(vehicle))
 
-    -- The server has the final say and answers through the statebag. Wait
-    -- briefly for it, so a refusal at the end of a twelve-second job is at
-    -- least reported rather than leaving the player guessing.
+    -- The server has the final say: it replies with the outcome and also
+    -- flags the vehicle through the statebag. Wait briefly for either, so a
+    -- refusal at the end of a twelve-second job is reported with its reason
+    -- rather than leaving the player guessing.
     local waited = 0
-    while waited < 3000 and DoesEntityExist(vehicle) and Entity(vehicle).state.trackerRemoved ~= true do
+    while waited < 3000 and removeResult == nil and DoesEntityExist(vehicle)
+        and Entity(vehicle).state.trackerRemoved ~= true do
         Wait(100)
         waited = waited + 100
     end
-    if DoesEntityExist(vehicle) and Entity(vehicle).state.trackerRemoved == true then
+    local removed = (removeResult and removeResult.ok)
+        or (DoesEntityExist(vehicle) and Entity(vehicle).state.trackerRemoved == true)
+    if removed then
         lib.notify({ type = 'success', description = 'Tracker removed.' })
     else
-        lib.notify({ type = 'error', description = "Couldn't get the tracker out." })
+        lib.notify({ type = 'error', description = (removeResult and removeResult.reason) or "Couldn't get the tracker out." })
     end
 end
 

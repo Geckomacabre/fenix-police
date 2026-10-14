@@ -2185,7 +2185,7 @@ Config.Witness = {
     reportCooldownMs = 20000,
 
     -- Server-side: how far a reported location may be from the reporting
-    -- player (anti-spoofing, same idea as Config.Security.maxAlertDistance).
+    -- player (anti-spoofing: a client can only report gunfire near itself).
     maxReportDistance = 80.0,
 
     -- Server-side: how many reports per minute a single player may send

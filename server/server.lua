@@ -274,7 +274,13 @@ AddEventHandler('deleteSpawnedVehicle', function(vehNetID)
     -- remove, stop tracking it.
     local entity = FenixGuard.resolve(src, vehNetID, 'vehicle', 'deleteSpawnedVehicle')
     if not entity then
-        TriggerClientEvent('deleteSpawnedVehicleResponseStolen', src, vehNetID)
+        -- Only a vehicle that still exists can be "stolen". One that is already
+        -- gone needs no more tracking, and calling it stolen would put it
+        -- straight back on the client's retry list.
+        local existing = type(vehNetID) == 'number' and NetworkGetEntityFromNetworkId(vehNetID) or 0
+        if existing ~= 0 and DoesEntityExist(existing) then
+            TriggerClientEvent('deleteSpawnedVehicleResponseStolen', src, vehNetID)
+        end
         return
     end
 
