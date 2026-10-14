@@ -57,6 +57,7 @@ function FenixIncident.create(incidentType, coords, severity, opts)
         witnesses = opts.witnesses or {},
         evidence = opts.evidence or {},
         assignedUnits = {}, -- unitId -> role string ('primary'|'backup'|'perimeter'|'ems'|'fire'|...)
+        assignedBy = {},    -- unitId -> the player whose client is running that unit
         status = 'CREATED',
         createdAt = GetGameTimer(),
         lastUpdate = GetGameTimer(),
@@ -92,11 +93,13 @@ end
 
 -- unitId is caller-defined (e.g. a vehicle net ID) -- this registry doesn't
 -- care what a "unit" is, only that something was assigned a role on a call.
-function FenixIncident.assignUnit(id, unitId, role)
+-- `by` is the player whose client runs the unit, if there is one.
+function FenixIncident.assignUnit(id, unitId, role, by)
     local incident = incidents[id]
     if not incident then return false end
 
     incident.assignedUnits[unitId] = role or 'primary'
+    incident.assignedBy[unitId] = by
     incident.lastUpdate = GetGameTimer()
     dbg(('#%d assigned unit %s as %s'):format(id, tostring(unitId), incident.assignedUnits[unitId]))
 
@@ -108,6 +111,7 @@ function FenixIncident.releaseUnit(id, unitId)
     if not incident then return false end
 
     incident.assignedUnits[unitId] = nil
+    incident.assignedBy[unitId] = nil
     incident.lastUpdate = GetGameTimer()
 
     return true
@@ -124,9 +128,14 @@ function FenixIncident.countAssigned(id)
     return n
 end
 
--- Drops CREATED/DISPATCHING calls that never got units and RESOLVED/
--- CANCELLED calls past the config'd retention window, so the table doesn't
--- grow forever across a long uptime. Call this from a slow-tick thread.
+-- Drops calls nobody is working and RESOLVED/CANCELLED calls past the
+-- config'd retention window, so the table doesn't grow forever across a long
+-- uptime. Call this from a slow-tick thread.
+--
+-- "Nobody is working" includes ACTIVE: dispatch moves every call to ACTIVE
+-- the moment it has been offered out, answered or not, so a call whose host
+-- declined (or that no host was near) would otherwise sit there for the full
+-- incidentMaxAgeMs.
 function FenixIncident.cleanupStale()
     local now = GetGameTimer()
     local maxAgeMs = (cfg().incidentMaxAgeMs) or (30 * 60 * 1000)
@@ -137,7 +146,8 @@ function FenixIncident.cleanupStale()
         local sinceUpdate = now - incident.lastUpdate
 
         local isDone = incident.status == 'RESOLVED' or incident.status == 'CANCELLED'
-        local isAbandoned = (incident.status == 'CREATED' or incident.status == 'DISPATCHING')
+        local isAbandoned = (incident.status == 'CREATED' or incident.status == 'DISPATCHING'
+                or incident.status == 'ACTIVE')
             and FenixIncident.countAssigned(id) == 0
             and sinceUpdate > abandonedMs
 

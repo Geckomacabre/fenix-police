@@ -29,6 +29,14 @@ local function log(fmt, ...)
     print(('[um_fenix_bridge] ' .. fmt):format(...))
 end
 
+--- Did this handler run with no network sender? A resource firing an event
+--- server-side with TriggerEvent arrives with `source` set to "" -- not 0 --
+--- so a `source == 0` test never recognises it and every such call reads as
+--- coming from a player who doesn't exist.
+local function isServer(s)
+    return s == nil or s == '' or s == 0
+end
+
 -- ============================================================================
 -- Targeting
 -- ============================================================================
@@ -161,17 +169,16 @@ RegisterNetEvent('police:server:policeAlert', function(text, _, alertSrc)
     if not CRIME.catchAllPoliceAlert then return end
 
     -- alertSrc is only trustworthy when this fired via a local TriggerEvent
-    -- (source == 0, no real network caller) -- that's qbx_jewelery's own
-    -- server code reporting on someone else's behalf. A real network call
-    -- (source ~= 0) already IS the offender -- qbx_vehiclekeys fires this
-    -- about itself. Previously a client-supplied alertSrc could override a
-    -- real network source, letting a modified client frame an arbitrary
-    -- victim with wanted stars and summoned police.
+    -- (no network caller, see isServer) -- that's qbx_jewelery's own server
+    -- code reporting on someone else's behalf. A real network call already IS
+    -- the offender -- qbx_vehiclekeys fires this about itself -- and a
+    -- client-supplied alertSrc must never override it, or a modified client
+    -- could frame an arbitrary victim with wanted stars and summoned police.
     local src = source
-    if src == 0 and type(alertSrc) == 'number' and GetPlayerName(alertSrc) then
-        src = alertSrc
+    if isServer(src) then
+        src = tonumber(alertSrc)
     end
-    if not src or src == 0 or not GetPlayerName(src) then return end
+    if not src or not GetPlayerName(src) then return end
 
     -- The jewellery scripts are the loud ones worth their own tier; everything
     -- else that uses this event gets the generic alert level.
@@ -184,26 +191,77 @@ RegisterNetEvent('police:server:policeAlert', function(text, _, alertSrc)
 end)
 
 -- ps-dispatch catch-all. Off by default: the per-resource hooks already cover
--- the robberies, and this would also fire for EMS and low-grade alerts.
-AddEventHandler('ps-dispatch:server:notify', function(data)
+-- the robberies, and this would also fire for low-grade alerts.
+--
+-- ps-dispatch raises its alerts from the client doing the thing the alert is
+-- about (TriggerServerEvent), so this has to be a net event here too -- a bare
+-- AddEventHandler never sees a client-sent event. A networked alert stars its
+-- sender only, never whoever data.coords points at: those coordinates come
+-- from the same client. Only a server-side TriggerEvent, which has no
+-- sender, falls back to everyone near data.coords.
+RegisterNetEvent('ps-dispatch:server:notify', function(data)
     if not CRIME.catchAllDispatch then return end
     if type(data) ~= 'table' then return end
 
-    report('dispatch', data.coords)
+    -- An alert only for medics or firefighters is about a casualty, raised
+    -- from the casualty's own client -- fenix-police's aftermath sends
+    -- InjuriedPerson for a player its officers just put down. Starring the
+    -- sender of one of those restarts the pursuit on whoever is lying there.
+    if type(data.jobs) == 'table' and #data.jobs > 0 then
+        local medicalOnly = true
+        for _, job in ipairs(data.jobs) do
+            if job ~= 'ems' and job ~= 'ambulance' and job ~= 'fire' then
+                medicalOnly = false
+                break
+            end
+        end
+        if medicalOnly then return end
+    end
+
+    local src = source
+    if isServer(src) then
+        report('dispatch', data.coords)
+    else
+        report('dispatch', nil, src)
+    end
 end)
 
 -- em_toolkit: every mission, heist finale and game-mode run funnels through
 -- this one event, so listing a mission id in BridgeConfig.Crime.emMissions is
 -- enough to make it a police matter.
-AddEventHandler('em_toolkit:missionStarted', function(id)
-    local src = source
-    if not src or src == 0 then return end
-
+--
+-- Registered as a net event so both ways em_toolkit might send it work. From
+-- a client, `source` is the player starting the mission (and all a client
+-- can do with it is star itself). From the server (TriggerEvent) there is no
+-- sender, so the player has to come from the event itself: a server id, or a
+-- list of them, as the argument after the mission id. em_toolkit's payload
+-- beyond the id isn't documented anywhere this bridge can see; with neither,
+-- the mission has nobody to pin it on and is skipped (logged with Debug.log
+-- on).
+RegisterNetEvent('em_toolkit:missionStarted', function(id, players)
     -- Opt-in per mission: `true` uses the em_mission tier, a number overrides
     -- it. Unlisted missions bring no police, which is what you want for the
     -- deliveries and errands sharing this event with the robberies.
     local entry = (CRIME.emMissions or {})[id]
     if not entry then return end
+    local stars = type(entry) == 'number' and entry or nil
 
-    report('em_mission', nil, src, type(entry) == 'number' and entry or nil)
+    local src = source
+    if not isServer(src) then
+        report('em_mission', nil, src, stars)
+        return
+    end
+
+    if type(players) ~= 'table' then players = { players } end
+    local reported = false
+    for _, ply in ipairs(players) do
+        local plySrc = tonumber(ply)
+        if plySrc and GetPlayerName(plySrc) then
+            report('em_mission', nil, plySrc, stars)
+            reported = true
+        end
+    end
+    if not reported then
+        log('em_toolkit mission "%s" started server-side with no player to pin it on', tostring(id))
+    end
 end)
