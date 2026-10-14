@@ -20,44 +20,50 @@ end)
 
 
 -- CLEANUP LOGIC --
-local activeGroundUnits = {}
+-- src -> { wanted = bool, updatedAt = os.time() }, from each client's own
+-- fenix-police:updateWantedStatus reports.
 local playerWantedStatus = {}
-local lastGlobalCleanup = 0
 
--- [Upstate Mafia] AFTERMATH -- src -> true while that player's client is
--- running a field-revive/scene-hold sequence (client/client.lua's
+-- [Upstate Mafia] AFTERMATH -- src -> os.time() until which that player's
+-- client is running a field-revive/scene-hold sequence (client/client.lua's
 -- beginAftermath/endAftermath). The wanted level clears the instant the
 -- player is incapacitated, so without this the server had no way to tell
 -- "no longer wanted because they're being revived" apart from "no longer
--- wanted, clean everything up" -- applyGroundPursuitTask kept re-tasking
--- units to shoot at and ram the player's body every second, and
--- cleanupIfNoPlayersWanted() kept wiping activeGroundUnits and broadcasting
--- a global despawn every couple of seconds, regardless of what the client
--- was doing with those same officers.
+-- wanted, clean everything up" -- the cleanup broadcast below would despawn
+-- the very officers kneeling over the body. An expiry rather than a flag: a
+-- client that never sends the closing aftermathState(false) -- a crash, or
+-- one that simply lies -- would otherwise hold its cleanup off for the rest
+-- of the session.
 local aftermathHolding = {}
 
-RegisterNetEvent('fenix-police:aftermathState')
-AddEventHandler('fenix-police:aftermathState', function(active)
-    local src = source
-    if active then
-        aftermathHolding[src] = true
-    else
-        aftermathHolding[src] = nil
-    end
-end)
-
-local function removeActiveGroundUnit(vehNetID)
-    activeGroundUnits[vehNetID] = nil
+-- The client caps one sequence at Config.Aftermath.holdAfterFailedMs from
+-- the moment it starts; the extra minute covers the medic's walk and the
+-- revive animation on top of that.
+local function aftermathHoldSeconds()
+    return math.floor(((Config.Aftermath or {}).holdAfterFailedMs or 240000) / 1000) + 60
 end
 
-local function getDistanceBetweenEntities(a, b)
-    local aCoords = GetEntityCoords(a)
-    local bCoords = GetEntityCoords(b)
-    local dx = aCoords.x - bCoords.x
-    local dy = aCoords.y - bCoords.y
-    local dz = aCoords.z - bCoords.z
-    return math.sqrt(dx * dx + dy * dy + dz * dz)
+local function holdingAftermath(src)
+    local expires = aftermathHolding[src]
+    if expires and expires > os.time() then return true end
+    aftermathHolding[src] = nil
+    return false
 end
+
+--- Wanted as far as this resource can tell: what the client last reported,
+--- or the wanted level its player is syncing right now, whichever says yes.
+--- The synced level is usually the fresher of the two.
+local function isPlayerWanted(playerId)
+    local id = tonumber(playerId)
+    if not id then return false end
+    local status = playerWantedStatus[id]
+    if status and status.wanted then return true end
+    return (GetPlayerWantedLevel(id) or 0) > 0
+end
+
+-- server/dispatch.lua reads this to keep a pursuit's own gunfire and crashes
+-- from being reported as fresh civilian incidents.
+if FenixDispatch then FenixDispatch.isPlayerWanted = isPlayerWanted end
 
 -- SET_PED_COMBAT_ATTRIBUTES, SET_PED_FLEE_ATTRIBUTES, SET_PED_ACCURACY,
 -- SET_PED_FIRING_PATTERN, SET_PED_RELATIONSHIP_GROUP_HASH, SET_DRIVER_ABILITY/
@@ -70,180 +76,109 @@ end
 -- every nearby client (not just the owner) re-request pathfinding for the
 -- same ped every tick, which blew through the engine's 20-slot
 -- CNetworkRoadNodeWorldStateData pool and froze the game.
-local function dispatchCombatProfile(pedNetID, profile)
+--
+-- A ped that no client owns yet -- a crew member the server created a moment
+-- ago usually isn't handed out instantly -- goes to `fallbackTarget`, the
+-- player it was spawned for and the client most likely to own it by the time
+-- this arrives. A ped that doesn't exist goes nowhere: sending it to -1
+-- instead is exactly the broadcast described above.
+local function dispatchCombatProfile(pedNetID, profile, fallbackTarget)
     local entity = NetworkGetEntityFromNetworkId(pedNetID)
-    local owner = DoesEntityExist(entity) and NetworkGetEntityOwner(entity) or -1
+    if not entity or entity == 0 or not DoesEntityExist(entity) then return end
+
+    local owner = NetworkGetEntityOwner(entity)
+    if not owner or owner <= 0 then owner = fallbackTarget end
+    if not owner then return end
+
     TriggerClientEvent('fenix-police:client:applyCombatProfile', owner, pedNetID, profile)
 end
 
-local function applyGroundPursuitTask(unit)
-    -- Player's client owns these officers now (walking one over for a field
-    -- revive, parking others to hold the scene) -- re-issuing combat/chase
-    -- tasks every second on top of that just fights it, which is how a unit
-    -- ends up shooting at and running over a body it should be reviving.
-    if aftermathHolding[unit.target] then return end
-
-    local vehicle = NetworkGetEntityFromNetworkId(unit.vehNetID)
-    local targetPed = GetPlayerPed(unit.target)
-
-    if not DoesEntityExist(vehicle) or not DoesEntityExist(targetPed) then
-        removeActiveGroundUnit(unit.vehNetID)
-        return
-    end
-
-    SetVehicleDoorsLocked(vehicle, 1)
-    Entity(vehicle).state:set('doorslockstate', 1, true)
-    SetSirenKeepOn(vehicle, true)
-
-    local targetCoords = GetEntityCoords(targetPed)
-
-    for _, pedNetID in ipairs(unit.officers) do
-        local officer = NetworkGetEntityFromNetworkId(pedNetID)
-        if DoesEntityExist(officer) then
-            dispatchCombatProfile(pedNetID, {
-                relationshipGroup = 'HATES_PLAYER',
-                fleeAttributes = {0, false},
-            })
-
-            if GetVehiclePedIsIn(officer, false) ~= vehicle then
-                -- No foot patrol behavior: if the car still exists, force officers back in.
-                if pedNetID == unit.driverNetID then
-                    SetPedIntoVehicle(officer, vehicle, -1)
-                else
-                    local seats = GetVehicleModelNumberOfSeats and GetVehicleModelNumberOfSeats(GetEntityModel(vehicle)) or 4
-                    for seat = 0, seats - 2 do
-                        if GetPedInVehicleSeat(vehicle, seat) == 0 then
-                            SetPedIntoVehicle(officer, vehicle, seat)
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    local driver = NetworkGetEntityFromNetworkId(unit.driverNetID)
-    if not DoesEntityExist(driver) or GetPedInVehicleSeat(vehicle, -1) ~= driver then
-        return
-    end
-
-    dispatchCombatProfile(unit.driverNetID, {
-        combatAttributes = {{3, false}}, -- do not voluntarily leave vehicle
-        driverAbility = 1.0,
-        driverAggressiveness = 1.0,
-    })
-
-    local distance = getDistanceBetweenEntities(driver, targetPed)
-    if distance > 45.0 then
-        -- Direct response phase. Every unit used to drive straight at the
-        -- player's live position, which reads as a conga line converging from
-        -- one direction rather than a real response -- especially with
-        -- several units all spawned behind the player at once (see
-        -- Config.Roads' rear-arc spawn bias).
-        --
-        -- Half the units (by a stable per-vehicle split, so a unit doesn't
-        -- flip roles every second) instead drive to where the player is
-        -- HEADING: current position plus their velocity projected forward
-        -- Config.Driving.interceptLeadDistance metres. No road graph lookup
-        -- needed -- GET_ENTITY_VELOCITY/COORDS are synced entity state, valid
-        -- server side, unlike the AI/task natives combat_bridge exists for.
-        -- Falls back to tailing (the old behaviour) below the configured
-        -- minimum speed: leading a target that isn't meaningfully moving just
-        -- means driving to nowhere in particular.
-        local dc = Config.Driving or {}
-        local driveTarget = targetCoords
-        if (tonumber(unit.vehNetID) or 0) % 2 == 0 then
-            local vel = GetEntityVelocity(targetPed)
-            local speed = #(vector2(vel.x, vel.y))
-            if speed >= (dc.interceptMinSpeed or 4.0) then
-                local lead = dc.interceptLeadDistance or 70.0
-                driveTarget = targetCoords + (vector3(vel.x, vel.y, 0.0) / speed) * lead
-            end
-        end
-
-        dispatchCombatProfile(unit.driverNetID, {
-            vehicleDriveTo = {
-                x = driveTarget.x, y = driveTarget.y, z = targetCoords.z,
-                speed = 42.0,
-                vehicleModelHash = GetEntityModel(vehicle),
-                drivingStyle = 6,
-                stopRange = 2.0,
-            },
-        })
-    else
-        -- Close phase: native GTA pursuit behavior, PIT/boxing/etc.
-        dispatchCombatProfile(unit.driverNetID, { vehicleChase = unit.target })
-    end
-
-    for _, pedNetID in ipairs(unit.officers) do
-        if pedNetID ~= unit.driverNetID then
-            local officer = NetworkGetEntityFromNetworkId(pedNetID)
-            if DoesEntityExist(officer) then
-                dispatchCombatProfile(pedNetID, { combatTarget = unit.target })
-            end
-        end
-    end
-end
-
-CreateThread(function()
-    while true do
-        Wait(1000)
-        for _, unit in pairs(activeGroundUnits) do
-            applyGroundPursuitTask(unit)
-        end
-    end
-end)
-
+--- someoneWanted, allPlayersKnown. Not all known while any connected player
+--- has yet to report -- a client still loading can't be assumed idle.
 local function anyPlayerWanted()
-    local players = GetPlayers()
-    if #players == 0 then return false, true end
-
-    for _, playerId in ipairs(players) do
-        local src = tonumber(playerId)
-        local status = playerWantedStatus[src]
-        if not status then
-            return false, false
-        end
-
-        if status.wanted then
-            return true, true
+    local someoneWanted, allKnown = false, true
+    for _, playerId in ipairs(GetPlayers()) do
+        if isPlayerWanted(playerId) then
+            someoneWanted = true
+        elseif not playerWantedStatus[tonumber(playerId)] then
+            allKnown = false
         end
     end
-
-    return false, true
+    return someoneWanted, allKnown
 end
 
-local function anyPlayerHoldingAftermath()
-    for _, holding in pairs(aftermathHolding) do
-        if holding then return true end
-    end
-    return false
+-- The "everyone stand down" broadcast fires once, when the server goes from
+-- someone wanted to nobody wanted. Re-firing it on every report while nobody
+-- is wanted (each client reports once a second) runs handleEndWantedDelete on
+-- every client every couple of seconds -- spawn gate shut, counters reset,
+-- units deleted -- and a player who has only just gone wanted, before their
+-- first report lands, loses their first units to it.
+local wantedSinceLastCleanup = false
+
+-- src -> true: left out of the last broadcast because their client was
+-- holding an aftermath scene. They get theirs once the hold ends.
+local cleanupOwed = {}
+
+local function sendCleanup(id)
+    -- The synced wanted level can be newer than the last report: someone
+    -- who went wanted this second is not told to stand their units down.
+    if (GetPlayerWantedLevel(id) or 0) > 0 then return end
+    TriggerClientEvent('fenix-police:cleanupAllPolice', id)
 end
 
 local function cleanupIfNoPlayersWanted()
-    if anyPlayerHoldingAftermath() then return end
-
     local someoneWanted, allPlayersKnown = anyPlayerWanted()
-    if not someoneWanted and allPlayersKnown then
-        local now = os.time()
-        if now - lastGlobalCleanup >= 2 then
-            lastGlobalCleanup = now
-            activeGroundUnits = {}
-            TriggerClientEvent('fenix-police:cleanupAllPolice', -1)
+    if someoneWanted then
+        wantedSinceLastCleanup = true
+        return
+    end
+    if not allPlayersKnown then return end
+
+    if wantedSinceLastCleanup then
+        wantedSinceLastCleanup = false
+        for _, playerId in ipairs(GetPlayers()) do
+            local id = tonumber(playerId)
+            if holdingAftermath(id) then
+                cleanupOwed[id] = true
+            else
+                sendCleanup(id)
+            end
+        end
+    end
+
+    for id in pairs(cleanupOwed) do
+        if not holdingAftermath(id) then
+            cleanupOwed[id] = nil
+            sendCleanup(id)
         end
     end
 end
+
+RegisterNetEvent('fenix-police:aftermathState')
+AddEventHandler('fenix-police:aftermathState', function(active)
+    local src = source
+    -- Metered on its own, not with the wanted-status reports that arrive
+    -- every cycle: a hold refused for their sake lets the cleanup broadcast
+    -- delete the officers mid-revive. An honest client sends a few a minute.
+    if not FenixGuard.allow(src, 'aftermath', 30) then return end
+
+    if active then
+        aftermathHolding[src] = os.time() + aftermathHoldSeconds()
+    else
+        aftermathHolding[src] = nil
+        cleanupIfNoPlayersWanted()
+    end
+end)
 
 AddEventHandler('playerDropped', function()
     local src = source
     playerWantedStatus[src] = nil
     aftermathHolding[src] = nil
-    for vehNetID, unit in pairs(activeGroundUnits) do
-        if unit.target == src then
-            removeActiveGroundUnit(vehNetID)
-        end
-    end
-    cleanupIfNoPlayersWanted()
+    cleanupOwed[src] = nil
+    -- Deferred: the leaving player can still be listed by GetPlayers while
+    -- this event runs, with no report on file any more, and an unreported
+    -- player holds the broadcast back for everyone.
+    SetTimeout(1000, cleanupIfNoPlayersWanted)
 end)
 
 -- [Upstate Mafia] Client diagnostics relay: client/ambient.lua mirrors its
@@ -273,35 +208,38 @@ RegisterCommand('fenixdiag', function(src)
     for _, line in ipairs(clientDiagLines) do print(line) end
 end, true)
 
+-- Clients may report every cycle, or only on a change plus a periodic
+-- heartbeat: this keeps the latest, and the cleanup above keys off the
+-- someone -> nobody transition, not off how often reports arrive.
+--
+-- Metered at twice the rate a client reporting every Config.scriptFrequency
+-- sends. Any tighter and a server running a faster cycle has reports
+-- refused, and a refused "no longer wanted" leaves that player counted as
+-- wanted, holding everyone's cleanup back until a later one gets through.
+local STATUS_PER_MINUTE = math.max(120,
+    math.ceil(120000 / math.max(tonumber(Config.scriptFrequency) or 1000, 100)))
+
 RegisterNetEvent('fenix-police:updateWantedStatus')
 AddEventHandler('fenix-police:updateWantedStatus', function(isWanted)
     local src = source
+    if not FenixGuard.allow(src, 'status', STATUS_PER_MINUTE) then return end
+
     playerWantedStatus[src] = {
         wanted = isWanted == true,
         updatedAt = os.time(),
     }
 
     cleanupIfNoPlayersWanted()
+
+    -- The report and the synced wanted level travel separately, so "no
+    -- longer wanted" can land while the server still sees the old level,
+    -- which counts as wanted. Look again once the sync has caught up rather
+    -- than on the next report -- a heartbeat away for a client that only
+    -- reports changes.
+    if isWanted ~= true and (GetPlayerWantedLevel(src) or 0) > 0 then
+        SetTimeout(2000, cleanupIfNoPlayersWanted)
+    end
 end)
-
--- Server event to delete a vehicle or officer entity from the network ID.
-RegisterServerEvent('deleteSpawnedEntity')
-AddEventHandler('deleteSpawnedEntity', function(entityNetID)
-    local src = source
-    if not FenixGuard.allow(src, 'delete') then return end
-
-    -- Was: resolve the net ID and delete whatever came back. Network IDs are
-    -- small integers, so that was "delete any entity on the server, by counting".
-    -- See server/guard.lua.
-    local entity = FenixGuard.resolve(src, entityNetID, 'any', 'deleteSpawnedEntity')
-    if not entity then return end
-
-    FenixGuard.release(entityNetID)
-    DeleteEntity(entity)
-end)
-
-
-
 
 -- Server event to delete a ped by network ID
 RegisterServerEvent('deleteSpawnedPed')
@@ -314,18 +252,6 @@ AddEventHandler('deleteSpawnedPed', function(pedNetID)
         FenixGuard.release(pedNetID)
         DeleteEntity(entity)
     end
-    for vehNetID, unit in pairs(activeGroundUnits) do
-        if unit.driverNetID == pedNetID then
-            removeActiveGroundUnit(vehNetID)
-        else
-            for _, officerNetID in ipairs(unit.officers) do
-                if officerNetID == pedNetID then
-                    removeActiveGroundUnit(vehNetID)
-                    break
-                end
-            end
-        end
-    end
 end)
 
 
@@ -333,13 +259,11 @@ end)
 
 -- Server event to delete a vehicle by network ID, this will check if anyone is in the vehicle first.
 -- If a ped is in the vehicle we can assume it is a player, because this will not have been called until all officers assigned
--- to the vehicle were already deleted. 
+-- to the vehicle were already deleted.
 RegisterServerEvent('deleteSpawnedVehicle')
 AddEventHandler('deleteSpawnedVehicle', function(vehNetID)
     local src = source
     if not FenixGuard.allow(src, 'delete') then return end
-
-    removeActiveGroundUnit(vehNetID)
 
     -- The occupied-vehicle check that used to live here is now layer 1 of
     -- FenixGuard.resolve, and applies to every handler rather than just this
@@ -498,8 +422,9 @@ local function levelValue(tbl, wantedLevel, default)
 end
 
 -- Returns true if this officer should be given a combat task on spawn.
--- `role` is 'air' for heli/aircraft crews (own firing pattern).
-local function applyOfficerCombatProfile(officer, wantedLevel, role)
+-- `role` is 'air' for heli/aircraft crews (own firing pattern). `requester` is
+-- the player the unit was spawned for (see dispatchCombatProfile).
+local function applyOfficerCombatProfile(officer, wantedLevel, role, requester)
     if not DoesEntityExist(officer) then return false end
 
     local pedNetID = NetworkGetNetworkIdFromEntity(officer)
@@ -510,7 +435,7 @@ local function applyOfficerCombatProfile(officer, wantedLevel, role)
             firingPattern = 'FIRING_PATTERN_FULL_AUTO',
             combatAttributes = {{2, true}},
             relationshipGroup = 'HATES_PLAYER',
-        })
+        }, requester)
         return true
     end
 
@@ -549,7 +474,7 @@ local function applyOfficerCombatProfile(officer, wantedLevel, role)
         profile.relationshipGroup = cfg.relationshipHostile or 'HATES_PLAYER'
     end
 
-    dispatchCombatProfile(pedNetID, profile)
+    dispatchCombatProfile(pedNetID, profile, requester)
 
     return hostile
 end
@@ -585,87 +510,59 @@ end
 
 
 
--- Function to add a weapon with attachments to a ped
-local function giveWeaponWithAttachments(ped, weaponHash, attachments)
-    if not DoesEntityExist(ped) then
-        return
-    end
-    -- Give the weapon to the ped
-    GiveWeaponToPed(ped, GetHashKey(weaponHash), 999, false, true)
-
-    -- Add each attachment to the weapon
-    for _, attachment in ipairs(attachments) do
-        GiveWeaponComponentToPed(ped, GetHashKey(weaponHash), GetHashKey(attachment))
-    end
-end
-
-
-
-
 -- SPAWNING FUNCTIONS --
 
 
 
 
--- Function to generate a random float between min and max
-local function randomFloat(min, max)
-    return min + math.random() * (max - min)
-end
-
-
-
 -- GROUND UNITS --
 RegisterNetEvent('spawnPoliceUnitNet')
-AddEventHandler('spawnPoliceUnitNet', function(wantedLevel, playerCoords, regionCode, spawnPoint, spawnHeading)
+AddEventHandler('spawnPoliceUnitNet', function(wantedLevel, _, regionCode, spawnPoint, spawnHeading)
     local src = source
-    if not FenixGuard.allow(src, 'spawn') then return end
+    -- Every way out of here answers the client. Its pending-spawn counter only
+    -- comes back down on a reply, and at five in flight it stops asking for
+    -- ground units for the rest of the pursuit.
+    local function fail() TriggerClientEvent('spawnPoliceUnitNetResponse', src, nil, nil) end
 
-    local seatIndex = -1
+    if not FenixGuard.allow(src, 'spawn') then return fail() end
 
-    -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
-    local vehicleCrewed = false
-    local hasDriverCount = 0
-    local vehNetID = nil
-    local officers = {}
-    local driverNetID = nil
+    local level = math.floor(tonumber(wantedLevel) or 0)
+    if level < 1 or type(spawnPoint) ~= 'vector3' then return fail() end
 
-    while (not vehicleCrewed) and hasDriverCount < Config.hasDriverWaitCount do
-
-
-        vehNetID = nil
-
-        -- Pick the vehicle to choose to spawn for this region, vehicle determines which peds spawn with it, and the peds determine combat behavior and weapons. 
-        local selectedEntry = getRandomVehicle(regionCode, wantedLevel)
-        if not selectedEntry then
-            if Config.isDebug then print('No suitable vehicle found for the given wanted level.') end
-            TriggerClientEvent('spawnPoliceUnitNetResponse', src, nil, nil)
-            return
-        end
-
-        -- Ground vehicles/peds are spawned client-side. In this server/runtime,
-        -- server-side ped creation can leave valid police vehicles with no driver.
-        -- The client can create the vehicle and its crew atomically, verify the
-        -- driver seat, and start pursuit without an ownership race.
-        -- Ground units are created client-side, so the server cannot record
-        -- them at creation the way it does for helicopters and planes. Instead it
-        -- issues a single-use ticket with the authorisation; the client quotes it
-        -- back with the entities it made, and only then are those entities
-        -- recorded as belonging to this player. A client can therefore only ever
-        -- register entities the server just told it to create.
-        local ticket = FenixGuard.issueTicket(src)
-        TriggerClientEvent('fenix-police:spawnPoliceUnitClient', src, selectedEntry.vehicle, selectedEntry.peds, spawnPoint, spawnHeading, ticket)
-        return
-        -- Dead code below this point (old server-side vehicle/ped spawn loop,
-        -- superseded by the client-side delegation above) was left in place
-        -- after a prior patch added the early `return`. Lua requires `return`
-        -- to be the last statement in its block, so this was a hard syntax
-        -- error that prevented this entire file — all of fenix-police's
-        -- server-side logic, not just ground unit spawning — from loading at
-        -- all. Removed the unreachable block; this while loop is now a
-        -- single-pass wrapper around the client delegation, which matches
-        -- what was already actually happening (return exits before any
-        -- second iteration could occur).
+    -- A region with no spawn list of its own -- a custom Config.Jurisdiction
+    -- zone, say -- would throw on ipairs(nil) in getRandomVehicle and never
+    -- answer.
+    local regions = Config.vehiclesByRegion or {}
+    if type(regionCode) ~= 'string' or not regions[regionCode] then
+        regionCode = regions.losSantos and 'losSantos' or next(regions)
     end
+    if not regionCode then return fail() end
+
+    -- Pick the vehicle to choose to spawn for this region, vehicle determines which peds spawn with it, and the peds determine combat behavior and weapons.
+    -- pcall: an entry missing its spawnChance or peds would otherwise throw
+    -- here and the request would never be answered.
+    local ok, selectedEntry = pcall(getRandomVehicle, regionCode, level)
+    if not ok then
+        print(('[fenix-police] Config.vehiclesByRegion.%s: %s'):format(regionCode, tostring(selectedEntry)))
+        return fail()
+    end
+    if not selectedEntry then
+        if Config.isDebug then print('No suitable vehicle found for the given wanted level.') end
+        return fail()
+    end
+
+    -- Ground vehicles/peds are spawned client-side. In this server/runtime,
+    -- server-side ped creation can leave valid police vehicles with no driver.
+    -- The client can create the vehicle and its crew atomically, verify the
+    -- driver seat, and start pursuit without an ownership race.
+    -- Ground units are created client-side, so the server cannot record
+    -- them at creation the way it does for helicopters and planes. Instead it
+    -- issues a single-use ticket with the authorisation; the client quotes it
+    -- back with the entities it made, and only then are those entities
+    -- recorded as belonging to this player. A client can therefore only ever
+    -- register entities the server just told it to create.
+    local ticket = FenixGuard.issueTicket(src)
+    TriggerClientEvent('fenix-police:spawnPoliceUnitClient', src, selectedEntry.vehicle, selectedEntry.peds, spawnPoint, spawnHeading, ticket)
 end)
 
 
@@ -692,395 +589,528 @@ end)
 
 
 
--- HELI UNITS --
-RegisterNetEvent('spawnPoliceHeliNet')
-AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, playerCoords, spawnPoint, spawnTable)
-    local src = source
-    if not FenixGuard.allow(src, 'spawn') then return end
+-- HELI / AIR SPAWN REQUESTS --
 
-    local seatIndex = -1
-    
-    -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
-    local vehicleCrewed = false
-    local hasDriverCount = 0
-    local vehNetID = nil
-    local officers = {}
-    
+-- Which of Config.polHelis / milHelis / milPlanes a request draws from: the
+-- same choice maintainPoliceUnits() in client/client.lua makes from what the
+-- player is sitting in (a plane: military planes and no helicopters; a
+-- helicopter: military helicopters and military planes; anything else or on
+-- foot: police helicopters and no planes), made from the server's own view
+-- of that player. Taking the table from the request instead lets any client
+-- spawn any model with any crew, and a spawnChance or numPeds of a billion
+-- hangs the server building the candidate list. nil = none of this kind is
+-- sent.
+local function airSpawnTableFor(ped, kind)
+    local veh = GetVehiclePedIsIn(ped, false)
+    local vehType = (veh and veh ~= 0) and GetVehicleType(veh) or nil
+    if kind == 'heli' then
+        if vehType == 'plane' then return nil end
+        if vehType == 'heli' then return Config.milHelis end
+        return Config.polHelis
+    end
+    if vehType == 'plane' or vehType == 'heli' then return Config.milPlanes end
+    return nil
+end
 
-    while (not vehicleCrewed) and hasDriverCount < Config.hasDriverWaitCount do
+-- client.lua's getRandomPointInRange offsets X and Y independently, so a
+-- spawn point can sit anywhere in a square around the player -- a corner is
+-- maxDistance * 1.41 out -- and minHeight..maxHeight above them. Checked per
+-- axis to match, with slack for the player moving while the request was in
+-- flight.
+local AIR_SPAWN_SLACK = 100.0
 
-        vehNetID = nil
+local function airSpawnPointPlausible(spawnPoint, here, maxDistance, maxHeight)
+    return math.abs(spawnPoint.x - here.x) <= maxDistance + AIR_SPAWN_SLACK
+        and math.abs(spawnPoint.y - here.y) <= maxDistance + AIR_SPAWN_SLACK
+        and math.abs(spawnPoint.z - here.z) <= maxHeight + AIR_SPAWN_SLACK
+end
 
-        -- Pick the vehicle to choose to spawn for this region, vehicle determines which peds spawn with it, and the peds determine combat behavior and weapons. 
-        local selectedEntry = getRandomAirUnit(spawnTable, wantedLevel)
-        if not selectedEntry then
-            if Config.isDebug then print('No suitable heli found for the given wanted level.') end
-            return
-        end
-        local vehicleHash = GetHashKey(selectedEntry.unit.model)
+--- The checks that need nothing from the rate limiter. Returns wantedLevel,
+--- spawnTable, the first unit pick and the requester's coords, or nil when
+--- there is nothing to send. Kept ahead of FenixGuard.allow on purpose: at a
+--- wanted level with no air unit configured for it (two stars, by default)
+--- the client asks again every cycle, and those answers must not use up the
+--- spawn budget ground units share.
+local function prepareAirRequest(src, kind, wantedLevel, spawnPoint)
+    local level = math.floor(tonumber(wantedLevel) or 0)
+    if level < 1 or type(spawnPoint) ~= 'vector3' then return nil end
+    if level > 5 then level = 5 end
 
-        local vehicle = CreateVehicleServerSetter(vehicleHash, 'heli', spawnPoint.x, spawnPoint.y, spawnPoint.z, 0.0)
-        local waitCount = 0 
-        while not DoesEntityExist(vehicle) and waitCount < Config.spawnWaitCount do
-            Wait(10)
-            waitCount = waitCount + 1
-        end
-        if not DoesEntityExist(vehicle) then
-            if Config.isDebug then print('Spawning '..selectedEntry.unit.model.. ' failed.') end
-            return
-        end
-        vehNetID = NetworkGetNetworkIdFromEntity(vehicle)
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return nil end
 
-        -- [Upstate Mafia] Was SetEntityDistanceCullingRadius(vehicle, 10000.0).
-        -- citizenfx/fivem#1828: a large culling radius on a server-created
-        -- entity, combined with a client-issued task (exactly this heli's
-        -- TaskHeliChase), is the reported trigger for OneSync silently
-        -- teleporting the entity back to its spawn point or dropping its task
-        -- once another player comes near it. A CitizenFX contributor's answer
-        -- in that thread is blunt: "you should not ever use that option."
-        -- Default culling is already enough to keep a heli loaded for the one
-        -- player it's actively chasing.
+    local spawnTable = airSpawnTableFor(ped, kind)
+    if not spawnTable then return nil end
 
-        -- [Upstate Mafia patch] Unlock doors + set statebag so qbx_vehiclekeys skips auto-lock
-        SetVehicleDoorsLocked(vehicle, 1)  -- 1 = unlocked
-        Entity(vehicle).state:set('doorslockstate', 1, true)  -- synced statebag
+    -- pcall: a malformed config entry still has to end in a reply.
+    local ok, pick = pcall(getRandomAirUnit, spawnTable, level)
+    if not ok or not pick then return nil end
 
-        officers = {}
+    return level, spawnTable, pick, GetEntityCoords(ped)
+end
 
-        -- [Upstate Mafia patch] Wait for heli entity to fully initialise before seating peds
-        Wait(500)
+local function deleteIfExists(entity)
+    if entity and entity ~= 0 and DoesEntityExist(entity) then DeleteEntity(entity) end
+end
 
-        -- Spawn pilots
-        for _, pedModel in ipairs(selectedEntry.pilots) do
-            local pedHash = GetHashKey(pedModel)
+-- GTA heading (degrees, 0 = north, counter-clockwise) facing `to` from `from`.
+local function headingTowards(from, to)
+    return math.deg(math.atan(-(to.x - from.x), to.y - from.y)) % 360.0
+end
 
-            -- Spawn ped at the heli (not 20 units away)
-            local officer = CreatePed(4, pedHash, spawnPoint.x, spawnPoint.y, spawnPoint.z + 1.0, spawnHeading, true, true)
-            local waitCount = 0
-            while not DoesEntityExist(officer) and waitCount < Config.spawnWaitCount do
-                if Config.isDebug then print('Waiting to spawn heli pilot...') end
-                officer = CreatePed(4, pedHash, spawnPoint.x, spawnPoint.y, spawnPoint.z + 1.0, spawnHeading, true, true)
-                Wait(10)
-                waitCount = waitCount + 1
-            end
-            if not DoesEntityExist(officer) then
-                if Config.isDebug then print('Spawning pilot '..pedModel.. ' failed.') end
-                return
-            end
-            -- SetEntityDistanceCullingRadius removed -- see the note above the
-            -- heli's own creation, same citizenfx/fivem#1828 concern.
-            Wait(200)
+-- Server-side CreatePed/CreateVehicleServerSetter can hand back a handle a
+-- moment before the entity exists. Calling CreatePed again on every pass of
+-- a wait loop turns one slow ped into up to ten, most of them dropping out of
+-- the sky never seated and never cleaned up.
+local function awaitEntity(entity)
+    if not entity or entity == 0 then return false end
+    local waited = 0
+    while not DoesEntityExist(entity) and waited < 3000 do
+        Wait(50)
+        waited = waited + 50
+    end
+    return DoesEntityExist(entity)
+end
 
-            -- Give weapon BEFORE seating so it persists through vehicle-entry state changes.
-            GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, true)
-            SetCurrentPedWeapon(officer, GetHashKey('weapon_combatpistol'), true)
+--- Runs one heli/plane spawn to completion, and always answers the client.
+--- `build(spawned)` does the work and returns the vehicle's net ID and its
+--- crew's, or nil. Everything it creates goes through `spawned`, which waits
+--- for the entity to exist and moves it into the requester's routing bucket
+--- (otherwise a player in an instance is chased by a helicopter only the
+--- default world can see). On nil, a Lua error, or the requester leaving
+--- mid-spawn, everything created is deleted and the reply is nil, nil.
+---
+--- Without a reply the client's pending-spawn counter never comes back down,
+--- and at five it stops asking: a handful of failures would ground air
+--- support for the rest of the pursuit.
+local function runAirSpawn(src, responseEvent, build)
+    local created = {}
+    local bucket = GetPlayerRoutingBucket(src)
 
-            -- Try multiple seating methods (same approach as ground units)
-            local seated = false
-            for attempt = 1, 20 do
-                SetPedIntoVehicle(officer, vehicle, seatIndex)
-                Wait(100)
-                local pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
-                if pedInSeat and pedInSeat ~= 0 then
-                    seated = true
-                    break
-                end
-                TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
-                Wait(150)
-                pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
-                if pedInSeat and pedInSeat ~= 0 then
-                    seated = true
-                    break
-                end
-                if Config.isDebug and attempt % 5 == 0 then
-                    print(('Heli pilot seat attempt %d for %s vehNetID=%s seat=%d'):format(attempt, selectedEntry.unit.model, tostring(vehNetID), seatIndex))
-                end
-            end
-
-            if not seated then
-                if Config.isDebug then print('Pilot FAILED to seat in ' .. selectedEntry.unit.model .. ' vehNetID = ' .. tostring(vehNetID) .. ' seat = ' .. seatIndex .. ', deleting ped') end
-                DeleteEntity(officer)
-                if seatIndex == -1 then
-                    -- Driver failed, no point continuing
-                    break
-                end
-            else
-                seatIndex = seatIndex + 1
-                local pedNetID = NetworkGetNetworkIdFromEntity(officer)
-                if Config.isDebug then print('NET pilot ' ..pedModel .. ' SEATED with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. tostring(vehNetID)) end
-                if DoesEntityExist(officer) then
-                    -- NOTE: weapon was already given before the seating loop (above).
-                    -- Giving again here tops up ammo and forces it into hand in case
-                    -- the seating state cleared the active-weapon slot.
-                    GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, true)
-                    SetCurrentPedWeapon(officer, GetHashKey('weapon_combatpistol'), true)
-                    -- Combat/task setup for heli pilot.
-                    dispatchCombatProfile(pedNetID, {
-                        combatAttributes = {{52, true}, {53, true}}, -- can vehicle attack / use mounted weapons
-                        fleeAttributes = {0, false},
-                        driverAbility = 1.0,
-                        heliChaseTarget = src,
-                    })
-                    -- Accuracy / firing pattern / hostility scale with wanted level.
-                    applyOfficerCombatProfile(officer, wantedLevel, 'air')
-                end
-                table.insert(officers, pedNetID)
-                vehicleCrewed = true
-            end
-
-            if not vehicleCrewed then
-                break
-            end
-        end
-
-        -- Spawn crew peds (only if we have a pilot)
-        if vehicleCrewed then
-            for _, pedModel in ipairs(selectedEntry.peds) do
-                local pedHash = GetHashKey(pedModel)
-
-                local officer = CreatePed(4, pedHash, spawnPoint.x, spawnPoint.y, spawnPoint.z + 1.0, spawnHeading, true, true)
-                local waitCount = 0
-                while not DoesEntityExist(officer) and waitCount < Config.spawnWaitCount do
-                    if Config.isDebug then print('Waiting to spawn heli crew...') end
-                    officer = CreatePed(4, pedHash, spawnPoint.x, spawnPoint.y, spawnPoint.z + 1.0, spawnHeading, true, true)
-                    Wait(10)
-                    waitCount = waitCount + 1
-                end
-                if not DoesEntityExist(officer) then
-                    if Config.isDebug then print('Spawning crew '..pedModel.. ' failed.') end
-                    return
-                end
-                -- SetEntityDistanceCullingRadius removed -- see the note above the
-                -- heli's own creation, same citizenfx/fivem#1828 concern.
-                Wait(200)
-
-                -- Give loadout BEFORE seating so weapons persist through vehicle-entry state.
-                givePedLoadout(officer, Config.loadouts[selectedEntry.unit.loadout])
-
-                local seated = false
-                for attempt = 1, 20 do
-                    SetPedIntoVehicle(officer, vehicle, seatIndex)
-                    Wait(100)
-                    local pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
-                    if pedInSeat and pedInSeat ~= 0 then
-                        seated = true
-                        break
-                    end
-                    TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
-                    Wait(150)
-                    pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
-                    if pedInSeat and pedInSeat ~= 0 then
-                        seated = true
-                        break
-                    end
-                    if Config.isDebug and attempt % 5 == 0 then
-                        print(('Heli crew seat attempt %d for %s vehNetID=%s seat=%d'):format(attempt, selectedEntry.unit.model, tostring(vehNetID), seatIndex))
-                    end
-                end
-
-                if not seated then
-                    if Config.isDebug then print('Crew FAILED to seat in ' .. selectedEntry.unit.model .. ' vehNetID = ' .. tostring(vehNetID) .. ' seat = ' .. seatIndex .. ', deleting ped') end
-                    DeleteEntity(officer)
-                else
-                    seatIndex = seatIndex + 1
-                    local pedNetID = NetworkGetNetworkIdFromEntity(officer)
-                    if Config.isDebug then print('NET crew ' ..pedModel .. ' SEATED with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. tostring(vehNetID)) end
-                    -- Loadout already given before seating; re-apply to ensure active weapon is set
-                    givePedLoadout(officer, Config.loadouts[selectedEntry.unit.loadout])
-                    -- Combat/task setup for heli crew.
-                    dispatchCombatProfile(pedNetID, { fleeAttributes = {0, false} })
-                    -- Crew only open fire once hostile for this wanted level; below
-                    -- that they ride along and the heli just shadows the player.
-                    local crewHostile = applyOfficerCombatProfile(officer, wantedLevel, 'air')
-                    if crewHostile then
-                        dispatchCombatProfile(pedNetID, { combatTarget = src })
-                    end
-                    table.insert(officers, pedNetID)
-                end
-            end
-        end
-
-        if not vehicleCrewed then
-            if Config.isDebug then print('Vehicle ' .. selectedEntry.unit.model .. ' failed to be crewed, deleting vehNetID = ' .. vehNetID .. ' and starting over ') end
-            DeleteEntity(vehicle)
-            vehNetID = nil
-            Wait(100)
-            -- Add 1 and try again
-            hasDriverCount = hasDriverCount + 1   
-        end
+    local function spawned(entity)
+        created[#created + 1] = entity
+        if not awaitEntity(entity) then return nil end
+        if bucket and bucket ~= 0 then SetEntityRoutingBucket(entity, bucket) end
+        return entity
     end
 
+    local ok, vehNetID, officers = pcall(build, spawned)
+    if not ok then
+        print(('[fenix-police] %s for %s failed: %s'):format(responseEvent, tostring(src), tostring(vehNetID)))
+    end
+
+    if not ok or not vehNetID or not GetPlayerName(src) then
+        for i = #created, 1, -1 do deleteIfExists(created[i]) end
+        TriggerClientEvent(responseEvent, src, nil, nil)
+        return
+    end
+
+    -- Anything made along the way that didn't end up in the unit -- a handle
+    -- that only came into existence after awaitEntity gave up on it -- goes.
+    local keep = { [vehNetID] = true }
+    for _, pedNetID in ipairs(officers) do keep[pedNetID] = true end
+    for _, entity in ipairs(created) do
+        if entity and entity ~= 0 and DoesEntityExist(entity)
+            and not keep[NetworkGetNetworkIdFromEntity(entity)] then
+            DeleteEntity(entity)
+        end
+    end
 
     -- Helicopters and planes are created here, on the server, so ownership is
     -- recorded directly at the point of creation -- no ticket round-trip is
     -- needed and there is nothing for a client to assert. This is what the
     -- ground path has to reconstruct with FenixGuard.issueTicket.
-    if vehNetID then FenixGuard.claim(src, vehNetID, 'vehicle') end
-    for _, pedNetID in ipairs(officers or {}) do
+    FenixGuard.claim(src, vehNetID, 'vehicle')
+    for _, pedNetID in ipairs(officers) do
         FenixGuard.claim(src, pedNetID, 'ped')
     end
 
     -- Return the netIDs to the client
-    TriggerClientEvent('spawnPoliceHeliNetResponse', src, vehNetID, officers)
+    TriggerClientEvent(responseEvent, src, vehNetID, officers)
+end
+
+--- The checks every air request makes once it is going to cost something.
+--- Returns true to go ahead.
+local function airRequestAllowed(src, what, spawnPoint, here, maxDistance, maxHeight)
+    if not FenixGuard.allow(src, 'spawn') then return false end
+
+    if not airSpawnPointPlausible(spawnPoint, here, maxDistance, maxHeight) then
+        FenixGuard.refuse(src, what, 'spawn point is nowhere near the requester')
+        return false
+    end
+
+    -- Server-created units count against the same per-player ceiling the
+    -- ground registration path has always enforced.
+    if FenixGuard.ownedCount(src) >= FenixGuard.ownedCap() then
+        if Config.isDebug then print(('[fenix-police] %s for %s refused: owned-entity cap'):format(what, tostring(src))) end
+        return false
+    end
+
+    return true
+end
+
+
+
+
+-- HELI UNITS --
+-- The trailing spawn table older clients still send is ignored; see
+-- airSpawnTableFor.
+RegisterNetEvent('spawnPoliceHeliNet')
+AddEventHandler('spawnPoliceHeliNet', function(wantedLevel, _, spawnPoint)
+    local src = source
+    local function fail() TriggerClientEvent('spawnPoliceHeliNetResponse', src, nil, nil) end
+
+    local level, spawnTable, firstPick, here = prepareAirRequest(src, 'heli', wantedLevel, spawnPoint)
+    if not level then return fail() end
+    if not airRequestAllowed(src, 'heli spawn', spawnPoint, here,
+        Config.maxHeliSpawnDistance or 500.0, Config.maxHeliSpawnHeight or 200.0) then
+        return fail()
+    end
+
+    local spawnHeading = headingTowards(spawnPoint, here)
+
+    runAirSpawn(src, 'spawnPoliceHeliNetResponse', function(spawned)
+        local seatIndex = -1
+
+        -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
+        local vehicleCrewed = false
+        local hasDriverCount = 0
+        local vehNetID = nil
+        local officers = {}
+        local selectedEntry = firstPick
+
+        while (not vehicleCrewed) and hasDriverCount < Config.hasDriverWaitCount do
+
+            -- Pick the vehicle to choose to spawn for this region, vehicle determines which peds spawn with it, and the peds determine combat behavior and weapons.
+            -- The first pass uses the pick prepareAirRequest already made.
+            selectedEntry = selectedEntry or getRandomAirUnit(spawnTable, level)
+            if not selectedEntry then
+                if Config.isDebug then print('No suitable heli found for the given wanted level.') end
+                return nil
+            end
+            local vehicleHash = GetHashKey(selectedEntry.unit.model)
+
+            local vehicle = spawned(CreateVehicleServerSetter(vehicleHash, 'heli', spawnPoint.x, spawnPoint.y, spawnPoint.z, spawnHeading))
+            if not vehicle then
+                if Config.isDebug then print('Spawning '..selectedEntry.unit.model.. ' failed.') end
+                return nil
+            end
+            vehNetID = NetworkGetNetworkIdFromEntity(vehicle)
+
+            -- [Upstate Mafia] Was SetEntityDistanceCullingRadius(vehicle, 10000.0).
+            -- citizenfx/fivem#1828: a large culling radius on a server-created
+            -- entity, combined with a client-issued task (exactly this heli's
+            -- TaskHeliChase), is the reported trigger for OneSync silently
+            -- teleporting the entity back to its spawn point or dropping its task
+            -- once another player comes near it. A CitizenFX contributor's answer
+            -- in that thread is blunt: "you should not ever use that option."
+            -- Default culling is already enough to keep a heli loaded for the one
+            -- player it's actively chasing.
+
+            -- [Upstate Mafia patch] Unlock doors + set statebag so qbx_vehiclekeys skips auto-lock
+            SetVehicleDoorsLocked(vehicle, 1)  -- 1 = unlocked
+            Entity(vehicle).state:set('doorslockstate', 1, true)  -- synced statebag
+
+            officers = {}
+
+            -- [Upstate Mafia patch] Wait for heli entity to fully initialise before seating peds
+            Wait(500)
+
+            -- Spawn pilots
+            for _, pedModel in ipairs(selectedEntry.pilots) do
+                local pedHash = GetHashKey(pedModel)
+
+                -- Spawn ped at the heli (not 20 units away). One that never
+                -- appears is handled exactly like one that won't sit down.
+                local officer = spawned(CreatePed(4, pedHash, spawnPoint.x, spawnPoint.y, spawnPoint.z + 1.0, spawnHeading, true, true))
+                local seated = false
+                if not officer then
+                    if Config.isDebug then print('Spawning pilot '..pedModel.. ' failed.') end
+                else
+                    -- SetEntityDistanceCullingRadius removed -- see the note above the
+                    -- heli's own creation, same citizenfx/fivem#1828 concern.
+                    Wait(200)
+
+                    -- Give weapon BEFORE seating so it persists through vehicle-entry state changes.
+                    GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, true)
+                    SetCurrentPedWeapon(officer, GetHashKey('weapon_combatpistol'), true)
+
+                    -- Try multiple seating methods (same approach as ground units)
+                    for attempt = 1, 20 do
+                        SetPedIntoVehicle(officer, vehicle, seatIndex)
+                        Wait(100)
+                        local pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
+                        if pedInSeat and pedInSeat ~= 0 then
+                            seated = true
+                            break
+                        end
+                        TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
+                        Wait(150)
+                        pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
+                        if pedInSeat and pedInSeat ~= 0 then
+                            seated = true
+                            break
+                        end
+                        if Config.isDebug and attempt % 5 == 0 then
+                            print(('Heli pilot seat attempt %d for %s vehNetID=%s seat=%d'):format(attempt, selectedEntry.unit.model, tostring(vehNetID), seatIndex))
+                        end
+                    end
+                end
+
+                if not seated then
+                    if Config.isDebug then print('Pilot FAILED to seat in ' .. selectedEntry.unit.model .. ' vehNetID = ' .. tostring(vehNetID) .. ' seat = ' .. seatIndex .. ', deleting ped') end
+                    deleteIfExists(officer)
+                    if seatIndex == -1 then
+                        -- Driver failed, no point continuing
+                        break
+                    end
+                else
+                    seatIndex = seatIndex + 1
+                    local pedNetID = NetworkGetNetworkIdFromEntity(officer)
+                    if Config.isDebug then print('NET pilot ' ..pedModel .. ' SEATED with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. tostring(vehNetID)) end
+                    if DoesEntityExist(officer) then
+                        -- NOTE: weapon was already given before the seating loop (above).
+                        -- Giving again here tops up ammo and forces it into hand in case
+                        -- the seating state cleared the active-weapon slot.
+                        GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, true)
+                        SetCurrentPedWeapon(officer, GetHashKey('weapon_combatpistol'), true)
+                        -- Combat/task setup for heli pilot.
+                        dispatchCombatProfile(pedNetID, {
+                            combatAttributes = {{52, true}, {53, true}}, -- can vehicle attack / use mounted weapons
+                            fleeAttributes = {0, false},
+                            driverAbility = 1.0,
+                            heliChaseTarget = src,
+                        }, src)
+                        -- Accuracy / firing pattern / hostility scale with wanted level.
+                        applyOfficerCombatProfile(officer, level, 'air', src)
+                    end
+                    table.insert(officers, pedNetID)
+                    vehicleCrewed = true
+                end
+
+                if not vehicleCrewed then
+                    break
+                end
+            end
+
+            -- Spawn crew peds (only if we have a pilot)
+            if vehicleCrewed then
+                for _, pedModel in ipairs(selectedEntry.peds) do
+                    local pedHash = GetHashKey(pedModel)
+
+                    local officer = spawned(CreatePed(4, pedHash, spawnPoint.x, spawnPoint.y, spawnPoint.z + 1.0, spawnHeading, true, true))
+                    if not officer then
+                        -- One gunner short, not a reason to scrap a crewed heli.
+                        if Config.isDebug then print('Spawning crew '..pedModel.. ' failed.') end
+                    else
+                        -- SetEntityDistanceCullingRadius removed -- see the note above the
+                        -- heli's own creation, same citizenfx/fivem#1828 concern.
+                        Wait(200)
+
+                        -- Give loadout BEFORE seating so weapons persist through vehicle-entry state.
+                        givePedLoadout(officer, Config.loadouts[selectedEntry.unit.loadout])
+
+                        local seated = false
+                        for attempt = 1, 20 do
+                            SetPedIntoVehicle(officer, vehicle, seatIndex)
+                            Wait(100)
+                            local pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
+                            if pedInSeat and pedInSeat ~= 0 then
+                                seated = true
+                                break
+                            end
+                            TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
+                            Wait(150)
+                            pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
+                            if pedInSeat and pedInSeat ~= 0 then
+                                seated = true
+                                break
+                            end
+                            if Config.isDebug and attempt % 5 == 0 then
+                                print(('Heli crew seat attempt %d for %s vehNetID=%s seat=%d'):format(attempt, selectedEntry.unit.model, tostring(vehNetID), seatIndex))
+                            end
+                        end
+
+                        if not seated then
+                            if Config.isDebug then print('Crew FAILED to seat in ' .. selectedEntry.unit.model .. ' vehNetID = ' .. tostring(vehNetID) .. ' seat = ' .. seatIndex .. ', deleting ped') end
+                            DeleteEntity(officer)
+                        else
+                            seatIndex = seatIndex + 1
+                            local pedNetID = NetworkGetNetworkIdFromEntity(officer)
+                            if Config.isDebug then print('NET crew ' ..pedModel .. ' SEATED with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. tostring(vehNetID)) end
+                            -- Loadout already given before seating; re-apply to ensure active weapon is set
+                            givePedLoadout(officer, Config.loadouts[selectedEntry.unit.loadout])
+                            -- Combat/task setup for heli crew.
+                            dispatchCombatProfile(pedNetID, { fleeAttributes = {0, false} }, src)
+                            -- Crew only open fire once hostile for this wanted level; below
+                            -- that they ride along and the heli just shadows the player.
+                            local crewHostile = applyOfficerCombatProfile(officer, level, 'air', src)
+                            if crewHostile then
+                                dispatchCombatProfile(pedNetID, { combatTarget = src }, src)
+                            end
+                            table.insert(officers, pedNetID)
+                        end
+                    end
+                end
+            end
+
+            if not vehicleCrewed then
+                if Config.isDebug then print('Vehicle ' .. selectedEntry.unit.model .. ' failed to be crewed, deleting vehNetID = ' .. vehNetID .. ' and starting over ') end
+                deleteIfExists(vehicle)
+                vehNetID = nil
+                selectedEntry = nil
+                Wait(100)
+                -- Add 1 and try again
+                hasDriverCount = hasDriverCount + 1
+            end
+        end
+
+        return vehNetID, officers
+    end)
 end)
 
 
 
 
 -- AIR UNITS --
+-- Same request shape and checks as the heli handler above.
 RegisterNetEvent('spawnPoliceAirNet')
-AddEventHandler('spawnPoliceAirNet', function(wantedLevel, playerCoords, spawnPoint, spawnTable)
+AddEventHandler('spawnPoliceAirNet', function(wantedLevel, _, spawnPoint)
     local src = source
-    if not FenixGuard.allow(src, 'spawn') then return end
+    local function fail() TriggerClientEvent('spawnPoliceAirNetResponse', src, nil, nil) end
 
-    local seatIndex = -1
+    local level, spawnTable, firstPick, here = prepareAirRequest(src, 'plane', wantedLevel, spawnPoint)
+    if not level then return fail() end
+    if not airRequestAllowed(src, 'plane spawn', spawnPoint, here,
+        Config.maxAirSpawnDistance or 600.0, Config.maxAirSpawnHeight or 300.0) then
+        return fail()
+    end
 
-    -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
-    local vehicleCrewed = false
-    local hasDriverCount = 0
-    local vehNetID = nil
-    local officers = {}
-    
+    local spawnHeading = headingTowards(spawnPoint, here)
 
-    while (not vehicleCrewed) and hasDriverCount < Config.hasDriverWaitCount do
+    runAirSpawn(src, 'spawnPoliceAirNetResponse', function(spawned)
+        local seatIndex = -1
 
-        vehNetID = nil
+        -- Variable will be set true as soon as a vehicle has a driver. I'm less worried about a crew member not warping in properly.
+        local vehicleCrewed = false
+        local hasDriverCount = 0
+        local vehNetID = nil
+        local officers = {}
+        local selectedEntry = firstPick
 
-        -- Pick the vehicle to choose to spawn for this region, vehicle determines which peds spawn with it, and the peds determine combat behavior and weapons. 
-        local selectedEntry = getRandomAirUnit(spawnTable, wantedLevel)
-        if not selectedEntry then
-            if Config.isDebug then print('No suitable air unit found for the given wanted level.') end
-            return
-        end
-        local vehicleHash = GetHashKey(selectedEntry.unit.model)
+        while (not vehicleCrewed) and hasDriverCount < Config.hasDriverWaitCount do
 
-        local vehicle = CreateVehicleServerSetter(vehicleHash, 'plane', spawnPoint.x, spawnPoint.y, spawnPoint.z, 0.0)
-        local waitCount = 0 
-        while not DoesEntityExist(vehicle) and waitCount < Config.spawnWaitCount do
-            Wait(10)
-            waitCount = waitCount + 1
-        end
-        if not DoesEntityExist(vehicle) then
-            if Config.isDebug then print('Spawning '..selectedEntry.unit.model.. ' failed.') end
-            return
-        end
-        vehNetID = NetworkGetNetworkIdFromEntity(vehicle)
+            -- Pick the vehicle to choose to spawn for this region, vehicle determines which peds spawn with it, and the peds determine combat behavior and weapons.
+            -- The first pass uses the pick prepareAirRequest already made.
+            selectedEntry = selectedEntry or getRandomAirUnit(spawnTable, level)
+            if not selectedEntry then
+                if Config.isDebug then print('No suitable air unit found for the given wanted level.') end
+                return nil
+            end
+            local vehicleHash = GetHashKey(selectedEntry.unit.model)
 
-        -- SetEntityDistanceCullingRadius removed -- see the note in
-        -- spawnPoliceHeliNet above, same citizenfx/fivem#1828 concern.
+            local vehicle = spawned(CreateVehicleServerSetter(vehicleHash, 'plane', spawnPoint.x, spawnPoint.y, spawnPoint.z, spawnHeading))
+            if not vehicle then
+                if Config.isDebug then print('Spawning '..selectedEntry.unit.model.. ' failed.') end
+                return nil
+            end
+            vehNetID = NetworkGetNetworkIdFromEntity(vehicle)
 
-        officers = {}
+            -- SetEntityDistanceCullingRadius removed -- see the note in
+            -- spawnPoliceHeliNet above, same citizenfx/fivem#1828 concern.
 
-        for _, pedModel in ipairs(selectedEntry.pilots) do
+            officers = {}
 
-
-            local pedHash = GetHashKey(pedModel)
+            for _, pedModel in ipairs(selectedEntry.pilots) do
 
 
-            local warpCount = 0
-            local pedInSeat = nil
-            while (not pedInSeat or pedInSeat == 0) and warpCount < Config.warpWaitCount do
+                local pedHash = GetHashKey(pedModel)
 
-                local officer = CreatePed(4, pedHash, spawnPoint.x+20, spawnPoint.y+20, spawnPoint.z, spawnHeading, true, true)
-                local waitCount = 0
-                while not DoesEntityExist(officer) and waitCount < Config.spawnWaitCount do
-                    if Config.isDebug then print('Waiting to spawn officer...') end
-                    officer = CreatePed(4, pedHash, spawnPoint.x+20, spawnPoint.y+20, spawnPoint.z, spawnHeading, true, true)
-                    Wait(10)
-                    waitCount = waitCount + 1
-                end
-                if not DoesEntityExist(officer) then
-                    if Config.isDebug then print('Spawning '..pedModel.. ' failed.') end
-                    return
-                end
-                -- SetEntityDistanceCullingRadius removed -- see the note in
-                -- spawnPoliceHeliNet above, same citizenfx/fivem#1828 concern.
-                Wait(50)
-                TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
-                Wait(50)
-                pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
-                local waitCount = 0
-                while (not pedInSeat or pedInSeat == 0) and waitCount < Config.spawnWaitCount do
-                    -- Try warping them again
-                    if Config.isDebug then print('Officer failed to warp into ' .. selectedEntry.unit.model .. ' vehNetID = ' .. vehNetID .. ' seat = ' .. seatIndex .. ' trying again ' .. waitCount) end
-                    TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
-                    Wait(20)
-                    pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
-                    waitCount = waitCount + 1
-                end
 
-                if (not pedInSeat or pedInSeat == 0) then
-                    -- Delete the officer and start over with a fresh one until they warp into the vehicle properly.
-                    if Config.isDebug then print('Officer failed to warp into ' .. selectedEntry.unit.model .. ' vehNetID = ' .. vehNetID .. ' too many times, deleting entity and starting over ') end
-                    DeleteEntity(officer)
-                    Wait(100)
-                    warpCount = warpCount + 1
-                else
-                    -- Put this here so if a ped fails to be warped in it will still fill the driver seat first.
-                    seatIndex = seatIndex + 1 -- Increase seat index so each seat is filled from driver, to passenger, to rear passengers etc.
+                local warpCount = 0
+                local pedInSeat = nil
+                while (not pedInSeat or pedInSeat == 0) and warpCount < Config.warpWaitCount do
 
-                    -- Network setup for pilot
-                    local pedNetID = NetworkGetNetworkIdFromEntity(officer)
-                    if Config.isDebug then print('NET ped ' ..pedModel .. ' spawned with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. vehNetID) end
+                    -- A ped that never appears counts as one failed warp.
+                    local officer = spawned(CreatePed(4, pedHash, spawnPoint.x+20, spawnPoint.y+20, spawnPoint.z, spawnHeading, true, true))
+                    if not officer then
+                        if Config.isDebug then print('Spawning '..pedModel.. ' failed.') end
+                        warpCount = warpCount + 1
+                    else
+                        -- SetEntityDistanceCullingRadius removed -- see the note in
+                        -- spawnPoliceHeliNet above, same citizenfx/fivem#1828 concern.
+                        Wait(50)
+                        TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
+                        Wait(50)
+                        pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
+                        local waitCount = 0
+                        while (not pedInSeat or pedInSeat == 0) and waitCount < Config.spawnWaitCount do
+                            -- Try warping them again
+                            if Config.isDebug then print('Officer failed to warp into ' .. selectedEntry.unit.model .. ' vehNetID = ' .. vehNetID .. ' seat = ' .. seatIndex .. ' trying again ' .. waitCount) end
+                            TaskWarpPedIntoVehicle(officer, vehicle, seatIndex)
+                            Wait(20)
+                            pedInSeat = GetPedInVehicleSeat(vehicle, seatIndex)
+                            waitCount = waitCount + 1
+                        end
 
-                    -- Combat/task setup for air pilot.
-                    if DoesEntityExist(officer) then
-                        GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, false)
-                        dispatchCombatProfile(pedNetID, {
-                            combatAttributes = {{52, true}, {53, true}, {85, true}, {86, true}}, -- vehicle attack / mounted weapons / prefer air targets / dogfighting
-                            fleeAttributes = {0, false},
-                            driverAbility = 1.0,
-                            planeChaseTarget = src,
-                        })
-                        -- Accuracy / firing pattern / hostility scale with wanted level.
-                        applyOfficerCombatProfile(officer, wantedLevel, 'air')
+                        if (not pedInSeat or pedInSeat == 0) then
+                            -- Delete the officer and start over with a fresh one until they warp into the vehicle properly.
+                            if Config.isDebug then print('Officer failed to warp into ' .. selectedEntry.unit.model .. ' vehNetID = ' .. vehNetID .. ' too many times, deleting entity and starting over ') end
+                            DeleteEntity(officer)
+                            Wait(100)
+                            warpCount = warpCount + 1
+                        else
+                            -- Put this here so if a ped fails to be warped in it will still fill the driver seat first.
+                            seatIndex = seatIndex + 1 -- Increase seat index so each seat is filled from driver, to passenger, to rear passengers etc.
+
+                            -- Network setup for pilot
+                            local pedNetID = NetworkGetNetworkIdFromEntity(officer)
+                            if Config.isDebug then print('NET ped ' ..pedModel .. ' spawned with pedNetID = ' ..pedNetID .. ' for vehNetID = ' .. vehNetID) end
+
+                            -- Combat/task setup for air pilot.
+                            if DoesEntityExist(officer) then
+                                GiveWeaponToPed(officer, GetHashKey('weapon_combatpistol'), 999, false, false)
+                                dispatchCombatProfile(pedNetID, {
+                                    combatAttributes = {{52, true}, {53, true}, {85, true}, {86, true}}, -- vehicle attack / mounted weapons / prefer air targets / dogfighting
+                                    fleeAttributes = {0, false},
+                                    driverAbility = 1.0,
+                                    planeChaseTarget = src,
+                                }, src)
+                                -- Accuracy / firing pattern / hostility scale with wanted level.
+                                applyOfficerCombatProfile(officer, level, 'air', src)
+                            end
+
+                            -- Add pilot to table to return
+                            table.insert(officers, pedNetID)
+
+                            -- We spawned a ped into the vehicle, ensure vehicleCrewed is true.
+                            vehicleCrewed = true
+                        end
                     end
 
-                    -- Add pilot to table to return
-                    table.insert(officers, pedNetID)
+                end
 
-                    -- We spawned a ped into the vehicle, ensure vehicleCrewed is true.
-                    vehicleCrewed = true
+                if not vehicleCrewed then
+                    -- Should break the ped loop and move straight to deleting the vehicle. In my experience if the first one fails to warp they all will.
+                    break
                 end
 
             end
 
-
-            --seatIndex = seatIndex + 1 -- Increase seat index so each seat is filled from driver, to passenger, to rear passengers etc.
-
-            
-            
-
             if not vehicleCrewed then
-                -- Should break the ped loop and move straight to deleting the vehicle. In my experience if the first one fails to warp they all will. 
-                break 
+                if Config.isDebug then print('Vehicle ' .. selectedEntry.unit.model .. ' failed to be crewed, deleting vehNetID = ' .. vehNetID .. ' and starting over ') end
+                deleteIfExists(vehicle)
+                vehNetID = nil
+                selectedEntry = nil
+                Wait(100)
+                -- Add 1 and try again
+                hasDriverCount = hasDriverCount + 1
             end
 
         end
 
-        if not vehicleCrewed then
-            if Config.isDebug then print('Vehicle ' .. selectedEntry.unit.model .. ' failed to be crewed, deleting vehNetID = ' .. vehNetID .. ' and starting over ') end
-            DeleteEntity(vehicle)
-            vehNetID = nil
-            Wait(100)
-            -- Add 1 and try again
-            hasDriverCount = hasDriverCount + 1   
-        end
-
-    end
-
-
-    -- Helicopters and planes are created here, on the server, so ownership is
-    -- recorded directly at the point of creation -- no ticket round-trip is
-    -- needed and there is nothing for a client to assert. This is what the
-    -- ground path has to reconstruct with FenixGuard.issueTicket.
-    if vehNetID then FenixGuard.claim(src, vehNetID, 'vehicle') end
-    for _, pedNetID in ipairs(officers or {}) do
-        FenixGuard.claim(src, pedNetID, 'ped')
-    end
-
-    -- Return the netIDs to the client
-    TriggerClientEvent('spawnPoliceAirNetResponse', src, vehNetID, officers)
+        return vehNetID, officers
+    end)
 end)
 
 
@@ -1140,6 +1170,20 @@ AddEventHandler('fenix-police:server:issueTicket', function(level)
     local c = Config.TicketSystem
     if not c or not c.enabled then return end
 
+    -- A citation needs a stop to be a citation: the player wanted, and one of
+    -- their own officers standing at the car. Without that this is a
+    -- complied_with_police honor hook on demand, as often as a client cares to
+    -- send it.
+    if not FenixGuard.allow(src, 'ticket', 3) then return end
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 or not isPlayerWanted(src)
+        or not FenixGuard.officerNear(src, GetEntityCoords(ped), (c.windowDistance or 3.5) + 6.0) then
+        FenixGuard.refuse(src, 'citation', 'no traffic stop in progress')
+        -- Still an outcome for the client to show: a warning, nothing charged.
+        TriggerClientEvent('fenix-police:client:ticketIssued', src, 0, true)
+        return
+    end
+
     local fine = c.fine or {}
     if not fine.enabled then
         -- Warning-only server: still answer, so the client shows an outcome
@@ -1194,7 +1238,11 @@ AddEventHandler('fenix-police:server:issueTicket', function(level)
     -- qbx_honor/config.lua's Config.Hooks.complied_with_police). Not a
     -- dependency -- pcall degrades to no honor change if qbx_honor isn't
     -- running, same pattern every other resource hooking into it uses.
-    pcall(function() exports.qbx_honor:ApplyHook(src, 'complied_with_police') end)
+    -- Only for a citation actually paid: with allowUnpaid on, a player with no
+    -- money could otherwise farm it from every stop for free.
+    if paid then
+        pcall(function() exports.qbx_honor:ApplyHook(src, 'complied_with_police') end)
+    end
 
     TriggerClientEvent('fenix-police:client:ticketIssued', src, amount, paid == true)
 end)
@@ -1208,11 +1256,14 @@ function GetPlayersInRadius(centerCoords, radius)
 
     for _, playerId in ipairs(GetPlayers()) do
         local ped = GetPlayerPed(playerId)
-        local playerCoords = GetEntityCoords(ped)
+        -- A player still loading in has no ped yet.
+        if ped and ped ~= 0 then
+            local playerCoords = GetEntityCoords(ped)
 
-        local dist = #(vector3(centerCoords.x, centerCoords.y, centerCoords.z) - playerCoords)
-        if dist <= radius then
-            table.insert(playersInRadius, playerId)
+            local dist = #(vector3(centerCoords.x, centerCoords.y, centerCoords.z) - playerCoords)
+            if dist <= radius then
+                table.insert(playersInRadius, playerId)
+            end
         end
     end
 
@@ -1230,7 +1281,7 @@ function GetWantedLevelFromCoords(alertCoords)
         round(alertCoords.x, 2),
         round(alertCoords.y, 2),
         round(alertCoords.z, 2)
-    )   
+    )
 
     -- Leftover development logging. It ran unconditionally — three lines per
     -- configured location, on every alert — and concatenated vector3 values
@@ -1261,52 +1312,34 @@ end
 
 --Uesed to receive alerts from qbpolice trigger fuction
 --Needs to be added to QB-Police police:server:policeAlert
--- Applies a wanted level to everyone standing near a reported crime.
+-- Applies a wanted level to everyone standing near a reported crime at one of
+-- Config.locations.
 --
--- [Upstate Mafia] Hardened. As written this took coordinates straight from the
--- client and handed a wanted level to every player within 10m of them, so any
--- client could pick a victim anywhere on the map and star them repeatedly -- a
--- wanted-level cannon aimed by whoever sent the event. It also printed five
--- lines to the server console per call, unconditionally, which is a console
--- flood on its own.
+-- Server-side only: another resource calls it with TriggerEvent, passing the
+-- reporting player and the alert (see the README). Nothing in this
+-- resource's own client sends it, and as a net event it would let any client
+-- star whoever stands near a configured location. A server-local
+-- TriggerEvent arrives with source "" rather than 0, so there is no caller to
+-- measure the coordinates against either: a caller-distance check here takes
+-- every legitimate call for a player with no ped and drops it.
 --
--- The fix is to stop trusting the location: a player reporting a crime is
--- reporting one they are AT. Coordinates further than
--- Config.Security.maxAlertDistance from the caller are refused. Calls that did
--- not come from a player (another resource triggering this server-side, where
--- source is 0) skip that check, because there is no caller to measure against
--- and server-side callers are already trusted.
-RegisterNetEvent('fenix:server:trigger')
+-- A crime anywhere other than a configured location stars nobody. Sending
+-- wanted level 0 isn't harmless: the client's SetWantedLevel turns it into
+-- clearing and re-applying whatever level the player already has, which
+-- re-centres their search area for free.
 AddEventHandler('fenix:server:trigger', function(pdata, alertData)
-    local src = source
+    if type(alertData) ~= 'table' then return end
+    local at = alertData.coords
+    if type(at) ~= 'table' and type(at) ~= 'vector3' then return end
 
-    if type(alertData) ~= 'table' or type(alertData.coords) ~= 'table' then return end
-
-    local x = tonumber(alertData.coords.x)
-    local y = tonumber(alertData.coords.y)
-    local z = tonumber(alertData.coords.z)
+    local x = tonumber(at.x)
+    local y = tonumber(at.y)
+    local z = tonumber(at.z)
     if not x or not y or not z then return end
 
-    if src and src ~= 0 then
-        if not FenixGuard.allow(src, 'alert') then return end
-
-        local maxDistance = (Config.Security or {}).maxAlertDistance or 100.0
-        if maxDistance > 0 then
-            local ped = GetPlayerPed(src)
-            if not ped or ped == 0 then return end
-
-            local here = GetEntityCoords(ped)
-            local dx, dy, dz = here.x - x, here.y - y, here.z - z
-            if math.sqrt((dx * dx) + (dy * dy) + (dz * dz)) > maxDistance then
-                FenixGuard.refuse(src, 'crime alert',
-                    'reported coordinates are not where the caller is')
-                return
-            end
-        end
-    end
-
     local coords = vector3(x, y, z)
-    local wantedlevel = GetWantedLevelFromCoords(coords) or 0
+    local wantedlevel = tonumber(GetWantedLevelFromCoords(coords))
+    if not wantedlevel or wantedlevel <= 0 then return end
 
     -- Was unconditional. Five console lines per call is a flood vector by
     -- itself, and none of it is useful outside debugging.
@@ -1318,18 +1351,23 @@ AddEventHandler('fenix:server:trigger', function(pdata, alertData)
     -- Routed through FenixDispatch (server/dispatch.lua) so every incident,
     -- whether it came from this legacy event or a newer call site, goes
     -- through the same FenixIncident lifecycle. wantedLevel from
-    -- Config.locations is passed straight through as the severity so
-    -- existing per-location tuning keeps working unchanged; when a location
-    -- has no configured wanted level this falls back to Config.Dispatch's
-    -- default severity for 'LEGACY_ALERT'.
+    -- Config.locations is applied exactly as configured, so existing
+    -- per-location tuning keeps working unchanged. The reporter's routing
+    -- bucket keeps the stars to players in the same one, either way: an
+    -- instanced interior shares its coordinates with every other copy of it.
+    local reporter = tonumber(pdata)
+    local bucket = (reporter and GetPlayerName(reporter)) and GetPlayerRoutingBucket(reporter) or nil
     if (Config.Dispatch or {}).enabled and FenixDispatch then
         FenixDispatch.createIncident('LEGACY_ALERT', coords, nil, {
             wantedRadius = 10.0,
             directWanted = wantedlevel,
+            bucket = bucket,
         })
     else
         for _, playerId in ipairs(GetPlayersInRadius(coords, 10.0)) do
-            TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
+            if bucket == nil or GetPlayerRoutingBucket(playerId) == bucket then
+                TriggerClientEvent('fenix-police:client:SetWantedLevel', playerId, wantedlevel)
+            end
         end
     end
 end)
@@ -1367,9 +1405,45 @@ end)
 -- fieldRevive TriggerServerEvent for the fuller story (this used to be a
 -- bare 'wasabi_ambulance:revive' client event before the wasabi_ambulance ->
 -- qbx_medical migration, 2026-09-09).
+--
+-- Left open, this is a free revive for anyone, any time, from anywhere, so
+-- it needs what the real sequence always has: the player's client holding an
+-- aftermath scene, one of that player's own officers beside them, and no
+-- other field revive inside Config.Security.fieldReviveCooldown.
+local lastFieldRevive = {}
+AddEventHandler('playerDropped', function() lastFieldRevive[source] = nil end)
+
 RegisterServerEvent('fenix-police:server:fieldRevive')
 AddEventHandler('fenix-police:server:fieldRevive', function()
     local src = source
+    if not FenixGuard.allow(src, 'revive', 6) then return end
+
+    if not holdingAftermath(src) then
+        FenixGuard.refuse(src, 'field revive', 'no aftermath scene in progress')
+        return
+    end
+
+    local now = os.time()
+    local cooldown = (Config.Security or {}).fieldReviveCooldown or 300
+    if lastFieldRevive[src] and now - lastFieldRevive[src] < cooldown then
+        FenixGuard.refuse(src, 'field revive', 'field revive cooldown')
+        return
+    end
+
+    -- The medic works within Config.Aftermath.reviveRange of where the
+    -- player went down; the slack covers the body moving since.
+    local ped = GetPlayerPed(src)
+    local range = ((Config.Aftermath or {}).reviveRange or 8.0) + 6.0
+    if not ped or ped == 0 or not FenixGuard.officerNear(src, GetEntityCoords(ped), range) then
+        FenixGuard.refuse(src, 'field revive', 'none of their officers is with them')
+        return
+    end
+
+    lastFieldRevive[src] = now
+    -- One revive per scene. The client closes the sequence itself straight
+    -- after sending this; nothing here waits on that.
+    aftermathHolding[src] = nil
+
     local ok, err = pcall(function()
         exports.qbx_medical:Revive(src)
     end)

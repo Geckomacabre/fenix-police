@@ -36,15 +36,31 @@ AddEventHandler('fenix-police:server:reportUnitPositions', function(reports)
         n = n + 1
         if n > cap then break end
 
-        if type(vehNetID) == 'number' and type(report) == 'table' and type(report.coords) == 'vector3' then
-            units[vehNetID] = {
-                src = src,
-                kind = report.kind, -- 'ground' | 'heli' | 'air'
-                role = report.role, -- e.g. 'VehicleChase', 'Standby' -- informational only
-                coords = report.coords,
-                updatedAt = now,
-            }
+        -- Dispatch picks hosts from this, so an entry is only accepted for a
+        -- unit the server already knows is this player's (FenixGuard), and
+        -- its kind and position come from the server's own view of the
+        -- entity. A report could otherwise put any net ID anywhere.
+        if type(vehNetID) == 'number' and type(report) == 'table' and FenixGuard.isHeldBy(src, vehNetID) then
+            local entity = NetworkGetEntityFromNetworkId(vehNetID)
+            local vehType = GetVehicleType(entity)
+            if vehType then
+                units[vehNetID] = {
+                    src = src,
+                    kind = (vehType == 'heli' and 'heli') or (vehType == 'plane' and 'air') or 'ground',
+                    -- e.g. 'VehicleChase', 'Standby' -- informational only
+                    role = type(report.role) == 'string' and report.role:sub(1, 32) or nil,
+                    coords = GetEntityCoords(entity),
+                    updatedAt = now,
+                }
+            end
         end
+    end
+end)
+
+AddEventHandler('playerDropped', function()
+    local src = source
+    for vehNetID, unit in pairs(units) do
+        if unit.src == src then units[vehNetID] = nil end
     end
 end)
 
@@ -53,10 +69,11 @@ function FenixUnitRegistry.all()
 end
 
 -- kind: optional filter ('ground'|'heli'|'air'), nil = any.
-function FenixUnitRegistry.nearest(coords, maxRadius, kind)
+-- accept: optional function(unit) -> bool, to skip entries the caller can't use.
+function FenixUnitRegistry.nearest(coords, maxRadius, kind, accept)
     local best, bestId, bestDist = nil, nil, maxRadius
     for vehNetID, unit in pairs(units) do
-        if not kind or unit.kind == kind then
+        if (not kind or unit.kind == kind) and (not accept or accept(unit)) then
             local dist = #(unit.coords - coords)
             if dist <= bestDist then
                 best, bestId, bestDist = unit, vehNetID, dist

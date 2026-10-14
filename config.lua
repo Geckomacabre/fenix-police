@@ -1359,15 +1359,17 @@ Config.Security = {
     -- Extra detail: allowlist size at boot, unit registrations as they land.
     debug = false,
 
-    -- Require an ownership record before acting on an entity.
+    -- Only act on an entity recorded against the requesting player, or, with no
+    -- record, one that player's own client created.
     --
-    -- Left OFF by default. With layers 1 and 2 in place, the worst an unowned
-    -- entity permits is one player interfering with another player's police
-    -- units -- griefing, not theft -- and turning this on before you have
-    -- confirmed registration works on your server converts every gap into a
-    -- police car that never gets cleaned up. Turn it on once `fenixguard` in the
-    -- server console shows entities being owned during a pursuit.
-    strictOwnership = false,
+    -- On by default. Layer 2 alone lets anyone unlock or delete any unoccupied
+    -- car whose model is on the allowlist -- and the stock police, sheriff, FBI,
+    -- ambulance and fire models are exactly what player job vehicles use. Every
+    -- unit this resource spawns passes layer 3 on its own: helicopters and
+    -- planes are recorded when the server creates them, everything else is
+    -- created by the requesting client. Set false only to go back to judging
+    -- unrecorded entities on model alone.
+    strictOwnership = true,
 
     -- Seconds a spawn ticket stays valid. A ticket is issued when the server
     -- authorises a ground spawn and consumed when the client reports back what
@@ -1376,9 +1378,11 @@ Config.Security = {
 
     -- Ceiling on how many entities one player can have recorded at once. The
     -- backstop against a client that passes every other check and simply asks
-    -- for units forever. Config.maxUnitsPerLevel tops out at 10 vehicles with
-    -- crews, so this has a lot of headroom before it can bite legitimately.
-    maxOwnedEntities = 60,
+    -- for units forever. Applies to helicopters and planes as well as ground
+    -- units. A five-star pursuit with every reinforcement and backup bonus is
+    -- 17 cars of up to 5 entities each plus 6 helicopters of 5, before dead
+    -- officers awaiting cleanup -- around 120 at the very worst.
+    maxOwnedEntities = 150,
 
     -- Requests per player per minute, per event group. These events are not
     -- called at remotely similar rates: `spawn` is a deliberate request made a
@@ -1396,23 +1400,15 @@ Config.Security = {
         delete   = 600,
         unlock   = 600,
         rearm    = 600,
-        alert    = 30,
     },
 
     -- Fallback for any event group not named above.
     maxRequestsPerMinute = 300,
 
-    -- `fenix:server:trigger` applies a wanted level to everyone standing near a
-    -- reported crime, and took the crime's coordinates from the client. Any
-    -- client could therefore pick a victim anywhere on the map and star them --
-    -- a wanted-level cannon aimed by whoever sent the event.
-    --
-    -- A player reporting a crime is reporting one they are AT, so coordinates
-    -- further than this from the caller are refused. Raise it if a resource of
-    -- yours legitimately reports crimes from a distance; 0 disables the check.
-    -- Calls from another resource server-side skip it either way, since there is
-    -- no caller to measure against.
-    maxAlertDistance = 100.0,
+    -- Minimum seconds between two field revives (Config.Aftermath) for the same
+    -- player. The revive itself is a server export, so this is what stops a
+    -- client asking for one over and over.
+    fieldReviveCooldown = 300,
 
     -- Models to allowlist that the config tables above don't mention. You only
     -- need these if something outside Config.vehiclesByRegion / Config.polHelis
@@ -2033,8 +2029,8 @@ Config.Dispatch = {
     -- briefly instead of vanishing immediately on resolution).
     incidentMaxAgeMs = 30 * 60 * 1000,
 
-    -- How long a CREATED/DISPATCHING incident can sit with zero assigned
-    -- units before it's treated as abandoned and cleaned up.
+    -- How long an incident can sit with zero assigned units, and nothing
+    -- happening on it, before it's treated as abandoned and cleaned up.
     abandonedIncidentMs = 5 * 60 * 1000,
 
     -- How far from an EMS/fire incident the server will look for a player
@@ -2043,6 +2039,24 @@ Config.Dispatch = {
     -- unanswered rather than being handed to someone who can't plausibly
     -- see it.
     maxHostSearchRadius = 300.0,
+
+    -- The host's client spawns the unit up to that responder's
+    -- spawnMaxDistance from the scene, and anything much past ~400 m from the
+    -- host is outside what its game has loaded (no collision, the unit never
+    -- arrives). The search radius above is cut to this minus spawnMaxDistance.
+    hostScopeRadius = 400.0,
+
+    -- A host can decline a call without saying so (already at its maxUnits,
+    -- nowhere legal to spawn). If no unit is assigned for a role this long
+    -- after asking, the next-nearest player who hasn't been asked gets it, up
+    -- to maxOffersPerRole players per role.
+    reofferAfterMs = 20000,
+    maxOffersPerRole = 3,
+
+    -- Gunfire and crash reports within this many metres of a wanted player
+    -- are dropped: they're the pursuit itself (the police shooting, PIT and
+    -- ram damage), not a fresh call.
+    wantedSuppressRadius = 80.0,
 
     -- Which agencies a given incident type calls for. Anything not listed
     -- defaults to {'police'} (see server/dispatch.lua agenciesFor()).
@@ -2255,9 +2269,12 @@ Config.Collision = {
 
 -- Live unit position registry (server/unit_registry.lua). The prerequisite
 -- server/dispatch.lua's header comment describes for real nearest-unit
--- dispatch -- collects data only in this pass, nothing yet reroutes a live
--- unit based on it. Off by default; even when off, client.lua's reporting
--- thread costs nothing beyond one idle Wait().
+-- dispatch. Nothing reroutes a live unit based on it; when on, dispatch
+-- prefers the player whose own ground unit is nearest a call as that call's
+-- host. Reports are only accepted for units the server already knows are the
+-- reporting player's, at the position the server itself sees. Off by
+-- default; even when off, client.lua's reporting thread costs nothing beyond
+-- one idle Wait().
 Config.UnitRegistry = {
     enabled = false,
 
