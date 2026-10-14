@@ -34,36 +34,55 @@ local function dbg(msg) if cfg().debug then print('[FENIX-BACKUP] ' .. msg) end 
 -- State
 -------------------------------------------------------------------------------
 
--- Running incident score per kind ('ground' | 'heli'), each entry a list of
--- { amount, at = gameTimer } so decay can be applied per-contribution rather
--- than to one aggregate number, which would decay contributions that haven't
--- even happened yet.
-local incidents = { ground = {}, heli = {} }
+-- Running incident score, a list of { amount, at = gameTimer } so decay can be
+-- applied per-contribution rather than to one aggregate number, which would
+-- decay contributions that haven't even happened yet. One score for the whole
+-- incident: how bad things are on the ground is also what decides whether a
+-- helicopter is worth sending, so ground and heli bonuses read the same score
+-- against their own thresholds.
+local incidents = {}
 
 local lastAnnounceAt = 0
+
+-- When an officer last went down / last took damage. The radio call is about
+-- those two things specifically -- an armed suspect raises the score but is
+-- not "officer down" -- and only a NEW one since the last call is worth
+-- keying the radio again for.
+local lastOfficerDownAt = 0
+local lastTakingFireAt = 0
 
 -- pedNetID -> health last cycle, so reportTakingFire's caller (client.lua) can
 -- tell "still alive but losing health" from "just spawned" without keeping its
 -- own copy of the same bookkeeping.
 local lastHealth = {}
 
+-- pedNetID -> true once that officer's death has been scored. client.lua sees
+-- a body every cycle until the dead-ped cleanup removes it (45s on the ground,
+-- 120s in the air); scoring each sighting turned one death into +40 a second.
+local downReported = {}
+
+-- Last time reportSuspectArmed actually scored. It's called per unit per
+-- cycle, so without this six units on scene scored the same drawn weapon six
+-- times a second.
+local lastArmedAt = 0
+
 -------------------------------------------------------------------------------
 -- Scoring
 -------------------------------------------------------------------------------
 
-local function addIncident(kind, amount)
+local function addIncident(amount)
     if amount <= 0 then return end
-    table.insert(incidents[kind], { amount = amount, at = GetGameTimer() })
+    table.insert(incidents, { amount = amount, at = GetGameTimer() })
 end
 
---- Sum of every contribution to `kind` that hasn't fully decayed yet, pruning
---- the ones that have. Linear decay rather than a hard cutoff: a unit that
---- lost an officer 50 seconds ago is cooling off, not instantly forgotten.
-local function currentScore(kind)
+--- Sum of every contribution that hasn't fully decayed yet, pruning the ones
+--- that have. Linear decay rather than a hard cutoff: a unit that lost an
+--- officer 50 seconds ago is cooling off, not instantly forgotten.
+local function currentScore()
     local c = cfg()
     local decay = c.decayMs or 60000
     local now = GetGameTimer()
-    local list = incidents[kind]
+    local list = incidents
     local total = 0.0
 
     for i = #list, 1, -1 do
@@ -82,14 +101,17 @@ end
 -- Public API — reporting
 -------------------------------------------------------------------------------
 
---- An officer has just died. Called once, the cycle death is first observed —
---- client.lua's per-officer loops already check IsPedDeadOrDying every cycle
---- for tasking, so this is a state comparison there, not a new scan here.
+--- An officer has just died. Safe to call every cycle the body is seen —
+--- only the first report for an officer scores.
 function FenixBackup.reportOfficerDown(pedNetID)
     if cfg().enabled == false then return end
-    addIncident('ground', cfg().officerDownScore or 40)
+    if pedNetID == nil or downReported[pedNetID] then return end
+    downReported[pedNetID] = true
+
+    addIncident(cfg().officerDownScore or 40)
+    lastOfficerDownAt = GetGameTimer()
     lastHealth[pedNetID] = nil
-    dbg('officer down, ground score now ' .. ('%.0f'):format(currentScore('ground')))
+    dbg('officer down, score now ' .. ('%.0f'):format(currentScore()))
 end
 
 --- An officer is still alive but has lost health since the last cycle —
@@ -98,32 +120,42 @@ end
 --- callers don't need their own per-ped history table.
 function FenixBackup.reportOfficerHealth(pedNetID, health)
     if cfg().enabled == false then return end
+    if pedNetID == nil or type(health) ~= 'number' then return end
     local prev = lastHealth[pedNetID]
     lastHealth[pedNetID] = health
 
     if prev and health < prev then
-        addIncident('ground', cfg().takingFireScore or 12)
+        addIncident(cfg().takingFireScore or 12)
+        lastTakingFireAt = GetGameTimer()
         dbg(('officer %s taking fire (%d -> %d)'):format(pedNetID, prev, health))
     end
 end
 
 --- Clears the health baseline for an officer who left the roster (reboarded,
 --- despawned, or is a fresh spawn) so their next reading isn't compared
---- against a stale number from a previous life.
+--- against a stale number from a previous life -- and so a later officer who
+--- is handed the same net id can be reported down in their own right.
 function FenixBackup.clearOfficer(pedNetID)
+    if pedNetID == nil then return end
     lastHealth[pedNetID] = nil
+    downReported[pedNetID] = nil
 end
 
 --- The suspect is visibly armed at a wanted level serious enough that it
---- matters. Cheap and idempotent to call every cycle: the score only grows
---- while the condition holds, same as taking fire.
+--- matters. Cheap to call every cycle from anywhere: it scores at most once a
+--- second however many units call it, and only while the condition holds.
 function FenixBackup.reportSuspectArmed(wantedLevel)
     if cfg().enabled == false then return end
     if (wantedLevel or 0) < 3 then return end
 
-    local playerPed = PlayerPedId()
-    if IsPedArmed(playerPed, 7) then -- 7 = any weapon except unarmed/melee-fists
-        addIncident('ground', cfg().suspectArmedScore or 8)
+    local now = GetGameTimer()
+    if (now - lastArmedAt) < 1000 then return end
+
+    -- 6 = explosives + firearms. Not melee: a drawn knife is not what calls in
+    -- extra units.
+    if IsPedArmed(PlayerPedId(), 6) then
+        lastArmedAt = now
+        addIncident(cfg().suspectArmedScore or 8)
     end
 end
 
@@ -139,7 +171,7 @@ function FenixBackup.bonusUnits(kind)
     if cfg().enabled == false then return 0 end
 
     local c = cfg()
-    local score = currentScore(kind)
+    local score = currentScore()
 
     if kind == 'heli' then
         local per = c.scorePerHeliUnit or 40
@@ -152,21 +184,31 @@ function FenixBackup.bonusUnits(kind)
     return math.min(cap, math.floor(score / per))
 end
 
---- Fire the "shots fired, officer down" radio call once a real incident has
---- happened, rate limited so a burst of gunfire doesn't key the radio every
---- cycle — the score itself keeps accumulating underneath regardless.
+--- Fire the backup radio call once a real incident has happened, rate limited
+--- so a burst of gunfire doesn't key the radio every cycle — the score itself
+--- keeps accumulating underneath regardless.
 --- Call this from the same place maintainPoliceUnits() reads bonusUnits(); it
 --- decides on its own whether the moment is actually worth announcing.
+---
+--- Only an officer going down or taking damage is announced, and only one that
+--- happened since the last call: an armed suspect can push the score over a
+--- threshold on its own, and announcing "officer down" for that -- again every
+--- cooldown, for as long as the score stayed up -- had dispatch reporting
+--- casualties nobody had taken.
 function FenixBackup.maybeAnnounce()
     if cfg().enabled == false then return end
     if FenixBackup.bonusUnits('ground') <= 0 and FenixBackup.bonusUnits('heli') <= 0 then return end
 
+    local lastIncidentAt = math.max(lastOfficerDownAt, lastTakingFireAt)
+    if lastIncidentAt == 0 or lastIncidentAt <= lastAnnounceAt then return end
+
     local now = GetGameTimer()
-    if (now - lastAnnounceAt) < (cfg().announceCooldownMs or 20000) then return end
+    if (now - lastIncidentAt) >= (cfg().decayMs or 60000) then return end
+    if lastAnnounceAt ~= 0 and (now - lastAnnounceAt) < (cfg().announceCooldownMs or 20000) then return end
     lastAnnounceAt = now
 
     if FenixPursuit and FenixPursuit.announceBackupRequest then
-        FenixPursuit.announceBackupRequest()
+        FenixPursuit.announceBackupRequest((lastOfficerDownAt >= lastTakingFireAt) and 'officerDown' or 'takingFire')
     end
 end
 
@@ -174,13 +216,16 @@ end
 --- starts from a clean slate rather than inheriting a decaying score from a
 --- pursuit that's already over.
 function FenixBackup.reset()
-    incidents = { ground = {}, heli = {} }
+    incidents = {}
     lastHealth = {}
+    downReported = {}
     lastAnnounceAt = 0
+    lastOfficerDownAt = 0
+    lastTakingFireAt = 0
+    lastArmedAt = 0
 end
 
 RegisterCommand('fenixbackup', function()
-    print(('[FENIX-BACKUP] ground score %.0f (+%d units), heli score %.0f (+%d units)')
-        :format(currentScore('ground'), FenixBackup.bonusUnits('ground'),
-                currentScore('heli'), FenixBackup.bonusUnits('heli')))
+    print(('[FENIX-BACKUP] score %.0f (+%d ground, +%d heli units)')
+        :format(currentScore(), FenixBackup.bonusUnits('ground'), FenixBackup.bonusUnits('heli')))
 end, false)
