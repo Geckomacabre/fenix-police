@@ -30,7 +30,40 @@ end
 
 local lastReportAt = 0
 
+-- "Weapons" that count as shooting without being gunfire. A fire crew
+-- working a blaze with an extinguisher (client/fire.lua), or someone pouring
+-- petrol, trips IS_ANY_PED_SHOOTING_IN_AREA exactly like a gun does -- and
+-- would turn every fire call into a SHOOTING call as well.
+local NOT_GUNFIRE = {
+    [GetHashKey('WEAPON_FIREEXTINGUISHER')] = true,
+    [GetHashKey('WEAPON_PETROLCAN')] = true,
+    [GetHashKey('WEAPON_HAZARDCAN')] = true,
+}
+
+-- True only when someone in the box is seen shooting and every such shooter
+-- holds one of those. A box where no shooter can be picked out still counts
+-- as gunfire, so this can only ever drop a report, never invent one. Height
+-- is ignored on purpose: a wider net here only ever keeps a report.
+local function onlyNonGunfire(coords, radius)
+    local sawNonGunfire = false
+    for _, ped in ipairs(GetGamePool('CPed')) do
+        if IsPedShooting(ped) then
+            local pos = GetEntityCoords(ped)
+            if math.abs(pos.x - coords.x) <= radius and math.abs(pos.y - coords.y) <= radius then
+                if not NOT_GUNFIRE[GetSelectedPedWeapon(ped)] then return false end
+                sawNonGunfire = true
+            end
+        end
+    end
+    return sawNonGunfire
+end
+
 local function checkForGunfire()
+    -- A wanted player never calls gunfire in: mid-pursuit the shots in the box
+    -- are this resource's own officers (or the player shooting back), and each
+    -- report would send an ambulance and an investigation unit into the chase.
+    if GetPlayerWantedLevel(PlayerId()) > 0 then return end
+
     local playerPed = PlayerPedId()
     local coords = GetEntityCoords(playerPed)
     local radius = cfg().radius or 60.0
@@ -46,6 +79,7 @@ local function checkForGunfire()
     local now = GetGameTimer()
     local cooldownMs = cfg().reportCooldownMs or 20000
     if now - lastReportAt < cooldownMs then return end
+    if onlyNonGunfire(coords, radius) then return end
     lastReportAt = now
 
     dbg(('gunfire detected within %.0fm, reporting'):format(radius))

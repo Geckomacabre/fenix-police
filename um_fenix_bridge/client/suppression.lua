@@ -9,7 +9,6 @@ Suppression = {}
 
 local count    = 0
 local sources  = {}  -- key -> true (for debugging)
-local active   = false
 
 --- Bump the counter. Pass a unique key for tracking.
 function Suppression.Add(key)
