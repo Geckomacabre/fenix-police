@@ -63,12 +63,22 @@ local contact = {
     -- in since the last reset", which is what gates tells() entirely.
     outfitSig    = nil,        -- string, drawable+texture ids across every clothing component
     vehicleModel = nil,        -- model hash the player was in when called in, or nil for on foot
+
+    -- Where the player was when the wanted level went up: the location the
+    -- call came from, and all units have to go on until somebody sees them.
+    -- See FenixPursuit.targetCoords().
+    dispatchPos  = nil,
 }
 
 -- Rate limiting for the radio, so a player weaving through traffic doesn't
 -- generate a call every time a wall passes between them and a cruiser.
 local lastDispatchAt = 0
 local lastSpeechAt = 0
+
+-- Game timer of the player's last shot, kept by the shot thread below.
+-- IsPedShooting is only true on the frame a round leaves the barrel, so the
+-- contact tick sampling it every 250ms missed most single shots.
+local lastShotAt = 0
 
 -------------------------------------------------------------------------------
 -- Small helpers
@@ -205,11 +215,39 @@ end
 -- Perception
 -------------------------------------------------------------------------------
 
+--- Is another vehicle between this officer and the player?
+---
+--- A separate probe rather than adding vehicles (2) to the LOS flags below:
+--- with vehicles in the mask the ray stops on the officer's own car and on the
+--- car the player is sitting in, and nothing would ever be seen again. Here the
+--- officer's car is excluded outright, and a hit on the player's own car (or
+--- anything right where the player is) counts as reaching them. A car right
+--- beside the officer doesn't count either: that's an officer on foot using
+--- a car as cover, who looks over or round it, and treating it as a wall
+--- blinded every officer in a shootout at once.
+local function trafficInTheWay(ped, playerPed, pedCoords, playerCoords)
+    local ownVeh = GetVehiclePedIsIn(ped, false)
+    local probe = StartExpensiveSynchronousShapeTestLosProbe(
+        pedCoords.x, pedCoords.y, pedCoords.z + 0.5,
+        playerCoords.x, playerCoords.y, playerCoords.z + 0.3,
+        2, ownVeh, 4)
+    local status, hit, hitCoords, _, entityHit = GetShapeTestResult(probe)
+    if status ~= 2 or not (hit == true or hit == 1) then return false end
+
+    if entityHit ~= 0 and entityHit == GetVehiclePedIsIn(playerPed, false) then return false end
+    if hitCoords then
+        local at = vector3(hitCoords.x, hitCoords.y, hitCoords.z)
+        if #(at - playerCoords) < 3.0 or #(at - pedCoords) < 3.0 then return false end
+    end
+    return true
+end
+
 --- Can this officer see the player right now?
 ---
---- Three gates, cheapest first. Distance rules out most of the set without a
---- trace; the field-of-view test stops an officer facing the other way from
---- "seeing" through the back of their head; only survivors pay for the ray.
+--- Gates cheapest first. Distance rules out most of the set without a trace;
+--- the field-of-view test stops an officer facing the other way from "seeing"
+--- through the back of their head; only survivors pay for the rays (world and
+--- props first, then traffic).
 ---
 --- Air units skip the FOV test on purpose — a helicopter carries a spotter whose
 --- whole job is looking down, and giving them a forward cone makes them useless
@@ -240,22 +278,29 @@ local function canSee(ped, kind, playerPed, playerCoords)
         end
     end
 
-    -- 17 = map + vehicles + objects. The player's own vehicle is ignored by the
-    -- native when the target is its driver, which is what we want.
-    return HasEntityClearLosToEntity(ped, playerPed, 17)
+    -- 17 = map (1) + objects (16): buildings, terrain and props.
+    if not HasEntityClearLosToEntity(ped, playerPed, 17) then return false end
+
+    -- Traffic only hides you from street level; from the air it doesn't.
+    if kind ~= 'ground' or c.vehiclesBlockSight == false then return true end
+    return not trafficInTheWay(ped, playerPed, pedCoords, playerCoords)
 end
 
 --- Noise reveals. Firing a weapon inside earshot of a unit hands your position
 --- back no matter how good the cover is, which is both realistic and the reason
 --- shooting your way out of a hiding place should not work.
-local function makingNoise(playerPed, playerCoords)
+local function makingNoise(playerCoords)
     local c = cfg()
     if c.gunfireReveals == false then return false end
-    if not IsPedShooting(playerPed) then return false end
+
+    -- At least two contact ticks wide, so a shot can't fall between them.
+    local window = math.max(500, (c.contactInterval or 250) * 2)
+    if lastShotAt == 0 or (GetGameTimer() - lastShotAt) > window then return false end
 
     local range = c.gunfireRange or 120.0
     for ped in pairs(observers) do
-        if DoesEntityExist(ped) and #(GetEntityCoords(ped) - playerCoords) < range then
+        if DoesEntityExist(ped) and not IsPedDeadOrDying(ped, true)
+            and #(GetEntityCoords(ped) - playerCoords) < range then
             return true
         end
     end
@@ -321,8 +366,9 @@ end
 -------------------------------------------------------------------------------
 
 --- Register (or refresh) an officer as somebody who can see for the pursuit.
---- Called from client.lua's chase loops every cycle. Entries not refreshed
---- inside `observerTimeout` are dropped, so a deleted officer removes itself.
+--- Called from client.lua's chase loops every cycle. An entry not refreshed
+--- inside `observerTimeout` loses its blip but keeps looking; a deleted or
+--- dead officer drops out of the set on its own.
 --- @param kind string 'ground' | 'heli' | 'air'
 function FenixPursuit.noteObserver(ped, kind)
     if not ped or ped == 0 or not DoesEntityExist(ped) then return end
@@ -379,7 +425,10 @@ function FenixPursuit.targetCoords(playerCoords)
     if cfg().enabled == false then return playerCoords, true end
     if contact.active then return playerCoords, true end
     if contact.lastKnown then return contact.lastKnown, false end
-    return playerCoords, false
+    -- Normally snapshotted by the contact thread the tick the wanted level
+    -- goes up; taken here instead if a unit asks first.
+    if not contact.dispatchPos then contact.dispatchPos = playerCoords end
+    return contact.dispatchPos, false
 end
 
 --- How far out units should be sweeping. Grows while contact stays lost, so a
@@ -418,7 +467,10 @@ end
 --- the search is called off entirely -- standing down is not a reason to
 --- start announcing again, it's the opposite.
 function FenixPursuit.sirenWanted()
-    if cfg().quietSearch == false then return true end
+    -- With perception off nothing ever sets contact.active, so it has to be
+    -- answered here or every siren stays muted for good -- same reasoning as
+    -- hasContact() above.
+    if cfg().enabled == false or cfg().quietSearch == false then return true end
     return contact.active
 end
 
@@ -468,9 +520,11 @@ function FenixPursuit.reset()
     contact.vehicleDesc  = nil
     contact.outfitSig    = nil
     contact.vehicleModel = nil
+    contact.dispatchPos  = nil
 
     lastDispatchAt = 0
     lastSpeechAt = 0
+    lastShotAt = 0
 end
 
 --- Opening radio call, made once per pursuit, but on the first REAL
@@ -537,13 +591,18 @@ end
 
 --- Radio call for a genuine incident-driven escalation — see
 --- client/backup.lua's FenixBackup, which decides WHEN this is warranted
---- (officer down, officer taking fire, an armed suspect) as opposed to
---- announceReinforcement's plain "still evading, been a while" clock. Forced
---- for the same reason the other escalations here are: rare, and should
---- always cut through whatever else is on the radio that second.
-function FenixPursuit.announceBackupRequest()
+--- (officer down, officer taking fire) as opposed to announceReinforcement's
+--- plain "still evading, been a while" clock. Forced for the same reason the
+--- other escalations here are: rare, and should always cut through whatever
+--- else is on the radio that second.
+--- @param kind string|nil 'officerDown' | 'takingFire'
+function FenixPursuit.announceBackupRequest(kind)
     if cfg().enabled == false then return end
-    dispatch('Shots fired, officer down! All units respond.', true)
+    if kind == 'takingFire' then
+        dispatch('Officer under attack, requesting backup.', true)
+    else
+        dispatch('Shots fired, officer down! All units respond.', true)
+    end
 end
 
 --- Radio call for a unit disengaging — see client/morale.lua's FenixMorale,
@@ -557,11 +616,17 @@ end
 
 --- Radio call for a jurisdiction handoff — see client/jurisdiction.lua's
 --- FenixJurisdiction, which detects the player crossing from one agency's
---- ground into another's mid-pursuit.
-function FenixPursuit.announceHandoff(fromRegion, toRegion)
+--- ground into another's mid-pursuit. Takes agency names
+--- (FenixJurisdiction.agencyOf), never region keys.
+function FenixPursuit.announceHandoff(fromAgency, toAgency)
     if cfg().enabled == false then return end
-    dispatch(('Suspect crossing into %s — responding units, expect a jurisdiction handoff.')
-        :format(tostring(toRegion or 'a neighbouring jurisdiction')), true)
+    local msg = ('Suspect entering %s jurisdiction'):format(tostring(toAgency or 'a neighbouring'))
+    if fromAgency then
+        msg = msg .. (' — %s units, expect a handoff.'):format(tostring(fromAgency))
+    else
+        msg = msg .. ' — responding units, expect a handoff.'
+    end
+    dispatch(msg, true)
 end
 
 -------------------------------------------------------------------------------
@@ -578,11 +643,36 @@ CreateThread(function()
         local c = cfg()
         local interval = c.contactInterval or 250
 
-        if c.enabled == false or next(observers) == nil then
+        local wanted = GetPlayerWantedLevel(PlayerId())
+        if c.enabled ~= false then
+            if wanted > 0 then
+                if not contact.dispatchPos then
+                    -- The wanted level just went up: this is where the call
+                    -- came from, and where units head until somebody actually
+                    -- sees the player.
+                    contact.dispatchPos = GetEntityCoords(PlayerPedId())
+                end
+            elseif not contact.everSeen then
+                -- Came and went before anyone saw them; the next wanted level
+                -- is a new call from wherever it happens.
+                contact.dispatchPos = nil
+            end
+        end
+
+        -- With nobody registered as eyes there is still work to do while a
+        -- pursuit that has had contact is live: contact has to be able to
+        -- LAPSE once every unit is dead or gone. Skipping the state machine
+        -- entirely froze it -- hasContact() stayed true forever, the search
+        -- never started or gave up, and road tactics kept deploying against a
+        -- suspect nobody could see.
+        local noEyes = next(observers) == nil
+        if c.enabled == false or (noEyes and not (contact.everSeen and wanted > 0)) then
             -- Nothing is chasing you: idle at a slower tick rather than paying
             -- for a perception pass over an empty set several times a second.
             interval = 500
         else
+            if noEyes then interval = 500 end
+
             local playerPed = PlayerPedId()
             local playerCoords = GetEntityCoords(playerPed)
             local now = GetGameTimer()
@@ -591,7 +681,8 @@ CreateThread(function()
             local seen = false
 
             for ped, entry in pairs(observers) do
-                if (now - entry.seenAt) > timeout or not DoesEntityExist(ped) then
+                local stale = (now - entry.seenAt) > timeout
+                if not DoesEntityExist(ped) or (stale and IsPedDeadOrDying(ped, true)) then
                     clearBlip(ped)
                     observers[ped] = nil
                 elseif IsPedDeadOrDying(ped, true) then
@@ -605,16 +696,30 @@ CreateThread(function()
                         entry.blip = false
                     end
                 else
-                    updateBlip(ped, entry, c)
-                    if canSee(ped, entry.kind, playerPed, playerCoords) then
+                    if stale then
+                        -- No longer refreshed: client.lua has handed this
+                        -- officer's unit to something other than the chase --
+                        -- a foot chase, an arrest, a traffic stop, a retreat.
+                        -- Off the map, but still a pair of eyes until dead or
+                        -- gone. Dropping them made contact lapse ("lost
+                        -- visual") with an officer standing beside the player
+                        -- once every unit on scene was busy like that.
+                        if entry.blip then
+                            clearBlip(ped)
+                            entry.blip = false
+                        end
+                    else
+                        updateBlip(ped, entry, c)
+                    end
+                    -- No break once somebody sees: the loop still has to prune
+                    -- and blip the rest, it just stops paying for their rays.
+                    if not seen and canSee(ped, entry.kind, playerPed, playerCoords) then
                         seen = true
-                        -- No break: the loop still has to prune the rest, and
-                        -- the set is at most a dozen peds.
                     end
                 end
             end
 
-            if not seen and makingNoise(playerPed, playerCoords) then
+            if not seen and makingNoise(playerCoords) then
                 seen = true
             end
 
@@ -686,11 +791,11 @@ CreateThread(function()
                 -- the wanted level itself -- a full FenixPursuit.reset() only
                 -- happens once the level decays to 0. Deliberately NOT
                 -- clearing lastKnown: targetCoords() falls back to the
-                -- player's LIVE coords once lastKnown is nil, which would
-                -- make units omniscient again right when they're supposed to
-                -- be standing down. They keep sitting on the stale last-known
-                -- point (already the existing idle behaviour once a search
-                -- goes cold) instead.
+                -- original dispatch position once lastKnown is nil, which
+                -- would send every unit back to where the call first came
+                -- from right when they're supposed to be standing down. They
+                -- keep sitting on the stale last-known point (already the
+                -- existing idle behaviour once a search goes cold) instead.
                 contact.gaveUp = true
                 dispatch('No visual, no leads. Units resuming patrol.')
                 dbg('search called off')
@@ -698,6 +803,20 @@ CreateThread(function()
         end
 
         Wait(interval)
+    end
+end)
+
+-- Shots, sampled every frame -- see lastShotAt. Only while somebody is
+-- registered to hear them, which is the only time makingNoise() asks.
+CreateThread(function()
+    while true do
+        local c = cfg()
+        if c.enabled ~= false and c.gunfireReveals ~= false and next(observers) ~= nil then
+            if IsPedShooting(PlayerPedId()) then lastShotAt = GetGameTimer() end
+            Wait(0)
+        else
+            Wait(500)
+        end
     end
 end)
 

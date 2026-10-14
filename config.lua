@@ -1332,8 +1332,13 @@ Config.Morale = {
 
     -- How long a regrouped unit sits out before it's eligible to rejoin the
     -- fight (if the player is still in the area) or is released for
-    -- maintainPoliceUnits to replace with a fresh unit.
+    -- maintainPoliceUnits to replace with a fresh unit. A unit that is still
+    -- broken when this runs out (casualties don't heal) is the one released.
     regroupSeconds = 35,
+
+    -- Minimum time between two "unit disengaging" radio calls, in ms. Several
+    -- units breaking in the same exchange of fire is one call, not one each.
+    announceCooldownMs = 15000,
 }
 
 
@@ -1445,6 +1450,13 @@ Config.Pursuit = {
     sightRange = 90.0,
     sightFov   = 160.0,
 
+    -- Other vehicles block a ground officer's view: a bus or a truck between
+    -- you and a cruiser hides you the same way a wall does. A car within a
+    -- few metres of the officer (the one they're taking cover behind) or of
+    -- you doesn't count. Air crews look down over traffic and are unaffected.
+    -- Set false to let officers see through traffic.
+    vehiclesBlockSight = true,
+
     -- Air crews. No cone: a helicopter carries a spotter whose entire job is
     -- looking down, and giving them a forward arc makes them useless at the one
     -- thing they exist for. This is what stops you breaking contact by turning a
@@ -1490,9 +1502,10 @@ Config.Pursuit = {
     -- wants to hear the street, not announce itself to it.
     quietSearch = true,
 
-    -- An officer who stops being refreshed by the chase loop for this long is
-    -- dropped from the perception set. This is how a deleted officer removes
-    -- itself without client.lua having to say so.
+    -- An officer who stops being refreshed by the chase loop for this long
+    -- (their unit is busy with a foot chase, an arrest, a stop or a retreat)
+    -- loses their blip but can still see you. A deleted or dead officer drops
+    -- out of the perception set without client.lua having to say so.
     observerTimeout = 4000,
 
     -- AI blips on responding officers, with the view cone that shows what each
@@ -1707,6 +1720,12 @@ Config.Tactics = {
     -- where possible, which is the difference between an obstacle and an ambush.
     placementAttempts = 12,
 
+    -- A spot ahead only counts as on the player's route if driving there is at
+    -- most this many times the straight-line distance. Catches the parallel
+    -- street, the crossing road and the overpass that happen to lie ahead in a
+    -- straight line. 0 disables the check.
+    routeRatio = 1.5,
+
     -- ── Sustained pursuit ───────────────────────────────────────────────────
     -- Road tactics used to be gated on wanted level alone, which meant a
     -- 2-star chase that just kept running for ten minutes never once saw a
@@ -1782,6 +1801,15 @@ Config.Roads = {
     --   'inner'   lane nearest the centre line.
     --   'random'  any lane travelling the right way.
     lanePreference = 'outer',
+
+    -- Lay out a two-way road's lanes outward from the gap between its two
+    -- directions (GET_CLOSEST_ROAD's last output) instead of centring the whole
+    -- lane set on the road's centre line. The two only differ on roads with a
+    -- median or an uneven lane split (2 one way, 1 the other), where the
+    -- centred layout can put a unit or a roadblock on the centre line or the
+    -- median. Off by default until checked on your map: `/fenixroads here`
+    -- prints both layouts for the road you are standing on.
+    medianAwareLanes = false,
 
     -- How far past the outermost lane a *parked* scene sits (radar traps,
     -- traffic stops), in metres from the edge of the carriageway. Because it is
@@ -2008,11 +2036,27 @@ Config.Jurisdiction = {
         -- },
     },
 
-    -- Units belonging to the outgoing region run through the same
-    -- Retreating/Regrouping states Config.Morale drives (client/morale.lua) --
-    -- "not my jurisdiction anymore" and "we're beaten" both mean "this unit
-    -- stops engaging and heads for its own turf", just with a different radio
-    -- line (FenixPursuit.announceHandoff).
+    -- Which agency polices each region key. Crossing between two regions of
+    -- the SAME agency (Paleto -> Sandy Shores, both the Sheriff) is not a
+    -- handoff at all. These names are also what the handoff radio call says.
+    -- A region not listed here (e.g. a custom zone's own region) counts as its
+    -- own agency.
+    agencies = {
+        losSantos   = 'LSPD',
+        paletoBay   = 'Sheriff',
+        sandyShores = 'Sheriff',
+        countryside = 'Sheriff',
+    },
+
+    -- How long, in ms, the player has to stay in the new region before a
+    -- crossing counts. Roads that run along a boundary cross it every few
+    -- seconds; without this every wobble was a handoff.
+    dwellMs = 8000,
+
+    -- Radio call on a confirmed handoff (FenixPursuit.announceHandoff). The
+    -- outgoing agency's units are released one at a time as the incoming
+    -- agency's units arrive, so the response swaps over a car at a time
+    -- rather than everyone turning round at the line.
     handoffRadio = true,
 }
 

@@ -69,9 +69,9 @@ function FenixFramework.Notify(msg, notifyType, duration)
         if ok then return end
     end
 
-    BeginTextCommandThefeed('STRING')
+    BeginTextCommandThefeedPost('STRING')
     AddTextComponentSubstringPlayerName(msg)
-    EndTextCommandThefeed('CHAR_DEFAULT', true, true)
+    EndTextCommandThefeedPostTicker(false, true)
 end
 
 --- Raw framework player data (job, metadata, ...), or nil standalone.
@@ -82,21 +82,31 @@ function FenixFramework.GetPlayerData()
     return nil
 end
 
---- Nearest vehicle to `coords` within `maxDistance`, or nil.
---- Uses qb-core/qbx_core's own call when present (matches its own
---- entity-pool filtering), otherwise walks the native vehicle pool.
+--- Is any player sitting in this vehicle?
+local function hasPlayerAboard(veh)
+    for seat = -1, GetVehicleMaxNumberOfPassengers(veh) - 1 do
+        local ped = GetPedInVehicleSeat(veh, seat)
+        if ped ~= 0 and IsPedAPlayer(ped) then return true end
+    end
+    return false
+end
+
+--- Nearest vehicle to `coords` within `maxDistance` that an officer could take,
+--- or nil. Always the native pool: qb-core's GetClosestVehicle takes a vehicle
+--- list, not a distance, and has no notion of which cars are off limits.
+---
+--- Wrecks, the local player's own (last driven) car and any vehicle with a
+--- player aboard are skipped -- the callers task an officer to commandeer the
+--- result, and that must never mean dragging a player out of their own car.
 function FenixFramework.GetClosestVehicle(coords, maxDistance)
     maxDistance = maxDistance or 100.0
-
-    if core and core.Functions and core.Functions.GetClosestVehicle then
-        local ok, veh = pcall(function() return core.Functions.GetClosestVehicle(coords, maxDistance, false) end)
-        if ok and veh and veh ~= 0 then return veh end
-    end
+    local playersCar = GetVehiclePedIsIn(PlayerPedId(), true)
 
     local closest, closestDist = nil, maxDistance
     for _, veh in ipairs(GetGamePool('CVehicle')) do
         local dist = #(coords - GetEntityCoords(veh))
-        if dist < closestDist then
+        if dist < closestDist and veh ~= playersCar and not IsEntityDead(veh)
+            and not hasPlayerAboard(veh) then
             closest, closestDist = veh, dist
         end
     end
