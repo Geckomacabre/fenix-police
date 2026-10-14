@@ -1,0 +1,30 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  luacheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install luacheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lua5.4 liblua5.4-dev luarocks
+          sudo luarocks --lua-version 5.4 install luacheck
+
+      - name: Cache FiveM native lists
+        uses: actions/cache@v4
+        with:
+          path: .luacheck
+          key: luacheck-natives-${{ hashFiles('tools/lint.sh') }}
+
+      - name: luacheck
+        run: tools/lint.sh

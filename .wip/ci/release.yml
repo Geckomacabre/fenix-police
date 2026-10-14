@@ -1,0 +1,52 @@
+name: Release packages
+
+# Attaches drop-in zips to every published release, so a server owner can
+# download something that goes straight into resources/ instead of a source
+# archive full of tooling. Two zips, because um_fenix_bridge is its own
+# resource: FiveM never discovers a resource nested inside another one, so it
+# has to be extracted next to fenix-police, not inside it.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to (re)build packages for
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Build zips
+        run: |
+          set -euo pipefail
+          mkdir -p dist/fenix-police dist/um_fenix_bridge
+
+          # The resource itself: runtime files plus the docs a server owner
+          # needs. No lint tooling, CI config, README screenshots, or the
+          # nested bridge (shipped separately below).
+          cp -r client server shared data dist/fenix-police/
+          cp fxmanifest.lua config.lua config.local.example.lua LICENSE \
+             README.md FORK-CHANGELOG.md UPSTATE_PATCHES.md changelog.md \
+             dist/fenix-police/
+          cp -r um_fenix_bridge/. dist/um_fenix_bridge/
+          cp LICENSE dist/um_fenix_bridge/
+
+          (cd dist && zip -qr "fenix-police-$TAG.zip" fenix-police)
+          (cd dist && zip -qr "um_fenix_bridge-$TAG.zip" um_fenix_bridge)
+          ls -la dist/*.zip
+
+      - name: Upload to the release
+        run: gh release upload "$TAG" dist/*.zip --clobber --repo "$GITHUB_REPOSITORY"
