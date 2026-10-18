@@ -660,7 +660,8 @@ Config.Ambient = {
         chance      = 0.75,      -- odds the call gets a response at all
         reportDelay = { 6, 12 }, -- seconds from the getaway to the call
         reuseRadius = 300.0,     -- metres from the stolen car a patrol/convoy can be sent from
-        chasers     = { 1, 2 },  -- cruisers sent when no patrol is close enough (at most 3)
+        chasers     = { 1, 2 },  -- cruisers sent when no patrol is close enough (at most 3;
+                                 -- 0 sends none, so only a patrol already nearby answers)
     },
 
     -- Vehicles used for ambient units, by region key (see Config.ZoneEnum).

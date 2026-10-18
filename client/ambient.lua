@@ -14,7 +14,10 @@
       post     fixed point  officers on foot playing scenarios at a station
       stop     procedural   NPC pulled over, officer writing at the window
       patrol   procedural   cruiser driving a normal route, no siren
+      convoy   procedural   two or three cruisers travelling together
       pursuit  procedural   NPC fleeing, cruisers chasing with sirens
+      carjack  procedural   driver dragged out; the victim calls it in and
+                            the getaway becomes a pursuit
 ]]
 
 local scenes = {}       -- sceneId -> scene record
@@ -1005,7 +1008,10 @@ local function addChaser(scene, suspect, pos, heading)
     SetVehicleEngineOn(copVeh, true, true, false)
     trackPed(scene, cop, true, copVeh)
     SetPedIntoVehicle(cop, copVeh, -1)
-    joinChase(cop, copVeh, suspect)
+    -- The model loads above can wait, and a scene torn down meanwhile has
+    -- already deleted its suspect. The unit is still on the scene's books
+    -- either way, so whatever ends the scene cleans it up.
+    if DoesEntityExist(suspect) then joinChase(cop, copVeh, suspect) end
     return copVeh
 end
 
@@ -1106,11 +1112,6 @@ local function advancePursuit(scene)
     local p = scene.pursuit
     if not p then return end
 
-    if not DoesEntityExist(p.suspect) then
-        scene.pursuit = nil
-        return
-    end
-
     local now = GetGameTimer()
     local elapsed = now - p.since
 
@@ -1155,6 +1156,28 @@ local function advancePursuit(scene)
         scene.releaseOnTeardown = true
         scene.expiresAt = now + (cfg().stopDepartureSeconds or 25) * 1000
         scene.pursuit = nil
+    end
+
+    -- Nobody left to chase or arrest. Dropping the pursuit on its own used to
+    -- leave its officers armed for radar, with nothing but the scene's
+    -- lifetime to end it; they stand down like after any other chase.
+    if not DoesEntityExist(p.suspect) then
+        driveOff()
+        return
+    end
+
+    -- While it is still a car chase, the suspect going down ends it, and so
+    -- does a player taking the car off them. Otherwise the endings below play
+    -- an arrest over a body, or halt the car and kill its engine with a player
+    -- at the wheel. A player who takes it is a car thief for the wanted
+    -- system, never someone an ambient unit chases.
+    if p.phase == 'responding' or p.phase == 'fleeing' then
+        local driver = DoesEntityExist(p.veh) and GetPedInVehicleSeat(p.veh, -1) or 0
+        if not isStanding(p.suspect) or (driver ~= 0 and IsPedAPlayer(driver)) then
+            dbg(('%s scene #%d: chase over, suspect down or car taken'):format(scene.kind, scene.id))
+            driveOff()
+            return
+        end
     end
 
     if p.phase == 'responding' then
@@ -1429,11 +1452,13 @@ local function spawnCarjack(playerCoords)
     return commitScene(scene, true)
 end
 
---- A `{ min, max }` config range, or a single number, as its two ends.
+--- A `{ min, max }` config range, or a single number, as its two ends. A
+--- table with only its first entry is that one value; anything unusable
+--- falls back to `lo`/`hi`.
 local function rangeOf(value, lo, hi)
     if type(value) == 'number' then return value, value end
-    if type(value) == 'table' then
-        lo = tonumber(value[1]) or lo
+    if type(value) == 'table' and tonumber(value[1]) then
+        lo = tonumber(value[1])
         hi = tonumber(value[2]) or lo
     end
     if hi < lo then hi = lo end
@@ -1441,8 +1466,8 @@ local function rangeOf(value, lo, hi)
 end
 
 --- The nearest patrol or convoy free to take a call near `pos`: an officer at
---- the wheel of their own car within `radius`, in a scene that isn't already
---- chasing, stopping, enforcing, leaving or being promoted.
+--- the wheel of their own car, still drivable, within `radius`, in a scene
+--- that isn't already chasing, stopping, enforcing, leaving or being promoted.
 local function freePatrolNear(pos, radius)
     local best, bestCop, bestVeh
     local bestDist = radius
@@ -1451,7 +1476,8 @@ local function freePatrolNear(pos, radius)
             and not scene.enforcing and not scene.playerStop and not scene.chase
             and not scene.stop and not scene.releaseOnTeardown and not scene.promoting then
             local cop, copVeh = leadCop(scene)
-            if cop and copVeh and GetPedInVehicleSeat(copVeh, -1) == cop then
+            if cop and copVeh and GetPedInVehicleSeat(copVeh, -1) == cop
+                and IsVehicleDriveable(copVeh, false) then
                 local d = #(GetEntityCoords(copVeh) - pos)
                 if d <= bestDist then
                     best, bestCop, bestVeh, bestDist = scene, cop, copVeh, d
@@ -1467,9 +1493,13 @@ end
 local RESPONSE_SPAWN_MIN, RESPONSE_SPAWN_MAX = 60.0, 140.0
 
 --- The victim's call about a carjacking. If it's answered, a patrol already
---- nearby takes it, or one to three cruisers are sent from out of sight, and
+--- nearby takes it, or up to three cruisers are sent from out of sight, and
 --- the scene becomes an NPC pursuit that advancePursuit plays out to the same
 --- arrest as any other. Returns true when units were sent, else false and why.
+---
+--- The carjacker here is always the scene's own NPC. Nothing in this goes
+--- near the wanted system: a player is never the one chased, and never gets
+--- a star from it.
 local function respondToCarjack(scene, cj, nearbyCops)
     local c = cfg()
     local rc = c.carjackResponse or {}
@@ -1484,12 +1514,15 @@ local function respondToCarjack(scene, cj, nearbyCops)
     -- in the middle of the player's own pursuit only muddies it.
     if GetPlayerWantedLevel(PlayerId()) > 0 then return false, 'player is wanted' end
     if not isStanding(cj.victim) then return false, 'nobody left to call it in' end
+    -- The suspect must still have the car. Pulled out of it — by a player as
+    -- much as anyone — there is no getaway left for this call to be about.
     if not isStanding(cj.suspect) or GetPedInVehicleSeat(cj.veh, -1) ~= cj.suspect
         or not IsVehicleDriveable(cj.veh, false) then
         return false, 'getaway already over'
     end
     local carPos = GetEntityCoords(cj.veh)
-    if #(carPos - GetEntityCoords(PlayerPedId())) > (c.nearbyRadius or 260.0) then
+    local playerPos = GetEntityCoords(PlayerPedId())
+    if #(carPos - playerPos) > (c.nearbyRadius or 260.0) then
         return false, 'too far from the player to be seen'
     end
     if math.random() >= (tonumber(rc.chance) or 0.75) then return false, 'chance roll' end
@@ -1508,21 +1541,31 @@ local function respondToCarjack(scene, cj, nearbyCops)
         joinChase(cop, copVeh, cj.suspect)
         dbg(('carjack scene #%d: %s scene #%d took the call'):format(scene.id, patrol.kind, patrol.id))
     else
+        -- At most three: a response, not a roadblock. 0 sends nobody, so only
+        -- a patrol already in the area ever takes the call.
+        local lo, hi = rangeOf(rc.chasers, 1, 2)
+        lo = math.max(0, math.min(math.floor(lo), 3))
+        hi = math.max(lo, math.min(math.floor(hi), 3))
+        local count = math.random(lo, hi)
+        if count < 1 then return false, 'no patrol nearby, and none sent' end
         -- Spawned officers count against the same area budget as any scene;
         -- reusing a patrol above adds none.
-        local lo, hi = rangeOf(rc.chasers, 1, 2)
-        local count = math.random(math.floor(lo), math.floor(hi))
-        -- A response, not a roadblock.
-        count = math.min(math.max(count, 1), 3, (c.maxNearbyCops or 6) - (nearbyCops or 0))
+        count = math.min(count, (c.maxNearbyCops or 6) - (nearbyCops or 0))
         if count < 1 then return false, 'no officers left in the area budget' end
 
         local avoidVisible = c.avoidVisibleSpawns ~= false
+        local minFromPlayer = c.minSpawnDistance or 70.0
         local pos, heading = FenixRoads.findSpawnPoint(carPos, {
             minDistance  = RESPONSE_SPAWN_MIN,
             maxDistance  = RESPONSE_SPAWN_MAX,
             attempts     = c.nodeSamples or 10,
             towards      = carPos,
             avoidVisible = avoidVisible,
+            -- The ring is around the car, and the player can be anywhere in
+            -- it. Out of view is not enough on its own — a cruiser that
+            -- appears just behind them is seen the moment they turn round —
+            -- so it keeps the same distance from them as any scene's spawn.
+            reject       = function(p) return #(p - playerPos) < minFromPlayer end,
             -- Created on the spot: there is no spawn in flight to keep clear of.
             reserve      = false,
         })
@@ -1531,6 +1574,9 @@ local function respondToCarjack(scene, cj, nearbyCops)
         local lead = addChaser(scene, cj.suspect, pos, heading)
         if not lead then return false, 'unit failed to spawn' end
         for i = 2, count do
+            -- Spawning the one before may have waited on a model load: once
+            -- the scene is gone there is no lead car left to line up behind.
+            if scenes[scene.id] ~= scene or not DoesEntityExist(lead) then break end
             -- Nose to tail behind the first, the way a pursuit's chasers
             -- start. Only the first spot was vetted, so each one after it gets
             -- the same emptiness and out-of-view test before anything appears.
@@ -2464,6 +2510,21 @@ local function cullScene(scene, playerCoords, now)
     local lead = (e and DoesEntityExist(e.copVeh)) and e.copVeh or scene.vehicles[1]
     if lead and DoesEntityExist(lead) then reference = GetEntityCoords(lead) end
 
+    -- Same problem for a chase, which is spread out: units sent after a
+    -- carjacker start well away from the stolen car, so one can be right by
+    -- the player, in view, while the getaway is already past cleanupDistance.
+    -- While the chase runs, the scene is wherever its nearest car is.
+    if scene.pursuit then
+        local best = #(reference - playerCoords)
+        for _, veh in ipairs(scene.vehicles) do
+            if DoesEntityExist(veh) then
+                local pos = GetEntityCoords(veh)
+                local d = #(pos - playerCoords)
+                if d < best then reference, best = pos, d end
+            end
+        end
+    end
+
     local tooFar = #(reference - playerCoords) > (c.cleanupDistance or 320.0)
     local expired = scene.expiresAt and now > scene.expiresAt
 
@@ -2821,11 +2882,16 @@ RegisterCommand('ambientpolice', function(_, args)
             state = 'conducting a stop'
         elseif scene.enforcing then
             state = 'already triggered a pursuit'
+        elseif scene.pursuit then
+            -- Not armed either: see isArmed. 'responding' is units still on
+            -- their way to a carjacking.
+            state = ('chasing a suspect (%s)'):format(tostring(scene.pursuit.phase))
+        elseif scene.carjack then
+            state = scene.carjack.reportAt and 'carjacking, not called in yet' or 'carjacking'
         elseif scene.cops == 0 or not observerOf(scene) then
             state = 'no officer to enforce'
-        elseif scene.pursuit or scene.releaseOnTeardown then
-            -- Not armed either: see isArmed.
-            state = 'busy (chasing a suspect, or leaving)'
+        elseif scene.releaseOnTeardown then
+            state = 'busy (leaving)'
         elseif scene.radarSpeed then
             state = ('armed at %.0f mph (authored)'):format(scene.radarSpeed)
         elseif scene.kind == 'radar' then
