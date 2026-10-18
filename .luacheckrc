@@ -83,7 +83,7 @@ globals = {
     'ApplyWantedLevel', 'SetWantedLevel', 'IsVehicleStuck', 'MonitorVehicle',
     'GetVehicleUnstuck', 'GetPedsOutOfVehicle', 'PromoteAmbientUnit',
     'PromoteAmbientUnitForInvestigation', 'EffectiveSpawnWantedLevel',
-    'ReleaseAllBreachShields', 'triggerArrest', 'IsCopPed',
+    'ReleaseAllBreachShields', 'triggerArrest',
 
     -- client/ambient.lua
     'ClaimNearbyPatrolForInvestigation',

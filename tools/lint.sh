@@ -5,7 +5,8 @@
 #   tools/lint.sh FILE...          lint only these files
 #   tools/lint.sh --no-color ...   luacheck options pass straight through
 #
-# Needs: luacheck (`luarocks install luacheck`), npm, tar.
+# Needs: luacheck (`luarocks install luacheck`), npm, tar, and luac5.4 for the
+# compile check.
 #
 # The native lists are generated once into .luacheck/ (gitignored) from the
 # @citizenfx/client and @citizenfx/server npm typings. Pinned, so a lint run
@@ -49,4 +50,23 @@ done
 if [[ ${#files[@]} -eq 0 ]]; then
     mapfile -t files < <(git ls-files '*.lua')
 fi
-exec luacheck "${opts[@]}" "${files[@]}"
+
+# luacheck parses but never compiles, so it can't see a compiler limit: the
+# 200 locals a function may have in scope at once, which client.lua's top
+# level once crossed with luacheck still reporting it clean. FiveM's runtime
+# is Lua 5.4 (lua54 'yes' in both manifests), so compile with 5.4.
+status=0
+luac=$(command -v luac5.4 || true)
+if [[ -z $luac ]] && command -v luac >/dev/null && luac -v 2>&1 | grep -q 'Lua 5\.4'; then
+    luac=$(command -v luac)
+fi
+if [[ -n $luac ]]; then
+    for f in "${files[@]}"; do
+        "$luac" -p "$f" || status=1
+    done
+else
+    echo 'lint: luac5.4 not found, skipping the compile check' >&2
+fi
+
+luacheck "${opts[@]}" "${files[@]}" || status=$?
+exit "$status"
