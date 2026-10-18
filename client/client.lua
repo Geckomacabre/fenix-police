@@ -4190,7 +4190,7 @@ local function drawBigWord(word, r, g, b, subtitle)
         SetTextEdge(1, 0, 0, 0, 160)
         SetTextEntry('STRING')
         AddTextComponentString(subtitle)
-        DrawText(0.5, 0.535)
+        DrawText(0.5, 0.56)
     end
 end
 

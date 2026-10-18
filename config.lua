@@ -1024,8 +1024,8 @@ Config.ArrestSystem = {
 
     -- The felony stop. While one officer walks over, the units holding back
     -- pull up and their officers get out and cover you from beside their
-    -- cars -- weapons on you, nobody firing -- until the arrest starts, or
-    -- the surrender ends and they get back in. A unit gets out once its car
+    -- cars -- weapons on you, nobody firing -- until you're in cuffs, or the
+    -- surrender ends and they get back in. A unit gets out once its car
     -- has stopped within `distance` metres of you; an officer already on foot
     -- that close covers from where they are. enabled = false keeps everyone
     -- seated and holding, as before.
