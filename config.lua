@@ -959,6 +959,17 @@ Config.ArrestSystem = {
     -- what keeps the pursuit loop intact instead of emptying every car at once.
     approachDistance = 35.0,
     arrestDistance = 2.0,          -- How close an officer must be to trigger arrest (metres)
+    -- Every other unit pulls up and waits this far from you (metres), holding
+    -- fire, while one officer from the arresting unit walks over. Kept inside
+    -- approachDistance, so one of them can take over if the arresting unit
+    -- drops out.
+    holdDistance = 25.0,
+
+    -- How long (ms) you can stand with your hands up with nobody taking you
+    -- in -- every unit far off, searching or retreating -- before your hands
+    -- come down and the pursuit carries on, with this notification.
+    surrenderTimeoutMs = 90000,
+    surrenderTimeoutMessage = 'Nobody came to take you in. Your hands are down.',
 
     -- How long the BUSTED screen holds, in REAL milliseconds. This is measured
     -- with GetNetworkTime rather than GetGameTimer, because the cinematic runs at
