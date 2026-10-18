@@ -1658,13 +1658,18 @@ Config.Driving = {
     -- Speed while sweeping a search area. Slow: they are looking, not chasing.
     searchSpeed = 16.0,
 
-    -- [Upstate Mafia] Half of the units still in the direct-response phase
-    -- (see applyGroundPursuitTask in server/server.lua) drive to a point this
-    -- far ahead of the player's current velocity instead of their live
-    -- position, so a response reads as officers cutting you off rather than
-    -- every unit converging from the same direction. Ignored below
-    -- interceptMinSpeed (m/s) -- leading a target that isn't meaningfully
-    -- moving just means driving to nowhere.
+    -- INTERCEPTORS --
+    -- Every other ground unit to join a pursuit is an interceptor. While
+    -- somebody can see the suspect and they are moving faster than
+    -- interceptMinSpeed (m/s), an interceptor not yet inside
+    -- chaseEnterDistance drives to the road interceptLeadDistance metres
+    -- ahead of where the suspect is heading instead of to the suspect, so a
+    -- response reads as officers cutting you off rather than every unit
+    -- converging from behind. Slower than that, leading the target just
+    -- means driving to nowhere, so it tails like everyone else; once close it
+    -- joins the chase proper. Re-pathed no more often than repathIntervalMs,
+    -- like any other drive-to. Set interceptors = false and every unit tails.
+    interceptors          = true,
     interceptLeadDistance = 70.0,
     interceptMinSpeed     = 4.0,
 

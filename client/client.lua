@@ -1171,6 +1171,24 @@ end
 -- forth every few seconds. Cleared when the pursuit ends.
 local respondingAgency = nil
 
+--- Whether a ground unit joining the pursuit now should be an interceptor
+--- (Config.Driving.interceptors, see handleChaseBehavior). Alternates by
+--- keeping this client's own working units split evenly, counted from what's
+--- on the road rather than a running toggle: a response that loses its
+--- interceptors to a crash or a retreat evens back out with the next
+--- arrivals instead of staying all tails. The first unit in always tails.
+local function assignInterceptor()
+    local interceptors, tails = 0, 0
+    for vehNetID, unit in pairs(spawnedVehicles) do
+        local leaving = unit.abandoned
+            or (FenixMorale and FenixMorale.isReleased and FenixMorale.isReleased(vehNetID))
+        if unit.clientOwned and not leaving then
+            if unit.interceptor then interceptors = interceptors + 1 else tails = tails + 1 end
+        end
+    end
+    return interceptors < tails
+end
+
 RegisterNetEvent('fenix-police:spawnPoliceUnitClient')
 AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedModels, spawnPoint, spawnHeading, spawnTicket)
     -- Discard in-flight spawns that arrived after handleEndWantedDelete() cleared the gate.
@@ -1303,7 +1321,7 @@ AddEventHandler('fenix-police:spawnPoliceUnitClient', function(vehicleInfo, pedM
     -- judged on model alone -- see server/guard.lua.
     TriggerServerEvent('fenix-police:registerSpawnedUnit', spawnTicket, vehNetID, officers)
 
-    spawnedVehicles[vehNetID] = { vehicle = vehicle, officers = {}, officerTasks = {}, officerEngage = engageFlags, clientOwned = true, loadout = vehicleInfo.loadout, agency = unitAgency() }
+    spawnedVehicles[vehNetID] = { vehicle = vehicle, officers = {}, officerTasks = {}, officerEngage = engageFlags, clientOwned = true, loadout = vehicleInfo.loadout, agency = unitAgency(), interceptor = assignInterceptor() }
 
     -- The driver starts as 'Spawned', not 'VehicleChase': its real task is
     -- the drive-to below, and a cached 'VehicleChase' meant a unit that
@@ -1468,6 +1486,7 @@ function PromoteAmbientUnit(vehicle, driverPed, passengerPeds, loadoutName)
         clientOwned = true,
         loadout = loadoutName,
         agency = unitAgency(),
+        interceptor = assignInterceptor(),
     }
 
     -- 'Spawned', not 'VehicleChase': the driver's actual task is the drive-to
@@ -2084,6 +2103,49 @@ local function pickSweepWaypoint(vehicleData, officer, polVehicle, center, radiu
     return false
 end
 
+-- An intercept is only worth driving to if the road found is near where the
+-- suspect is actually heading and in front of them. The nearest road to a
+-- point projected out over a field, the water or a dead end can be one
+-- behind them, or a street over -- sending a unit there is worse than having
+-- it tail. Both are fractions of Config.Driving.interceptLeadDistance.
+local INTERCEPT_MAX_SNAP  = 0.5  -- road node to projected point, at most
+local INTERCEPT_MIN_AHEAD = 0.3  -- road node ahead of the suspect along their travel, at least
+
+--- The point on the road network Config.Driving.interceptLeadDistance ahead
+--- of where the suspect is going, or nil when there isn't a useful one: too
+--- slow for leading them to mean anything, or no road ahead of them.
+---
+--- One road-node lookup per call -- that pool is what a busy pursuit filled
+--- before (see the drive-to branch of handleChaseBehavior) -- so it stamps
+--- profile.interceptCheckedAt, which holds the next call off for the same
+--- re-path interval a drive-to waits.
+local function interceptPoint(profile, playerPed, playerCoords, driveCfg)
+    local moving = GetVehiclePedIsIn(playerPed, false)
+    if moving == 0 then moving = playerPed end
+    local velocity = GetEntityVelocity(moving)
+    local speed = math.sqrt((velocity.x * velocity.x) + (velocity.y * velocity.y))
+    -- Never below a slow walk, whatever is configured: the heading of a
+    -- suspect barely moving is noise, and of one standing still is 0/0.
+    if speed < math.max(tonumber(driveCfg.interceptMinSpeed) or 4.0, 1.0) then return nil end
+
+    local lead = tonumber(driveCfg.interceptLeadDistance) or 70.0
+    local dirX, dirY = velocity.x / speed, velocity.y / speed
+    local aheadX, aheadY = playerCoords.x + (dirX * lead), playerCoords.y + (dirY * lead)
+
+    -- Node flags 0: the normal road network only. A switched-off node is a
+    -- road traffic doesn't use, and the drive-to's own route won't take it.
+    profile.interceptCheckedAt = GetGameTimer()
+    local found, node = GetClosestVehicleNode(aheadX, aheadY, playerCoords.z, 0, 3.0, 0)
+    if not found or not node then return nil end
+
+    local snapX, snapY = node.x - aheadX, node.y - aheadY
+    if math.sqrt((snapX * snapX) + (snapY * snapY)) > lead * INTERCEPT_MAX_SNAP then return nil end
+    local ahead = ((node.x - playerCoords.x) * dirX) + ((node.y - playerCoords.y) * dirY)
+    if ahead < lead * INTERCEPT_MIN_AHEAD then return nil end
+
+    return vector3(node.x, node.y, node.z)
+end
+
 -- [Upstate Mafia] Forward declarations: the surrender and traffic-stop handlers
 -- are defined ~1200 lines below, alongside the rest of the arrest system, but
 -- have to be reachable from the chase loop here.
@@ -2588,18 +2650,44 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                                 -- faster than 15 m/s moves 15 m every cycle, so every unit
                                 -- behind it still re-pathed every second. A minimum
                                 -- interval between re-paths bounds that.
+                                --
+                                -- An interceptor's road-node lookup for the
+                                -- point ahead counts as a re-path for the
+                                -- interval too (interceptCheckedAt), whether or
+                                -- not it moved the target, so a unit whose
+                                -- intercept point stays put isn't looking it up
+                                -- every second instead.
+                                local now = GetGameTimer()
                                 local lastTarget = profile.lastDriveTarget
-                                local repathDue = GetGameTimer() - (profile.lastDriveAt or 0) >= (driveCfg.repathIntervalMs or 4000)
-                                if taskStatus ~= 'DriveToCoord' or not lastTarget
-                                    or (repathDue and #(target - lastTarget) > 15.0)
-                                    or taskLapsed(vehicleData, pedNetID, officer, TASK_DRIVE_TO_COORD) then
-                                    TaskVehicleDriveToCoord(officer, polVehicle, target.x, target.y, target.z, profile.speed, 1, GetEntityModel(polVehicle), DRIVING_STYLE_PURSUIT, 2.0, true)
-                                    SetDriveTaskDrivingStyle(officer, DRIVING_STYLE_PURSUIT)
-                                    profile.lastDriveTarget = target
-                                    profile.lastDriveAt = GetGameTimer()
-                                    tasks[pedNetID] = 'DriveToCoord'
-                                    markTaskIssued(vehicleData, pedNetID)
-                                    if taskStatus == 'Sweep' then vehicleData.sweep = nil end
+                                local driving = taskStatus == 'DriveToCoord' or taskStatus == 'Intercept'
+                                local lapsed = driving and taskLapsed(vehicleData, pedNetID, officer, TASK_DRIVE_TO_COORD)
+                                local lastRouteAt = math.max(profile.lastDriveAt or 0, profile.interceptCheckedAt or 0)
+                                local repathDue = now - lastRouteAt >= (driveCfg.repathIntervalMs or 4000)
+
+                                if not driving or not lastTarget or lapsed or repathDue then
+                                    -- Interceptors (every other unit, see
+                                    -- assignInterceptor) head for the road
+                                    -- ahead of a suspect somebody can see
+                                    -- moving, rather than for the suspect --
+                                    -- pressure from the front as well as from
+                                    -- behind. Otherwise, or with no useful
+                                    -- road ahead, they tail like everyone else.
+                                    local mode, driveTarget, stopRange = 'DriveToCoord', target, 2.0
+                                    if vehicleData.interceptor and inContact and driveCfg.interceptors ~= false then
+                                        local point = interceptPoint(profile, playerPed, playerCoords, driveCfg)
+                                        if point then mode, driveTarget, stopRange = 'Intercept', point, 8.0 end
+                                    end
+
+                                    if taskStatus ~= mode or not lastTarget or lapsed
+                                        or #(driveTarget - lastTarget) > 15.0 then
+                                        TaskVehicleDriveToCoord(officer, polVehicle, driveTarget.x, driveTarget.y, driveTarget.z, profile.speed, 1, GetEntityModel(polVehicle), DRIVING_STYLE_PURSUIT, stopRange, true)
+                                        SetDriveTaskDrivingStyle(officer, DRIVING_STYLE_PURSUIT)
+                                        profile.lastDriveTarget = driveTarget
+                                        profile.lastDriveAt = now
+                                        tasks[pedNetID] = mode
+                                        markTaskIssued(vehicleData, pedNetID)
+                                        if taskStatus == 'Sweep' then vehicleData.sweep = nil end
+                                    end
                                 end
                             end
                         end
