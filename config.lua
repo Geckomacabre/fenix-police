@@ -2655,8 +2655,25 @@ Config.planeTooFarDistance = 800.0
 -- This is the number of seconds that must pass while a plane crew is too far away from the player before they are deleted.
 Config.farAirPilotCleanupTimer = 120 
 
--- This is the number of seconds that must pass after the player is no longer wanted before officers are deleted.
-Config.endWantedCleanupTimer = 5
+-- [Upstate Mafia] What becomes of the response once you have shaken it -- the
+-- wanted level ran out or decayed away. Every unit used to be deleted the
+-- moment the stars went, wherever it was, the cruiser at your bumper
+-- included. With this on they stand down instead: sirens off, officers on
+-- foot walk back to their car (one off screen is simply removed) and it
+-- drives off at an ordinary patrol pace; helicopters and planes climb away.
+-- Each is removed once it is off screen AND further than despawnDistance
+-- from you, or maxSeconds after it was sent off, in view or not. A unit
+-- leaving stays gone: wanted again before it is out of sight, you get fresh
+-- units while it keeps driving. A stolen cruiser is still yours to keep.
+--
+-- An arrest, a resource restart, or enabled = false removes every unit at
+-- once, as before. (This replaces Config.endWantedCleanupTimer, which nothing
+-- ever read.)
+Config.Departure = {
+    enabled = true,
+    despawnDistance = 150.0, -- metres from you, while off screen
+    maxSeconds = 45,         -- removed this long after leaving, regardless
+}
 
 -- This is the number of times a driver will try to unstick a vehicle before being teleported to the nearest road. 
 Config.maxCloseUnstuckAttempts = 4 
