@@ -1483,6 +1483,22 @@ Config.Pursuit = {
     -- corner while a heli is overhead, and it is most of what justifies one.
     airSightRange = 250.0,
 
+    -- Darkness. From startHour until endHour on the in-game clock (a window
+    -- across midnight is fine) a car running with its lights off, or a
+    -- suspect on foot, is only seen at sightMultiplier of the normal range
+    -- (sightRange, or airSightRange from the air). Headlights or high beams
+    -- on put you back at lightsOnMultiplier -- full range by default: the
+    -- stealth is running dark, not the clock. A police helicopter with its
+    -- nightsun on sees you at full range regardless. The AI blip cones shrink
+    -- with the range they show. enabled = false: same range day and night.
+    night = {
+        enabled            = true,
+        startHour          = 21,
+        endHour            = 6,
+        sightMultiplier    = 0.6,
+        lightsOnMultiplier = 1.0,
+    },
+
     -- How long line of sight has to stay broken before contact is genuinely
     -- lost, in ms. Sight breaks constantly in city driving -- every corner,
     -- every truck, every overpass -- so without a grace period the pursuit would
@@ -1658,13 +1674,18 @@ Config.Driving = {
     -- Speed while sweeping a search area. Slow: they are looking, not chasing.
     searchSpeed = 16.0,
 
-    -- [Upstate Mafia] Half of the units still in the direct-response phase
-    -- (see applyGroundPursuitTask in server/server.lua) drive to a point this
-    -- far ahead of the player's current velocity instead of their live
-    -- position, so a response reads as officers cutting you off rather than
-    -- every unit converging from the same direction. Ignored below
-    -- interceptMinSpeed (m/s) -- leading a target that isn't meaningfully
-    -- moving just means driving to nowhere.
+    -- INTERCEPTORS --
+    -- Every other ground unit to join a pursuit is an interceptor. While
+    -- somebody can see the suspect and they are moving faster than
+    -- interceptMinSpeed (m/s), an interceptor not yet inside
+    -- chaseEnterDistance drives to the road interceptLeadDistance metres
+    -- ahead of where the suspect is heading instead of to the suspect, so a
+    -- response reads as officers cutting you off rather than every unit
+    -- converging from behind. Slower than that, leading the target just
+    -- means driving to nowhere, so it tails like everyone else; once close it
+    -- joins the chase proper. Re-pathed no more often than repathIntervalMs,
+    -- like any other drive-to. Set interceptors = false and every unit tails.
+    interceptors          = true,
     interceptLeadDistance = 70.0,
     interceptMinSpeed     = 4.0,
 
@@ -1713,6 +1734,29 @@ Config.Driving = {
         [3] = 10.0,
         [4] = 8.0,
         [5] = 6.0,
+    },
+
+    -- CHASE TACTICS --
+    -- What a unit in the close-range TaskVehicleChase state is allowed to do
+    -- to the suspect's car, by wanted level. Every chase used to box in and
+    -- PIT at every level, so a one-star speeder got the same point-blank
+    -- box-in as a five-star cop killer. Each level lists the native's chase
+    -- behaviour flags to switch on; every other one is switched off:
+    --   1   aggressive ramming
+    --   2   ram attempts
+    --   8   boxing in, with the occasional PIT
+    --   16  ramming, a little gentler than 1 and 2
+    --   32  stay back, no contact at all -- following, convoy-style
+    -- A level with no entry uses the nearest level below it that has one
+    -- (boxing in, 8, if none does). Re-applied mid-chase when the wanted level
+    -- changes. enabled = false: flag 8 at every level, the old behaviour.
+    chaseTactics = {
+        enabled = true,
+        [1] = { 32 },       -- follow; no contact for a minor offence
+        [2] = { 32 },
+        [3] = { 8 },        -- boxing in, occasional PIT
+        [4] = { 8, 16 },    -- boxing in and ramming
+        [5] = { 8, 2 },     -- end it now
     },
 }
 

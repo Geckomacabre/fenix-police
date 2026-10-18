@@ -88,6 +88,9 @@ globals = {
     -- client/ambient.lua
     'ClaimNearbyPatrolForInvestigation',
 
+    -- client/combat_bridge.lua
+    'ApplyChaseTactics',
+
     -- server/server.lua
     'GetPlayersInRadius', 'GetWantedLevelFromCoords', 'round',
 
