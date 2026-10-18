@@ -40,6 +40,9 @@ end
 -- coords: vector3.
 -- severity: 1-5.
 -- opts: optional { witnesses = {}, suspects = {}, victims = {}, region = string }
+-- witnesses/suspects are player server ids. A suspect is somebody an
+-- investigation may find (server/dispatch.lua's reportGunshot), not
+-- somebody already starred.
 function FenixIncident.create(incidentType, coords, severity, opts)
     opts = opts or {}
 
@@ -117,6 +120,21 @@ function FenixIncident.releaseUnit(id, unitId)
     return true
 end
 
+-- What an investigation came to: 'SUSPECT_SPOTTED' (a listed suspect was
+-- seen armed at the scene) or 'NO_SUSPECT' (a unit looked and found
+-- nobody). nil until one of those happens. Also what keeps a call from
+-- starring anybody twice.
+function FenixIncident.setOutcome(id, outcome)
+    local incident = incidents[id]
+    if not incident then return false end
+
+    incident.outcome = outcome
+    incident.lastUpdate = GetGameTimer()
+    dbg(('#%d outcome %s'):format(id, tostring(outcome)))
+
+    return true
+end
+
 function FenixIncident.countAssigned(id)
     local incident = incidents[id]
     if not incident then return 0 end
@@ -174,9 +192,10 @@ RegisterCommand('fenixincidents', function(source)
     local count = 0
     for id, incident in pairs(incidents) do
         count = count + 1
-        print(('#%d %-12s sev=%d status=%-16s units=%d at %s')
+        print(('#%d %-12s sev=%d status=%-16s units=%d suspects=%d outcome=%s at %s')
             :format(id, incident.type, incident.severity, incident.status,
-                FenixIncident.countAssigned(id), tostring(incident.location)))
+                FenixIncident.countAssigned(id), #incident.suspects,
+                incident.outcome or '-', tostring(incident.location)))
     end
 
     if count == 0 then

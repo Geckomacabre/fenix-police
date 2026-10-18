@@ -2231,7 +2231,10 @@ Config.Dispatch = {
 
 -- Civilian gunfire witnessing (client/witness.lua). Requires
 -- Config.Dispatch.enabled = true as well -- this only feeds incidents into
--- that system, it does nothing on its own.
+-- that system, it does nothing on its own. A caller who had just fired a gun
+-- themselves is listed as a suspect on the call
+-- (Config.Investigate.findSuspects); nobody is called in from a shooting
+-- range (Config.Investigate.exemptZones).
 Config.Witness = {
     enabled = false,
     debug = false,
@@ -2405,9 +2408,35 @@ Config.Investigate = {
 
     -- How long the CODE_HUMAN_POLICE_INVESTIGATE beat runs, counted from
     -- when the officer is actually on scene, before the officer re-boards
-    -- and clears -- see client/investigate.lua's header
-    -- for why this never actually finds anything yet.
+    -- and clears if nobody has been found (see findSuspects below).
     investigateTimeMs = 15000,
+
+    -- Finding the shooter. A gunfire caller whose own client saw them fire a
+    -- gun in the moments before (client/witness.lua) is listed as a suspect
+    -- on the call. The investigating crew watches for listed suspects from
+    -- watchFromDistance out on the way in, and while on scene: one within
+    -- spotRange of an officer, in line of sight and visibly armed (a gun in
+    -- hand, or firing), is reported, and the server -- after checking the
+    -- sighting against its own view -- raises their wanted level to the
+    -- call's (Config.Dispatch.severityToWanted; never lowers one, and never
+    -- for a player who is already wanted). When that suspect is the unit's
+    -- own host player, the unit itself joins the pursuit instead of driving
+    -- off. Nobody seen in investigateTimeMs: the officer clears as before.
+    -- false: the unit only ever looks around and clears.
+    findSuspects = true,
+    spotRange = 40.0,
+    watchFromDistance = 80.0,
+
+    -- Places where gunfire is nobody's business: nobody inside one calls
+    -- gunfire in (Config.Witness), shots fired inside one don't count as
+    -- gunfire for a caller nearby, and nobody standing in one is ever
+    -- spotted. Applies to gunfire reports whether or not this block is
+    -- enabled. The shipped entries are the two Ammu-Nation shooting ranges;
+    -- add your own (a hunting lodge, a gun-club MLO) the same way. {} = none.
+    exemptZones = {
+        { coords = vector3(13.6, -1097.4, 29.8), radius = 25.0 },  -- Ammu-Nation range, Pillbox Hill (Adam's Apple Blvd)
+        { coords = vector3(821.7, -2163.4, 29.6), radius = 25.0 }, -- Ammu-Nation range, Cypress Flats
+    },
 
     tickMs = 1500,
 }
