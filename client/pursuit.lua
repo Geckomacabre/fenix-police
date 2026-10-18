@@ -80,6 +80,17 @@ local lastSpeechAt = 0
 -- contact tick sampling it every 250ms missed most single shots.
 local lastShotAt = 0
 
+-- The darkness multiplier the contact tick last used (see nightSight), kept
+-- only so the debug print fires when it changes rather than every tick.
+local lastNightSight = 1.0
+
+-- Game timers of the last takedown and custody calls. Not cleared by
+-- FenixPursuit.reset(): an arrest can end the wanted level -- and with it
+-- the pursuit -- either side of its own custody call, and a reset between two
+-- reports of one arrest must not let the second one through.
+local lastTakedownAt = 0
+local lastCustodyAt = 0
+
 -------------------------------------------------------------------------------
 -- Small helpers
 -------------------------------------------------------------------------------
@@ -242,6 +253,56 @@ local function trafficInTheWay(ped, playerPed, pedCoords, playerCoords)
     return true
 end
 
+--- Is it dark by the in-game clock? Handles a window that wraps midnight
+--- (21 to 6) as well as one that doesn't.
+local function isNight(night)
+    local hour = GetClockHours()
+    local from, to = tonumber(night.startHour) or 21, tonumber(night.endHour) or 6
+    if from > to then return hour >= from or hour < to end
+    return hour >= from and hour < to
+end
+
+--- How far, as a fraction of the normal sight range, an observer with no
+--- light of their own can see the player right now. Taken once per contact
+--- tick, not per observer: it only depends on the clock and the player.
+---
+--- 1.0 by day. At night a car running dark, or a suspect on foot, is far
+--- harder to pick out than the same car with its headlights on -- which is
+--- the point: the stealth is something the player does (lights off), not
+--- something the clock hands them, and driving round lit up at 2am gets them
+--- seen exactly as at noon.
+local function nightSight(c, playerPed)
+    local night = c.night
+    if night == false then return 1.0 end
+    if type(night) ~= 'table' then night = {} end
+    if night.enabled == false or not isNight(night) then return 1.0 end
+
+    local vehicle = GetVehiclePedIsIn(playerPed, false)
+    if vehicle ~= 0 then
+        local _, lightsOn, highbeamsOn = GetVehicleLightsState(vehicle)
+        if lightsOn == true or lightsOn == 1 or highbeamsOn == true or highbeamsOn == 1 then
+            return tonumber(night.lightsOnMultiplier) or 1.0
+        end
+    end
+    return tonumber(night.sightMultiplier) or 0.6
+end
+
+--- This observer's sight range this tick. A police helicopter with its
+--- nightsun on brings its own light, so darkness doesn't shorten what its
+--- spotter can see; anyone else is cut by `dark` (see nightSight).
+local function sightRange(c, ped, kind, dark)
+    local range = (kind == 'ground') and (c.sightRange or 90.0) or (c.airSightRange or 250.0)
+    if dark == 1.0 then return range end
+
+    if kind == 'heli' then
+        local heli = GetVehiclePedIsIn(ped, false)
+        if heli ~= 0 and IsVehicleSearchlightOn(heli) then
+            return range * math.max(dark, 1.0)
+        end
+    end
+    return range * dark
+end
+
 --- Can this officer see the player right now?
 ---
 --- Gates cheapest first. Distance rules out most of the set without a trace;
@@ -252,13 +313,13 @@ end
 --- Air units skip the FOV test on purpose — a helicopter carries a spotter whose
 --- whole job is looking down, and giving them a forward cone makes them useless
 --- at the one thing they exist for.
-local function canSee(ped, kind, playerPed, playerCoords)
+--- @param range number this observer's sight range this tick, see sightRange
+local function canSee(ped, kind, playerPed, playerCoords, range)
     local c = cfg()
 
     local pedCoords = GetEntityCoords(ped)
     local dist = #(pedCoords - playerCoords)
 
-    local range = (kind == 'ground') and (c.sightRange or 90.0) or (c.airSightRange or 250.0)
     if dist > range then return false end
 
     if kind == 'ground' then
@@ -335,9 +396,20 @@ end
 --- on the contact tick rather than once at registration, because who is driving
 --- changes: a passenger who bails out becomes a unit and needs a blip, and a
 --- driver who is dragged out stops being one.
-local function updateBlip(ped, entry, c)
+---
+--- The cone's reach follows `range`, this tick's sight range, rather than
+--- being set once: it moves with nightfall, the player's headlights and a
+--- heli's nightsun, and a cone still showing the daytime range at night would
+--- stop being the contact model it is there to show.
+local function updateBlip(ped, entry, c, range)
     local want = wantsBlip(ped, c)
-    if want == entry.blip then return end
+    if want == entry.blip then
+        if want and entry.blipRange ~= range then
+            SetPedAiBlipNoticeRange(ped, range)
+            entry.blipRange = range
+        end
+        return
+    end
 
     if want then
         if c.blipColour then
@@ -346,10 +418,11 @@ local function updateBlip(ped, entry, c)
             SetPedHasAiBlip(ped, true)
         end
         SetPedAiBlipHasCone(ped, c.blipCones ~= false)
-        SetPedAiBlipNoticeRange(ped, (entry.kind == 'ground')
-            and (c.sightRange or 90.0) or (c.airSightRange or 250.0))
+        SetPedAiBlipNoticeRange(ped, range)
+        entry.blipRange = range
     else
         SetPedHasAiBlip(ped, false)
+        entry.blipRange = nil
     end
 
     entry.blip = want
@@ -629,6 +702,55 @@ function FenixPursuit.announceHandoff(fromAgency, toAgency)
     dispatch(msg, true)
 end
 
+-- How the end of a pursuit sounds on the radio. Called by the arrest system,
+-- both safe to call at any time, from anywhere, as often as it likes:
+--
+--   FenixPursuit.announceTakedown(kind)  suspect brought down, officers moving
+--                                        in; kind 'taser' | 'tackle' | 'k9'
+--   FenixPursuit.announceCustody()       suspect cuffed, pursuit over
+--
+-- Both are forced past the normal dispatch cooldown and rate limited on their
+-- own instead: the moment a suspect goes down is usually the moment
+-- "re-acquired" has just gone out, and the cooldown would swallow the one call
+-- that matters.
+
+-- Within this long of a custody call, another is the same arrest reported
+-- twice, not a second arrest.
+local CUSTODY_REPEAT_MS = 15000
+
+local TAKEDOWN_CALLS = {
+    taser  = 'Taser deployed, suspect is down.',
+    tackle = 'Suspect tackled, officers moving in.',
+    k9     = 'K9 has the suspect, officers moving in.',
+}
+
+--- Radio call for a less-lethal takedown. At most one per dispatchCooldown,
+--- so a suspect who keeps getting back up isn't announced every time the
+--- taser is reloaded.
+--- @param kind string|nil 'taser' | 'tackle' | 'k9'; anything else gets a generic call
+function FenixPursuit.announceTakedown(kind)
+    local c = cfg()
+    if c.enabled == false then return end
+
+    local now = GetGameTimer()
+    if lastTakedownAt ~= 0 and (now - lastTakedownAt) < (c.dispatchCooldown or 8000) then return end
+    lastTakedownAt = now
+
+    dispatch(TAKEDOWN_CALLS[kind] or 'Suspect is down, officers moving in.', true)
+end
+
+--- Radio call once the suspect is in cuffs: the pursuit's last word. Once per
+--- arrest, however many places report it.
+function FenixPursuit.announceCustody()
+    if cfg().enabled == false then return end
+
+    local now = GetGameTimer()
+    if lastCustodyAt ~= 0 and (now - lastCustodyAt) < CUSTODY_REPEAT_MS then return end
+    lastCustodyAt = now
+
+    dispatch('Suspect in custody, code 4. All units clear.', true)
+end
+
 -------------------------------------------------------------------------------
 -- The contact thread
 -------------------------------------------------------------------------------
@@ -678,6 +800,12 @@ CreateThread(function()
             local now = GetGameTimer()
             local timeout = c.observerTimeout or 4000
 
+            local dark = nightSight(c, playerPed)
+            if dark ~= lastNightSight then
+                dbg(('sight range x%.2f (%s)'):format(dark, dark < 1.0 and 'dark' or 'lit'))
+                lastNightSight = dark
+            end
+
             local seen = false
 
             for ped, entry in pairs(observers) do
@@ -696,6 +824,7 @@ CreateThread(function()
                         entry.blip = false
                     end
                 else
+                    local range = sightRange(c, ped, entry.kind, dark)
                     if stale then
                         -- No longer refreshed: client.lua has handed this
                         -- officer's unit to something other than the chase --
@@ -709,11 +838,11 @@ CreateThread(function()
                             entry.blip = false
                         end
                     else
-                        updateBlip(ped, entry, c)
+                        updateBlip(ped, entry, c, range)
                     end
                     -- No break once somebody sees: the loop still has to prune
                     -- and blip the rest, it just stops paying for their rays.
-                    if not seen and canSee(ped, entry.kind, playerPed, playerCoords) then
+                    if not seen and canSee(ped, entry.kind, playerPed, playerCoords, range) then
                         seen = true
                     end
                 end

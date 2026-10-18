@@ -1483,6 +1483,22 @@ Config.Pursuit = {
     -- corner while a heli is overhead, and it is most of what justifies one.
     airSightRange = 250.0,
 
+    -- Darkness. From startHour until endHour on the in-game clock (a window
+    -- across midnight is fine) a car running with its lights off, or a
+    -- suspect on foot, is only seen at sightMultiplier of the normal range
+    -- (sightRange, or airSightRange from the air). Headlights or high beams
+    -- on put you back at lightsOnMultiplier -- full range by default: the
+    -- stealth is running dark, not the clock. A police helicopter with its
+    -- nightsun on sees you at full range regardless. The AI blip cones shrink
+    -- with the range they show. enabled = false: same range day and night.
+    night = {
+        enabled            = true,
+        startHour          = 21,
+        endHour            = 6,
+        sightMultiplier    = 0.6,
+        lightsOnMultiplier = 1.0,
+    },
+
     -- How long line of sight has to stay broken before contact is genuinely
     -- lost, in ms. Sight breaks constantly in city driving -- every corner,
     -- every truck, every overpass -- so without a grace period the pursuit would
