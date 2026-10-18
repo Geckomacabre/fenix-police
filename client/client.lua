@@ -1379,9 +1379,10 @@ end)
 -- rather than skipping FenixGuard's ownership bookkeeping.
 -- ============================================================================
 
--- Single-slot ticket handshake: ambient.lua only ever promotes one scene at a
--- time (see the promotion loop in ambient.lua's wanted-onset sweep), so there
--- is never a second PromoteAmbientUnit call in flight to race this against.
+-- Single-slot ticket handshake. ambient.lua's wanted-onset sweep promotes one
+-- scene at a time, but an investigation unit handing over to the pursuit
+-- (investigate.lua) can call in at the same moment, so PromoteAmbientUnit
+-- queues on the slot below instead of overwriting another call's ticket.
 local promotionTicketResult = nil
 local awaitingPromotionTicket = false
 
@@ -1445,6 +1446,18 @@ function PromoteAmbientUnit(vehicle, driverPed, passengerPeds, loadoutName)
         elseif DoesEntityExist(ped) then
             strays[#strays + 1] = ped
         end
+    end
+
+    -- Another promotion is waiting on its ticket: wait our turn. Its own wait
+    -- is bounded at five seconds, so this one is too; the entities may not
+    -- have survived the wait.
+    local queued = 0
+    while awaitingPromotionTicket and queued < 6000 do
+        Wait(50)
+        queued = queued + 50
+    end
+    if awaitingPromotionTicket or not DoesEntityExist(vehicle) or not DoesEntityExist(driverPed) then
+        return false
     end
 
     promotionTicketResult = nil
