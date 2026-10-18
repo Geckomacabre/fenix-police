@@ -896,6 +896,38 @@ Config.FootChase = {
         enabled = true,
         durationMs = 2500,
     },
+
+    -- Less-lethal takedowns. Without them a suspect who kept running was
+    -- followed forever or shot: surrender was the only way an arrest ever
+    -- started. A committed chaser who isn't shooting (see combatRange and
+    -- Config.Combat -- hostile chasers still shoot, as before) tases a
+    -- suspect in range at the lower wanted levels, or tackles one they've
+    -- caught up with. A suspect who goes down -- taser, tackle, K9, a fall --
+    -- with that officer within cuffRange is arrested through
+    -- Config.ArrestSystem, which has to be on for any of this to happen.
+    -- Never used against an on-duty police player. enabled = false: chasers
+    -- just chase, as before.
+    takedown = {
+        enabled = true,
+        taser = {
+            enabled = true,
+            maxWantedLevel = 3,          -- at or below this, a chaser draws a taser instead of chasing forever
+            weapon = 'WEAPON_STUNGUN',   -- given for the shot and taken back after, unless the officer carries one
+            minRange = 3.0, maxRange = 12.0,
+            cooldownMs = 6000,           -- per officer between shots (cartridge reload)
+            firearmBlocks = true,        -- never tase a suspect holding a firearm (that's a gun call, Config.Combat decides)
+        },
+        tackle = {
+            enabled = true,
+            maxWantedLevel = 5,
+            range = 1.8,                 -- chaser within this of a running suspect may tackle
+            chance = 0.45,               -- per attempt
+            cooldownMs = 3500,
+            ragdollMs = 2500,
+        },
+        cuffRange = 3.0,                 -- an officer this close to a downed suspect starts the arrest
+        getUpGraceMs = 4000,             -- wait at most this long for the ragdoll to end before cuffing
+    },
 }
 
 

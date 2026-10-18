@@ -2930,23 +2930,32 @@ local SURRENDER_TASKS = {
     SurrenderExit = true, SurrenderCover = true, SurrenderOrbit = true,
 }
 
--- handleFootChase's markers for a unit's committed foot chaser.
-local FOOT_CHASE_TASKS = { Exiting = true, FootChase = true, FootCombat = true, Staging = true }
+-- handleFootChase's markers for a unit's committed foot chaser -- the
+-- takedown ones included, or a chaser mid-tase would read as no chaser at all
+-- and the unit would send a second officer out.
+local FOOT_CHASE_TASKS = {
+    Exiting = true, FootChase = true, FootCombat = true, Staging = true,
+    Taser = true, Takedown = true, TakedownHold = true,
+}
+
+-- Defined with the foot chase's takedowns, which draw the taser it puts away.
+local holsterTaser
 
 local TASK_ENTER_VEHICLE      = GetHashKey('SCRIPT_TASK_ENTER_VEHICLE')
 local TASK_AIM_GUN_AT_ENTITY  = GetHashKey('SCRIPT_TASK_AIM_GUN_AT_ENTITY')
 
 --- Takes one officer off the trigger for the current surrender, once: the
 --- same stand-down the aftermath uses (passive group, no always-fight), so
---- nothing starts shooting again on its own. What they were doing is kept for
---- releaseSurrenderHold. Their task is the caller's business -- a pilot
---- keeps flying.
+--- nothing starts shooting again on its own. A taser drawn for a takedown goes
+--- away too. What they were doing is kept for releaseSurrenderHold. Their task
+--- is the caller's business -- a pilot keeps flying.
 --- @return boolean true the first time this surrender
 local function holdSurrenderFire(vehicleData, pedNetID, officer)
     vehicleData.surrenderHeld = vehicleData.surrenderHeld or {}
     if vehicleData.surrenderHeld[pedNetID] ~= nil then return false end
     vehicleData.surrenderHeld[pedNetID] = vehicleData.officerTasks[pedNetID] or false
     standDownOfficer(officer)
+    holsterTaser(vehicleData, pedNetID, officer)
     return true
 end
 
@@ -4986,6 +4995,238 @@ end
 -- commitment is dropped (see handleFootChase).
 local FOOT_CHASE_EXIT_TIMEOUT_MS = 5000
 
+-- ---- Less-lethal takedowns --------------------------------------------------
+-- Surrender used to be the only way an arrest ever started: a suspect who
+-- kept running was followed forever by a chaser who wouldn't shoot, or shot by
+-- one who would. A committed chaser who isn't shooting now tases a suspect in
+-- range at the lower wanted levels, or tackles one they've caught up with, and
+-- a suspect who goes down with that officer on them is cuffed -- taser,
+-- tackle, K9 bite or a fall, it's the same arrest. See
+-- Config.FootChase.takedown.
+
+-- How long a taser shot holds the chaser before they're back to chasing.
+local TASER_SHOT_MS = 1600
+-- A suspect down within this range of the chaser has them close in for the
+-- cuffs, for at most this long before the chase picks up again.
+local TAKEDOWN_CLOSE_IN_RANGE = 15.0
+local TAKEDOWN_CLOSE_IN_MS    = 4000
+-- A tackle this recent is what put a suspect on the ground.
+local TACKLE_CREDIT_MS = 4000
+
+-- The takedown in progress -- one officer moving in on a suspect who is down
+-- -- or nil. One at a time, whichever unit's officer got there first.
+--   { vehicleData, vehNetID, pedNetID, officer }
+local activeTakedown = nil
+local lastTackleAt = nil
+
+-- Defined with the arrest flow below, whose waits it bounds as well.
+local waitFor
+
+local function takedownCfg()
+    local td = Config.FootChase.takedown
+    return type(td) == 'table' and td or {}
+end
+
+local function announceTakedown(kind)
+    if FenixPursuit and FenixPursuit.announceTakedown then FenixPursuit.announceTakedown(kind) end
+end
+
+--- On the ground right now: stunned, or ragdolled for any reason at all.
+local function suspectDown(playerPed)
+    return IsPedBeingStunned(playerPed, 0) or IsPedRagdoll(playerPed)
+end
+
+--- Whether a takedown can be started: the arrest system there to finish it,
+--- a suspect on foot and alive whom no other flow has, and not a police
+--- player on duty -- the same line the K9 won't cross.
+local function takedownAllowed(playerPed)
+    if takedownCfg().enabled == false then return false end
+    if not (Config.ArrestSystem and Config.ArrestSystem.enabled and toggleOn('arrestSystem')) then return false end
+    if isSurrendering or isBeingArrested or isPullingOver or isBeingTicketed or ticketWrapUp or aftermath.active then
+        return false
+    end
+    if IsEntityDead(playerPed) or IsPedFatallyInjured(playerPed) or IsPedInAnyVehicle(playerPed, false) then
+        return false
+    end
+    return not isPlayerPoliceOfficer()
+end
+
+--- Puts a drawn taser away: the weapon the officer had in hand back, and the
+--- taser itself gone unless it was theirs to begin with -- so a chase that
+--- turns into a gunfight later is fought with a gun. Safe to call with no
+--- taser out. Assigns to the local forward-declared with FOOT_CHASE_TASKS.
+function holsterTaser(vehicleData, pedNetID, officer)
+    local drawn = vehicleData.taserDrawn and vehicleData.taserDrawn[pedNetID]
+    if not drawn then return end
+    vehicleData.taserDrawn[pedNetID] = nil
+    if officer == 0 or not DoesEntityExist(officer) then return end
+    if drawn.prev ~= 0 and drawn.prev ~= drawn.weapon then
+        SetCurrentPedWeapon(officer, drawn.prev, true)
+    end
+    if not drawn.owned then RemoveWeaponFromPed(officer, drawn.weapon) end
+end
+
+--- One taser shot from a chaser in range with a clear line, at a suspect not
+--- holding a firearm (that one is a gun call, and Config.Combat makes it).
+--- @return boolean true when the shot was taken
+local function tryTaser(vehicleData, pedNetID, chaser, playerPed, dist, wantedLevel)
+    local t = takedownCfg().taser
+    if type(t) ~= 'table' then t = {} end
+    if t.enabled == false or wantedLevel > (tonumber(t.maxWantedLevel) or 3) then return false end
+    if dist < (tonumber(t.minRange) or 3.0) or dist > (tonumber(t.maxRange) or 12.0) then return false end
+
+    local now = GetGameTimer()
+    vehicleData.taserAt = vehicleData.taserAt or {}
+    local last = vehicleData.taserAt[pedNetID]
+    if last and now - last < (tonumber(t.cooldownMs) or 6000) then return false end
+    if t.firearmBlocks ~= false and IsPedArmed(playerPed, 4) then return false end
+    if not NetworkHasControlOfEntity(chaser) or not HasEntityClearLosToEntity(chaser, playerPed, 17) then
+        return false
+    end
+    if not takedownAllowed(playerPed) then return false end
+
+    -- Hit or miss, that's the cartridge used.
+    vehicleData.taserAt[pedNetID] = now
+
+    local weapon = GetHashKey(type(t.weapon) == 'string' and t.weapon or 'WEAPON_STUNGUN')
+    local owned = HasPedGotWeapon(chaser, weapon, false)
+    vehicleData.taserDrawn = vehicleData.taserDrawn or {}
+    vehicleData.taserDrawn[pedNetID] = { weapon = weapon, prev = GetSelectedPedWeapon(chaser), owned = owned }
+    if not owned then GiveWeaponToPed(chaser, weapon, 1, false, true) end
+    SetCurrentPedWeapon(chaser, weapon, true)
+
+    -- A weapon handed to a networked ped can be dropped by the sync, which
+    -- leaves the officer holding his gun: this shot would be a real one.
+    if GetSelectedPedWeapon(chaser) ~= weapon then
+        holsterTaser(vehicleData, pedNetID, chaser)
+        if Config.isDebug then print('[FENIX-TAKEDOWN] taser never reached the officer\'s hand, no shot') end
+        return false
+    end
+
+    TaskShootAtEntity(chaser, playerPed, 1500, GetHashKey('FIRING_PATTERN_SINGLE_SHOT'))
+    vehicleData.officerTasks[pedNetID] = 'Taser'
+    if Config.isDebug then
+        print(('[FENIX-TAKEDOWN] taser fired by %s at %.1fm'):format(tostring(pedNetID), dist))
+    end
+    return true
+end
+
+--- A chaser right behind a running suspect may bring them down: driven
+--- forward and down along the chaser's own heading.
+--- @return boolean true when the suspect was tackled
+local function tryTackle(vehicleData, pedNetID, chaser, playerPed, dist, wantedLevel)
+    local k = takedownCfg().tackle
+    if type(k) ~= 'table' then k = {} end
+    if k.enabled == false or wantedLevel > (tonumber(k.maxWantedLevel) or 5) then return false end
+    if dist > (tonumber(k.range) or 1.8) or GetEntitySpeed(playerPed) <= 2.0 then return false end
+
+    local now = GetGameTimer()
+    vehicleData.tackleAt = vehicleData.tackleAt or {}
+    local last = vehicleData.tackleAt[pedNetID]
+    if last and now - last < (tonumber(k.cooldownMs) or 3500) then return false end
+    if not takedownAllowed(playerPed) then return false end
+
+    -- One roll per attempt; a miss waits out the cooldown like a hit.
+    vehicleData.tackleAt[pedNetID] = now
+    if math.random() >= (tonumber(k.chance) or 0.45) or not CanPedRagdoll(playerPed) then return false end
+
+    local ms = math.floor(tonumber(k.ragdollMs) or 2500)
+    local fwd = GetEntityForwardVector(chaser)
+    local at = GetEntityCoords(playerPed)
+    local onGround, groundZ = GetGroundZFor_3dCoord(at.x, at.y, at.z + 1.0, false)
+    if not onGround then groundZ = at.z - 1.0 end
+    -- Fall type 1 (over a wall): pitched forward rather than crumpling.
+    SetPedToRagdollWithFall(playerPed, ms, ms + 500, 1, fwd.x, fwd.y, fwd.z, groundZ,
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    vehicleData.officerTasks[pedNetID] = 'Takedown'
+    lastTackleAt = now
+    announceTakedown('tackle')
+    if Config.isDebug then print(('[FENIX-TAKEDOWN] tackle by %s'):format(tostring(pedNetID))) end
+    return true
+end
+
+--- The takedown hold, on its own thread: ten checks a second, where the
+--- chase loop makes one, is what a suspect getting up needs. The officer
+--- closes in while the suspect is down; with them within cuffRange, the
+--- arrest starts once the suspect is up -- or after getUpGraceMs still on
+--- the ground -- unless they have got further than cuffRange + 2.5 m away
+--- by then. Anything else taking over ends it.
+local function runTakedown(hold)
+    local td = takedownCfg()
+    local cuffRange = tonumber(td.cuffRange) or 3.0
+    local escapeRange = cuffRange + 2.5
+    local officer = hold.officer
+
+    local function over()
+        local ped = PlayerPedId()
+        return activeTakedown ~= hold
+            or isSurrendering or isBeingArrested or isPullingOver or isBeingTicketed or ticketWrapUp
+            or aftermath.active
+            or spawnedVehicles[hold.vehNetID] ~= hold.vehicleData
+            or (FenixMorale ~= nil and FenixMorale.isRetreating(hold.vehNetID))
+            or not DoesEntityExist(officer) or IsPedDeadOrDying(officer, true) or IsPedInAnyVehicle(officer, false)
+            or IsEntityDead(ped) or IsPedFatallyInjured(ped) or IsPedInAnyVehicle(ped, false)
+            or GetPlayerWantedLevel(PlayerId()) < 1
+    end
+    local function distance()
+        return #(GetEntityCoords(officer) - GetEntityCoords(PlayerPedId()))
+    end
+
+    -- Closing in while they're still down.
+    TaskGoToEntity(officer, PlayerPedId(), -1, 0.8, 3.0, 1073741824, 0)
+    waitFor(function()
+        return over() or not suspectDown(PlayerPedId()) or distance() <= cuffRange
+    end, TAKEDOWN_CLOSE_IN_MS, 100)
+    if over() or not suspectDown(PlayerPedId()) or distance() > cuffRange then return end
+
+    -- Down, with an officer on them.
+    local playerPed = PlayerPedId()
+    local k9 = activeK9
+    local kind = nil
+    if IsPedBeingStunned(playerPed, 0) then
+        kind = 'taser'
+    elseif k9 and k9.state == 'Attack' and DoesEntityExist(k9.ped)
+        and #(GetEntityCoords(k9.ped) - GetEntityCoords(playerPed)) <= 4.0 then
+        kind = 'k9'
+    elseif lastTackleAt and GetGameTimer() - lastTackleAt < TACKLE_CREDIT_MS then
+        kind = 'tackle'
+    end
+    announceTakedown(kind)
+    -- The dog lets go, so the suspect gets up into the cuffs instead of being
+    -- held down by it until the grace runs out.
+    recallK9('takedown')
+
+    waitFor(function()
+        return over() or not suspectDown(PlayerPedId()) or distance() > escapeRange
+    end, tonumber(td.getUpGraceMs) or 4000, 100)
+    if over() or distance() > escapeRange then return end
+
+    if Config.isDebug then
+        print(('[FENIX-TAKEDOWN] %s down, cuffing (officer %s)'):format(tostring(kind or 'suspect'), tostring(hold.pedNetID)))
+    end
+    triggerArrest(officer)
+end
+
+--- Starts the takedown hold for one officer (see runTakedown), who belongs to
+--- it until it ends and is then handed back to the foot chase.
+local function beginTakedown(vehicleData, vehNetID, pedNetID, officer)
+    local hold = { vehicleData = vehicleData, vehNetID = vehNetID, pedNetID = pedNetID, officer = officer }
+    activeTakedown = hold
+    vehicleData.officerTasks[pedNetID] = 'TakedownHold'
+
+    Citizen.CreateThread(function()
+        local ok, err = pcall(runTakedown, hold)
+        if not ok then print(('[fenix-police] takedown errored: %s'):format(tostring(err))) end
+        if activeTakedown == hold then activeTakedown = nil end
+        -- Back to chasing the next cycle the foot chase gets -- after an
+        -- arrest that falls through, too -- unless something else (a
+        -- surrender hold, a retreat) has the officer by now.
+        if vehicleData.officerTasks[pedNetID] == 'TakedownHold' then
+            vehicleData.officerTasks[pedNetID] = 'Exiting'
+        end
+    end)
+end
+
 --- One officer per unit commits to a foot chase (matches handleSurrenderApproach's
 --- "exactly one, not the whole crew" reasoning above -- emptying every seat the
 --- moment the player steps out of a car would gut the rest of the pursuit).
@@ -4996,6 +5237,15 @@ function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
     local tasks = vehicleData.officerTasks
     if not tasks then return false end
 
+    -- A taser still out on anyone but a chaser mid-shot -- the shot cut short
+    -- by something else taking the officer over, an aftermath or a stop -- is
+    -- put away before anything else.
+    if vehicleData.taserDrawn then
+        for pedNetID in pairs(vehicleData.taserDrawn) do
+            if tasks[pedNetID] ~= 'Taser' then holsterTaser(vehicleData, pedNetID, pedFromNet(pedNetID)) end
+        end
+    end
+
     -- A retreating or released unit is morale.lua's. Running this first sent
     -- an officer after the player out of a car morale.lua was driving away,
     -- and kept re-tasking a committed chaser it was trying to pull back. Its
@@ -5005,6 +5255,7 @@ function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
         for pedNetID, task in pairs(tasks) do
             if FOOT_CHASE_TASKS[task] then
                 releaseBreachShield(pedNetID)
+                holsterTaser(vehicleData, pedNetID, pedFromNet(pedNetID))
                 tasks[pedNetID] = nil
             end
         end
@@ -5121,6 +5372,7 @@ function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
     if IsPedInAnyVehicle(playerPed, false) or dist > (cfg.giveUpDistance or 80.0) then
         ClearPedTasks(chaser)
         releaseBreachShield(chaserPedNetID)
+        holsterTaser(vehicleData, chaserPedNetID, chaser)
         tasks[chaserPedNetID] = nil
         return false
     end
@@ -5160,6 +5412,22 @@ function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
         provokePolice()
         ClearEntityLastDamageEntity(chaser)
     end
+
+    -- Moving in on a downed suspect: the takedown hold has this officer
+    -- until it ends (see beginTakedown).
+    if activeTakedown and activeTakedown.officer == chaser then return true end
+
+    -- A taser shot runs its course -- cut short once it has landed -- and
+    -- the taser goes back in the holster after it, whatever comes next.
+    if tasks[chaserPedNetID] == 'Taser' then
+        local shotAt = vehicleData.taserAt and vehicleData.taserAt[chaserPedNetID] or 0
+        if IsPedBeingStunned(playerPed, 0) then
+            announceTakedown('taser')
+        elseif GetGameTimer() - shotAt < TASER_SHOT_MS then
+            return true
+        end
+    end
+    holsterTaser(vehicleData, chaserPedNetID, chaser)
 
     -- [Upstate Mafia] Reactive staging: the initial commit above only stages
     -- when the player is ALREADY inside the instant an officer gets out --
@@ -5205,6 +5473,23 @@ function handleFootChase(vehicleData, playerPed, vehNetID, wantedLevel)
             tasks[chaserPedNetID] = 'FootCombat'
         end
     else
+        -- Less-lethal, from a chaser who isn't shooting: hostile ones shoot.
+        -- A suspect already down gets the cuffs, not another shot; one still
+        -- running is tackled from right behind or tased from range -- only by
+        -- a chaser actually chasing, not one still finding their feet.
+        if not hostile and not activeTakedown and takedownCfg().enabled ~= false then
+            if suspectDown(playerPed) then
+                if dist <= TAKEDOWN_CLOSE_IN_RANGE and takedownAllowed(playerPed) then
+                    beginTakedown(vehicleData, vehNetID, chaserPedNetID, chaser)
+                    return true
+                end
+            elseif tasks[chaserPedNetID] == 'FootChase'
+                and (tryTackle(vehicleData, chaserPedNetID, chaser, playerPed, dist, wantedLevel)
+                    or tryTaser(vehicleData, chaserPedNetID, chaser, playerPed, dist, wantedLevel)) then
+                return true
+            end
+        end
+
         -- TaskGoToEntity tracks the live entity on its own once issued, same
         -- as TaskVehicleChase above — only (re-)issued on an actual state
         -- change, not every cycle.
@@ -5564,9 +5849,10 @@ local standDownForArrest
 --- Every wait in the arrest, WASTED and roadside-stop flows goes through
 --- this. Unbounded, a fade another resource cut short or an anim dict that
 --- never loaded held the player frozen, cuffed or behind a black screen for
---- the rest of the session.
+--- the rest of the session. The foot chase's takedown hold uses it too, so it
+--- assigns to the local forward-declared there.
 --- @return boolean true if `done` came true in time
-local function waitFor(done, timeoutMs, stepMs)
+function waitFor(done, timeoutMs, stepMs)
     local deadline = GetGameTimer() + timeoutMs
     while not done() do
         if GetGameTimer() >= deadline then return false end
