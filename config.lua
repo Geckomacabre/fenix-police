@@ -1026,7 +1026,15 @@ Config.ArrestSystem = {
     bustedDuration = 6000,
     bustedMaxDuration = 30000,     -- Hard ceiling, whatever bustedDuration says
     bustedSkippable = true,        -- SPACE or ENTER skips the rest of the cinematic
-    bustedSubtitle = 'Taken into custody',
+    bustedSubtitle = 'Taken into custody', -- line drawn under BUSTED; '' for none
+
+    -- The arresting officer holsters, steps round behind you and cuffs you
+    -- with the game's own paired arrest animation (pairedCuffMs long) before
+    -- the escort below. Anything that stops it -- the animation not loading,
+    -- the officer unable to get behind you -- falls back to the kneel, which
+    -- is also what false gives you.
+    pairedCuffing = true,
+    pairedCuffMs = 3500,
 
     -- Where you wake up: 'nearest' picks the closest station to the arrest,
     -- 'random' picks any station in the list below.

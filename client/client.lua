@@ -4157,7 +4157,11 @@ exports('IsPlayerPoliceOfficer', function() return isPlayerPoliceOfficer() end)
 -- sprite and nothing in its exposed arguments can hide it, and the actual
 -- reference for this look (a screenshot of vanilla GTA's own WASTED screen)
 -- has no band at all.
-local function drawBigWord(word, r, g, b)
+--
+-- `subtitle`, if given, is a line under the word in the plain body font --
+-- BUSTED's Config.ArrestSystem.bustedSubtitle -- small enough not to compete
+-- with it.
+local function drawBigWord(word, r, g, b, subtitle)
     SetTextFont(7)
     SetTextScale(1.35, 1.35)
     SetTextColour(r, g, b, 255)
@@ -4167,12 +4171,30 @@ local function drawBigWord(word, r, g, b)
     SetTextEntry('STRING')
     AddTextComponentString(word)
     DrawText(0.5, 0.44)
+
+    if type(subtitle) == 'string' and subtitle ~= '' then
+        SetTextFont(4)
+        SetTextScale(0.55, 0.55)
+        SetTextColour(255, 255, 255, 230)
+        SetTextCentre(true)
+        SetTextDropShadow()
+        SetTextEdge(1, 0, 0, 0, 160)
+        SetTextEntry('STRING')
+        AddTextComponentString(subtitle)
+        DrawText(0.5, 0.535)
+    end
 end
 
 local HANDS_UP_DICT = 'random@mugging3'
 local HANDS_UP_ANIM = 'handsup_standing_base'
 local KNEEL_DICT    = 'random@arrests@busted'
 local KNEEL_ANIM    = 'idle_a'
+
+-- The game's own paired arrest: the officer behind the suspect, cuffing them
+-- from the left. Used together or not at all.
+local PAIRED_DICT       = 'mp_arrest_paired'
+local PAIRED_COP_ANIM   = 'cop_p2_back_left'
+local PAIRED_CROOK_ANIM = 'crook_p2_back_left'
 
 -- [Upstate Mafia] Forward declarations. The traffic-ticket path lives in its own
 -- section below triggerArrest, but shares this key mapping — one key for one
@@ -5532,7 +5554,7 @@ end, false)
 -- outside its own thread -- the player dying or going down mid-arrest, the
 -- watchdog in the main loop -- stops touching the camera, the time scale and
 -- the player the moment it resumes.
---   { startedAt = GetGameTimer(), cam }
+--   { startedAt = GetGameTimer(), cam, attachedTo, holster = { ped, weapon }, custody }
 local activeArrest = nil
 
 -- Defined with the aftermath helpers further down, which it shares.
@@ -5582,11 +5604,26 @@ local function releaseArrest(arrest, clearTasks)
     end
 
     local playerPed = PlayerPedId()
+    -- Cut off while the paired cuffing still had the suspect held to the
+    -- officer: left attached, the player was carried about by an NPC.
+    if arrest.attachedTo then
+        if IsEntityAttached(playerPed) then DetachEntity(playerPed, true, false) end
+        arrest.attachedTo = nil
+    end
     SetEnableHandcuffs(playerPed, false)
     UncuffPed(playerPed)
     FreezeEntityPosition(playerPed, false)
     if clearTasks then ClearPedTasks(playerPed) end
     if IsScreenFadedOut() or IsScreenFadingOut() then DoScreenFadeIn(500) end
+
+    -- The arresting officer put his weapon away for the cuffs. One still
+    -- standing after an arrest that fell through gets it back in hand, or a
+    -- pursuit that picks up again has him squaring up with his fists.
+    local holster = arrest.holster
+    if holster and DoesEntityExist(holster.ped) and not IsPedDeadOrDying(holster.ped, true)
+        and holster.weapon ~= 0 and holster.weapon ~= WEAPON_UNARMED then
+        SetCurrentPedWeapon(holster.ped, holster.weapon, true)
+    end
 
     isBeingArrested = false
     -- An arrest that never finished leaves the units it held for the
@@ -5628,6 +5665,90 @@ local function pickEscortVehicle(arrestCoords)
     return best, bestSeat
 end
 
+-- How long the arresting officer gets to walk round behind the suspect for
+-- the paired cuffing, and how near that spot is near enough: the attach that
+-- lines the pair up snaps the suspect across whatever gap is left, and past
+-- this it would visibly drag them.
+local PAIRED_WALK_MS    = 6000
+local PAIRED_SNAP_RANGE = 1.0
+-- The suspect is held to the officer only for the start of the animation,
+-- which is all lining the two up takes; held any longer, the officer's own
+-- movement carries them about with him.
+local PAIRED_ATTACH_MS  = 950
+
+--- Config.ArrestSystem.pairedCuffing: the arresting officer holsters, walks
+--- round behind the suspect and cuffs them with the game's paired arrest,
+--- the suspect held to him for its first beat so the two line up. Every wait
+--- is bounded, and anything that doesn't happen -- the dictionary not
+--- loading, an officer who is gone or can't get behind them, a suspect still
+--- on the ground after a takedown -- returns false with nobody attached, for
+--- the caller to kneel the suspect as it always has.
+--- @return boolean true once the cuffs are on
+local function pairedCuff(arrest, cop, playerPed, live)
+    local a = Config.ArrestSystem
+    if a.pairedCuffing == false then return false end
+
+    local function copReady()
+        return cop ~= nil and cop ~= 0 and DoesEntityExist(cop) and not IsPedDeadOrDying(cop, true)
+            and not IsPedInAnyVehicle(cop, false)
+    end
+    if not copReady() then return false end
+
+    -- Asked for before the wait on a downed suspect getting up, which
+    -- usually covers the load.
+    RequestAnimDict(PAIRED_DICT)
+    waitFor(function() return not live() or not IsPedRagdoll(playerPed) end, 3000, 50)
+    if not live() or IsPedRagdoll(playerPed) then return false end
+    waitFor(function() return not live() or HasAnimDictLoaded(PAIRED_DICT) end, 2000, 10)
+    if not live() or not HasAnimDictLoaded(PAIRED_DICT) or not copReady() then return false end
+
+    if not NetworkHasControlOfEntity(cop) then NetworkRequestControlOfEntity(cop) end
+
+    -- Weapon away: the cuffs take both hands.
+    arrest.holster = { ped = cop, weapon = GetSelectedPedWeapon(cop) }
+    SetCurrentPedWeapon(cop, WEAPON_UNARMED, true)
+
+    -- Round behind them, facing the way they face. The suspect is held
+    -- where they stand meanwhile; the walk is to a fixed spot.
+    FreezeEntityPosition(playerPed, true)
+    local heading = GetEntityHeading(playerPed)
+    local behind = GetOffsetFromEntityInWorldCoords(playerPed, 0.0, -0.5, 0.0)
+    TaskFollowNavMeshToCoord(cop, behind.x, behind.y, behind.z, 1.0, PAIRED_WALK_MS, 0.2, 0, heading)
+    local walkStartedAt = GetGameTimer()
+    waitFor(function()
+        if not live() or not copReady() then return true end
+        if #(GetEntityCoords(cop) - behind) <= 0.5 then return true end
+        -- Stopped short, and not going any further.
+        return GetGameTimer() - walkStartedAt > 500 and GetScriptTaskStatus(cop, TASK_FOLLOW_NAV_MESH) == 7
+    end, PAIRED_WALK_MS, 50)
+    if not live() then return false end
+    if not copReady() or #(GetEntityCoords(cop) - behind) > PAIRED_SNAP_RANGE then return false end
+
+    local cuffMs = math.max(PAIRED_ATTACH_MS, tonumber(a.pairedCuffMs) or 3500)
+    FreezeEntityPosition(playerPed, false)
+    ClearPedTasks(playerPed)
+    -- 11816 is a bone id, not one of a ped's bone indices, so the suspect is
+    -- held to the officer's own origin -- the frame these offsets (a touch to
+    -- his left and just ahead of him, turned 20 degrees) line the two clips
+    -- up in. A turn about one axis only, so the rotation order doesn't matter.
+    AttachEntityToEntity(playerPed, cop, 11816, -0.1, 0.45, 0.0, 0.0, 0.0, 20.0,
+        false, false, false, false, 2, false)
+    arrest.attachedTo = cop
+    TaskPlayAnim(cop, PAIRED_DICT, PAIRED_COP_ANIM, 8.0, -8.0, cuffMs, 33, 0, false, false, false)
+    TaskPlayAnim(playerPed, PAIRED_DICT, PAIRED_CROOK_ANIM, 8.0, -8.0, cuffMs, 33, 0, false, false, false)
+
+    Wait(PAIRED_ATTACH_MS)
+    if not live() then return false end
+    DetachEntity(playerPed, true, false)
+    arrest.attachedTo = nil
+
+    Wait(cuffMs - PAIRED_ATTACH_MS)
+    if not live() then return false end
+    SetEnableHandcuffs(playerPed, true)
+    FreezeEntityPosition(playerPed, true)
+    return true
+end
+
 local function runArrest(arrest, arrestingCop)
     local function live() return activeArrest == arrest end
 
@@ -5640,23 +5761,40 @@ local function runArrest(arrest, arrestingCop)
     -- through the escort and the BUSTED screen.
     standDownForArrest()
 
-    -- Freeze player and play kneel animation
-    FreezeEntityPosition(playerPed, true)
-    RequestAnimDict(KNEEL_DICT)
-    waitFor(function() return not live() or HasAnimDictLoaded(KNEEL_DICT) end, 2000, 10)
-    if not live() then return end
-    ClearPedTasks(playerPed)
-    if HasAnimDictLoaded(KNEEL_DICT) then
-        TaskPlayAnim(playerPed, KNEEL_DICT, KNEEL_ANIM, 8.0, -8.0, -1, 33, 0, false, false, false)
+    -- "Suspect in custody" goes out once, the moment the cuffs are on: after
+    -- the paired cuffing, at the escort, or failing both just before BUSTED.
+    local function inCustody()
+        if arrest.custody then return end
+        arrest.custody = true
+        if FenixPursuit and FenixPursuit.announceCustody then FenixPursuit.announceCustody() end
     end
 
-    -- Make the arresting cop face the player
-    if DoesEntityExist(arrestingCop) and not IsPedDeadOrDying(arrestingCop, true) then
-        TaskTurnPedToFaceEntity(arrestingCop, playerPed, 2000)
-    end
-
-    Wait(800)
+    -- Cuffed on their feet by the officer behind them; when that can't
+    -- happen, the kneel it has always been.
+    local cuffed = pairedCuff(arrest, arrestingCop, playerPed, live)
     if not live() then return end
+
+    if cuffed then
+        inCustody()
+    else
+        -- Freeze player and play kneel animation
+        FreezeEntityPosition(playerPed, true)
+        RequestAnimDict(KNEEL_DICT)
+        waitFor(function() return not live() or HasAnimDictLoaded(KNEEL_DICT) end, 2000, 10)
+        if not live() then return end
+        ClearPedTasks(playerPed)
+        if HasAnimDictLoaded(KNEEL_DICT) then
+            TaskPlayAnim(playerPed, KNEEL_DICT, KNEEL_ANIM, 8.0, -8.0, -1, 33, 0, false, false, false)
+        end
+
+        -- Make the arresting cop face the player
+        if DoesEntityExist(arrestingCop) and not IsPedDeadOrDying(arrestingCop, true) then
+            TaskTurnPedToFaceEntity(arrestingCop, playerPed, 2000)
+        end
+
+        Wait(800)
+        if not live() then return end
+    end
 
     -- The suspect is under control: the officers covering them from beside
     -- their cars lower their weapons, and the escort below takes over.
@@ -5708,6 +5846,7 @@ local function runArrest(arrest, arrestingCop)
         ClearPedTasks(playerPed)
         FreezeEntityPosition(playerPed, false)
         SetEnableHandcuffs(playerPed, true)
+        inCustody()
 
         -- Officers converge and stand around the player -- the
         -- "surrounded" beat -- before anyone starts walking.
@@ -5778,6 +5917,8 @@ local function runArrest(arrest, arrestingCop)
 
     -- ---- BUSTED CINEMATIC ----
 
+    inCustody()
+
     local duration = math.min(Config.ArrestSystem.bustedDuration or 6000,
                               (Config.ArrestSystem.bustedMaxDuration or 30000))
     local skippable = Config.ArrestSystem.bustedSkippable ~= false
@@ -5800,18 +5941,9 @@ local function runArrest(arrest, arrestingCop)
     -- route -- if anything it's a closer match than the scaleform ever
     -- was, and it sidesteps the scaleform-pool reliability issues this
     -- screen hit entirely (see server.cfg's ScaleformStore pool-size
-    -- increase for that whole saga).
-    local function drawBigWord(word, r, g, b)
-        SetTextFont(7)
-        SetTextScale(1.35, 1.35)
-        SetTextColour(r, g, b, 255)
-        SetTextCentre(true)
-        SetTextDropShadow()
-        SetTextEdge(2, 0, 0, 0, 160)
-        SetTextEntry('STRING')
-        AddTextComponentString(word)
-        DrawText(0.5, 0.44)
-    end
+    -- increase for that whole saga). The drawing itself is drawBigWord,
+    -- shared with WASTED; a copy of it here only shadowed that one.
+    local subtitle = Config.ArrestSystem.bustedSubtitle
 
     -- 2. Screen effect + sound
     StartScreenEffect('DeathFailOut', 0, false)
@@ -5878,7 +6010,7 @@ local function runArrest(arrest, arrestingCop)
         -- the whole screen reads red-hued, matching the reference.
         DrawRect(0.5, 0.5, 1.0, 1.0, 160, 20, 20, 70)
 
-        drawBigWord('busted', 70, 140, 230)
+        drawBigWord('busted', 70, 140, 230, subtitle)
 
         DisableAllControlActions(0)
         Wait(0)
@@ -5925,7 +6057,11 @@ local function runArrest(arrest, arrestingCop)
     end
 
     -- Immediately, not ClearPedTasks: it takes the player out of the escort
-    -- car on the spot, before the cleanup below deletes that car.
+    -- car on the spot, before the cleanup below deletes that car. Out of the
+    -- cuffs too: with no car to walk to, the paired cuffing left them on, and
+    -- the player would wake up at the station still wearing them.
+    SetEnableHandcuffs(playerPed, false)
+    UncuffPed(playerPed)
     ClearPedTasksImmediately(playerPed)
     FreezeEntityPosition(playerPed, false)
     if station then
