@@ -1,6 +1,6 @@
 <img src="img/FenixPolice001.jpg" alt="Fenix Police Response" width="800"/>
 
-# Fenix Police Response 2.0 — Upstate Mafia Fork
+# Fenix Police Response 3.0 — Upstate Mafia Fork
 
 AI police dispatch and wanted levels for FiveM, replacing the base GTA V police
 system with something less punishing and more deliberate. Every setting is
@@ -10,7 +10,7 @@ practical.
 > **This is a fork.** The original is
 > [FenixPK/fenix-police](https://github.com/FenixPK/fenix-police) by **Fenix**,
 > who wrote everything this is built on. This fork tracks upstream 1.0.2 and adds
-> an ambient enforcement layer on top. Version 2.0 is *this fork's* number and
+> an ambient enforcement layer on top. Version 3.0 is *this fork's* number and
 > has no relationship to upstream's versioning.
 >
 > Licensed **GPL-3.0**, same as upstream. `FORK-CHANGELOG.md` and
@@ -107,10 +107,10 @@ through to `vehicleFallback` — stock `police` / `sheriff`.
 
 ### Ambient carjackings
 
-A suspect drags a driver out of a stopped car and speeds off. The getaway speed
-is chosen so a radar trap down the road will clock them — a carjacking can
-escalate into a full pursuit through the existing enforcement path, with no
-wiring between the two features.
+A suspect drags a driver out of a stopped car and speeds off. A few seconds
+later the victim calls it in, and a nearby patrol — or fresh units sent from
+out of sight — chase the stolen car down and arrest the driver
+(`Config.Ambient.carjackResponse`).
 
 ### On-duty police are exempt
 
@@ -458,6 +458,12 @@ versa) just gets the simpler fallback behaviour, not an error.
 ## Project status
 
 Honest assessment, because it affects what you should expect:
+
+- **3.0 is unplayed.** Its fixes and new features (takedowns, felony-stop
+  surrender, paired cuffing, chase tactics by wanted level, interceptors,
+  night stealth, carjack response, investigations finding the shooter, units
+  driving away) pass lint and a Lua 5.4 compile check but have not been run
+  on a server yet. See `FORK-CHANGELOG.md` 3.0.0 "Known limitations".
 
 - The **upstream base is stable** and has been played extensively.
 - The ambient layer's core — placement, radar detection, player pursuit — has

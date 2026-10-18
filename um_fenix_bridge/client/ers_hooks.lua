@@ -45,8 +45,11 @@ local function spawnBackup(calloutId, coords)
         local angle = math.rad(math.random(360))
         local x = coords.x + math.cos(angle) * r
         local y = coords.y + math.sin(angle) * r
-        local _, z = GetGroundZFor_3dCoord(x, y, coords.z + 50.0, false)
-        z = z and (z + 1.0) or coords.z
+        -- groundZ comes back as 0.0 (still truthy) when no ground was found,
+        -- e.g. the point isn't streamed in yet, which would put cruisers at
+        -- sea level. Only the found flag says whether it's real.
+        local found, groundZ = GetGroundZFor_3dCoord(x, y, coords.z + 50.0, false)
+        local z = found and (groundZ + 1.0) or coords.z
 
         local veh = CreateVehicle(vehHash, x, y, z, math.random(360), true, false)
         if veh and DoesEntityExist(veh) then

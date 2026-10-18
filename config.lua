@@ -15,8 +15,9 @@ Config.Toggles = {
     -- Wanted level system: if false, players never become wanted
     wantedLevels            = true,
 
-    -- Arrest / BUSTED screen system (requires Config.ArrestSystem.enabled too)
-    arrestSystem            = false,
+    -- Surrender / arrest / BUSTED screen system (requires Config.ArrestSystem.enabled
+    -- too). Off leaves the H key to traffic stops only.
+    arrestSystem            = true,
 
     -- AI helicopter units
     heliUnits               = true,
@@ -286,7 +287,9 @@ Config.Ambient = {
     -- client.lua's PromoteAmbientUnit) — the cop that was already patrolling
     -- turns and joins the chase, rather than vanishing and being replaced by
     -- a freshly spawned one. Radar traps, static posts and traffic stops are
-    -- never promoted, only despawned as before.
+    -- never promoted, only despawned as before — with one exception: the car
+    -- that clocked you itself (radar below) joins as a real unit once you
+    -- ignore its lights. Setting this false turns that off too.
     promoteOnWanted = true,
     -- How close (metres) a patrol/convoy scene has to be to the player the
     -- moment a wanted level appears to be a candidate for promotion.
@@ -384,16 +387,19 @@ Config.Ambient = {
     pursuitHoldSeconds = 20,
 
     -- After the tableau holds, walk the suspect to the nearest scene vehicle
-    -- and put them in the back seat before the scene tears down/drives off,
-    -- instead of the suspect just standing there until the whole thing blinks
-    -- out of existence. false reverts to the old instant-teardown ending.
+    -- and put them in the back seat, then the officers get back in and drive
+    -- off with them, instead of the suspect just standing there until the
+    -- whole thing blinks out of existence. false reverts to the old
+    -- instant-teardown ending.
     pursuitEscortToVehicle = true,
     pursuitEscortSeconds = 6,      -- time budget for the walk-and-enter beat
 
     -- How long a traffic stop runs before the officer wraps up and walks back to
     -- the car, and how long the scene is then kept alive so both vehicles can
     -- actually drive away. Applies to procedural stops and to radar traps that
-    -- have pulled an NPC over. Without these a stop never ends.
+    -- have pulled an NPC over. Without these a stop never ends. The departure
+    -- window is also what a pursuit's transport, and a car that clocked you and
+    -- then stood down, get to drive off before they're released.
     stopDurationSeconds  = 60,
     stopDepartureSeconds = 25,
 
@@ -412,7 +418,9 @@ Config.Ambient = {
     -- Chance the group is three cars instead of two.
     convoyThirdCarChance = 0.35,
 
-    -- Nose-to-tail spacing between cars in the group, in metres.
+    -- Nose-to-tail spacing between cars in the group, in metres — where they
+    -- spawn, and the gap each one then keeps to the car in front as it
+    -- follows it.
     convoySpacing = 9.0,
 
     -- Seconds before the group is torn down regardless of distance. Falls back
@@ -557,7 +565,11 @@ Config.Ambient = {
         -- Players: hands off to this resource's own pursuit stack. Units spawn,
         -- dispatch reacts, and the ArrestSystem (if enabled) ends it in a bust.
         -- The catching cruiser joins the chase and is exempted from
-        -- despawnWhenWanted so it doesn't vanish mid-catch.
+        -- despawnWhenWanted so it doesn't vanish mid-catch. If you keep
+        -- driving past pulloverGraceMs it becomes a real pursuit unit
+        -- (promoteOnWanted); once you're no longer wanted it kills its lights
+        -- and drives on. Never fires while you're already wanted — each catch
+        -- would add another star to a pursuit that is already running.
         catchPlayers = true,
         playerWantedLevel = 1,
 
@@ -590,6 +602,11 @@ Config.Ambient = {
         -- officer at the window. NPCs are judged against the trap's own limit
         -- rather than the posted sign — resolving a street name for every
         -- vehicle in the pool every tick isn't worth it for background traffic.
+        -- Only plain world traffic is ever pulled over: never a vehicle another
+        -- script owns (pursuit, EMS, fire and investigation units, other
+        -- resources' job cars, other ambient scenes), an emergency or
+        -- military vehicle, an aircraft or boat, or a car this client doesn't
+        -- control.
         catchNpcs = true,
         npcYieldSeconds = 15,
 
@@ -625,11 +642,27 @@ Config.Ambient = {
 
     -- Peds used as carjackers. Defaults to civPeds when unset; give it a
     -- rougher-looking list if you want them to read as criminals on sight.
-    -- The getaway is driven fast on purpose, so a suspect who passes a radar
-    -- trap gets clocked and chased with no extra wiring.
     carjackSuspects = {
         'a_m_y_skater_01', 'a_m_m_farmer_01', 'a_m_y_hipster_01',
         'a_m_y_stwhi_01', 'a_m_m_soucent_01',
+    },
+
+    -- A carjacking gets called in. A few seconds after the getaway the victim
+    -- reports it, and either a patrol or convoy car already nearby lights up
+    -- and goes after the stolen car, or cruisers are sent from out of sight.
+    -- From there it plays out like a `pursuit` scene and ends in the same
+    -- arrest. It shares pursuitCooldownSeconds with them, never fires while
+    -- you're wanted or when the getaway is beyond nearbyRadius, and spawned
+    -- units count against maxNearbyCops. If nobody catches up within a minute
+    -- the suspect gets away and the units go back to patrolling.
+    -- enabled = false leaves every carjacker to drive off unanswered.
+    carjackResponse = {
+        enabled     = true,
+        chance      = 0.75,      -- odds the call gets a response at all
+        reportDelay = { 6, 12 }, -- seconds from the getaway to the call
+        reuseRadius = 300.0,     -- metres from the stolen car a patrol/convoy can be sent from
+        chasers     = { 1, 2 },  -- cruisers sent when no patrol is close enough (at most 3;
+                                 -- 0 sends none, so only a patrol already nearby answers)
     },
 
     -- Vehicles used for ambient units, by region key (see Config.ZoneEnum).
@@ -742,9 +775,11 @@ Config.Ambient = {
 -- Every check requires an ambient officer to actually be able to see the
 -- player first (client/violations.lua calls exports('fenix-police'):IsWitnessed,
 -- the same cone/radius test radar enforcement uses) -- "the police only know
--- what they can see" applies here too, not just to pursuits. A hit calls the
--- same ApplyWantedLevel() radar enforcement uses, so dispatch, the pursuit
--- stack and the roadside-citation flow all pick it up with no extra wiring.
+-- what they can see" applies here too, not just to pursuits. A hit raises the
+-- wanted level to the violation's wantedLevel (SetWantedLevel: never stacked
+-- on an existing one, and nothing is cited while already wanted), so
+-- dispatch, the pursuit stack and the roadside-citation flow all pick it up
+-- with no extra wiring.
 --
 -- Deliberately NOT covered: running red lights, stop-sign violations, and
 -- driving on the sidewalk. FiveM has no native that reports a traffic light's
@@ -771,6 +806,10 @@ Config.Violations = {
         enabled = true,
         -- GetVehicleClass(veh) == 8 is motorcycles.
         minSpeedMph = 5,
+        -- How long the rider has to be seen bare-headed, continuously,
+        -- before it counts -- covers the game's own helmet going on a moment
+        -- after setting off. Any head prop counts as a helmet.
+        dwellMs = 4000,
         wantedLevel = 1,
         cooldownSeconds = 90,
     },
@@ -857,6 +896,38 @@ Config.FootChase = {
         enabled = true,
         durationMs = 2500,
     },
+
+    -- Less-lethal takedowns. Without them a suspect who kept running was
+    -- followed forever or shot: surrender was the only way an arrest ever
+    -- started. A committed chaser who isn't shooting (see combatRange and
+    -- Config.Combat -- hostile chasers still shoot, as before) tases a
+    -- suspect in range at the lower wanted levels, or tackles one they've
+    -- caught up with. A suspect who goes down -- taser, tackle, K9, a fall --
+    -- with that officer within cuffRange is arrested through
+    -- Config.ArrestSystem, which has to be on for any of this to happen.
+    -- Never used against an on-duty police player. enabled = false: chasers
+    -- just chase, as before.
+    takedown = {
+        enabled = true,
+        taser = {
+            enabled = true,
+            maxWantedLevel = 3,          -- at or below this, a chaser draws a taser instead of chasing forever
+            weapon = 'WEAPON_STUNGUN',   -- given for the shot and taken back after, unless the officer carries one
+            minRange = 3.0, maxRange = 12.0,
+            cooldownMs = 6000,           -- per officer between shots (cartridge reload)
+            firearmBlocks = true,        -- never tase a suspect holding a firearm (that's a gun call, Config.Combat decides)
+        },
+        tackle = {
+            enabled = true,
+            maxWantedLevel = 5,
+            range = 1.8,                 -- chaser within this of a running suspect may tackle
+            chance = 0.45,               -- per attempt
+            cooldownMs = 3500,
+            ragdollMs = 2500,
+        },
+        cuffRange = 3.0,                 -- an officer this close to a downed suspect starts the arrest
+        getUpGraceMs = 4000,             -- wait at most this long for the ragdoll to end before cuffing
+    },
 }
 
 
@@ -939,6 +1010,47 @@ Config.ArrestSystem = {
     -- what keeps the pursuit loop intact instead of emptying every car at once.
     approachDistance = 35.0,
     arrestDistance = 2.0,          -- How close an officer must be to trigger arrest (metres)
+    -- Every other unit pulls up and waits this far from you (metres), holding
+    -- fire, while one officer from the arresting unit walks over. Kept inside
+    -- approachDistance, so one of them can take over if the arresting unit
+    -- drops out.
+    holdDistance = 25.0,
+
+    -- How long (ms) you can stand with your hands up with nobody taking you
+    -- in -- every unit far off, searching or retreating -- before your hands
+    -- come down and the pursuit carries on, with this notification.
+    surrenderTimeoutMs = 90000,
+    surrenderTimeoutMessage = 'Nobody came to take you in. Your hands are down.',
+
+    -- The felony stop. While one officer walks over, the units holding back
+    -- pull up and their officers get out and cover you from beside their
+    -- cars -- weapons on you, nobody firing -- until you're in cuffs, or the
+    -- surrender ends and they get back in. A unit gets out once its car
+    -- has stopped within `distance` metres of you; an officer already on foot
+    -- that close covers from where they are. enabled = false keeps everyone
+    -- seated and holding, as before.
+    cover = {
+        enabled = true,
+        distance = 45.0,
+    },
+
+    -- A police helicopter overhead circles you with its searchlight on while
+    -- your hands are up, then goes back to the chase or the search when the
+    -- surrender ends. radius and height/minHeight (the height it flies at,
+    -- and the lowest it will go) in metres, speed in m/s. enabled = false
+    -- leaves it on whatever it was doing.
+    heliOrbit = {
+        enabled = true,
+        radius = 30.0,
+        height = 45.0,
+        minHeight = 30.0,
+        speed = 12.0,
+    },
+
+    -- On-screen help while your hands are up. {key} is replaced with the key
+    -- the surrender command is bound to in your settings (H unless rebound).
+    -- Unset, this built-in text is used; '' shows no help text at all.
+    -- surrenderHint = 'Hands up. Officers are moving in — [{key}] to cancel',
 
     -- How long the BUSTED screen holds, in REAL milliseconds. This is measured
     -- with GetNetworkTime rather than GetGameTimer, because the cinematic runs at
@@ -946,7 +1058,15 @@ Config.ArrestSystem = {
     bustedDuration = 6000,
     bustedMaxDuration = 30000,     -- Hard ceiling, whatever bustedDuration says
     bustedSkippable = true,        -- SPACE or ENTER skips the rest of the cinematic
-    bustedSubtitle = 'Taken into custody',
+    bustedSubtitle = 'Taken into custody', -- line drawn under BUSTED; '' for none
+
+    -- The arresting officer holsters, steps round behind you and cuffs you
+    -- with the game's own paired arrest animation (pairedCuffMs long) before
+    -- the escort below. Anything that stops it -- the animation not loading,
+    -- the officer unable to get behind you -- falls back to the kneel, which
+    -- is also what false gives you.
+    pairedCuffing = true,
+    pairedCuffMs = 3500,
 
     -- Where you wake up: 'nearest' picks the closest station to the arrest,
     -- 'random' picks any station in the list below.
@@ -1110,6 +1230,9 @@ Config.TicketSystem = {
         warning  = 'Verbal warning issued. You are free to go.',
         serious  = 'Too serious for a citation — they want you out of the car.',
         fled     = 'You pulled away from the stop.',
+        -- timeoutSeconds ran out with no officer ever sent to the window. One
+        -- already walking up when it runs out lets you go with the warning.
+        timeout  = 'No unit reached the stop. You are still wanted.',
     },
 }
 
@@ -1332,8 +1455,13 @@ Config.Morale = {
 
     -- How long a regrouped unit sits out before it's eligible to rejoin the
     -- fight (if the player is still in the area) or is released for
-    -- maintainPoliceUnits to replace with a fresh unit.
+    -- maintainPoliceUnits to replace with a fresh unit. A unit that is still
+    -- broken when this runs out (casualties don't heal) is the one released.
     regroupSeconds = 35,
+
+    -- Minimum time between two "unit disengaging" radio calls, in ms. Several
+    -- units breaking in the same exchange of fire is one call, not one each.
+    announceCooldownMs = 15000,
 }
 
 
@@ -1359,15 +1487,17 @@ Config.Security = {
     -- Extra detail: allowlist size at boot, unit registrations as they land.
     debug = false,
 
-    -- Require an ownership record before acting on an entity.
+    -- Only act on an entity recorded against the requesting player, or, with no
+    -- record, one that player's own client created.
     --
-    -- Left OFF by default. With layers 1 and 2 in place, the worst an unowned
-    -- entity permits is one player interfering with another player's police
-    -- units -- griefing, not theft -- and turning this on before you have
-    -- confirmed registration works on your server converts every gap into a
-    -- police car that never gets cleaned up. Turn it on once `fenixguard` in the
-    -- server console shows entities being owned during a pursuit.
-    strictOwnership = false,
+    -- On by default. Layer 2 alone lets anyone unlock or delete any unoccupied
+    -- car whose model is on the allowlist -- and the stock police, sheriff, FBI,
+    -- ambulance and fire models are exactly what player job vehicles use. Every
+    -- unit this resource spawns passes layer 3 on its own: helicopters and
+    -- planes are recorded when the server creates them, everything else is
+    -- created by the requesting client. Set false only to go back to judging
+    -- unrecorded entities on model alone.
+    strictOwnership = true,
 
     -- Seconds a spawn ticket stays valid. A ticket is issued when the server
     -- authorises a ground spawn and consumed when the client reports back what
@@ -1376,9 +1506,11 @@ Config.Security = {
 
     -- Ceiling on how many entities one player can have recorded at once. The
     -- backstop against a client that passes every other check and simply asks
-    -- for units forever. Config.maxUnitsPerLevel tops out at 10 vehicles with
-    -- crews, so this has a lot of headroom before it can bite legitimately.
-    maxOwnedEntities = 60,
+    -- for units forever. Applies to helicopters and planes as well as ground
+    -- units. A five-star pursuit with every reinforcement and backup bonus is
+    -- 17 cars of up to 5 entities each plus 6 helicopters of 5, before dead
+    -- officers awaiting cleanup -- around 120 at the very worst.
+    maxOwnedEntities = 150,
 
     -- Requests per player per minute, per event group. These events are not
     -- called at remotely similar rates: `spawn` is a deliberate request made a
@@ -1396,23 +1528,15 @@ Config.Security = {
         delete   = 600,
         unlock   = 600,
         rearm    = 600,
-        alert    = 30,
     },
 
     -- Fallback for any event group not named above.
     maxRequestsPerMinute = 300,
 
-    -- `fenix:server:trigger` applies a wanted level to everyone standing near a
-    -- reported crime, and took the crime's coordinates from the client. Any
-    -- client could therefore pick a victim anywhere on the map and star them --
-    -- a wanted-level cannon aimed by whoever sent the event.
-    --
-    -- A player reporting a crime is reporting one they are AT, so coordinates
-    -- further than this from the caller are refused. Raise it if a resource of
-    -- yours legitimately reports crimes from a distance; 0 disables the check.
-    -- Calls from another resource server-side skip it either way, since there is
-    -- no caller to measure against.
-    maxAlertDistance = 100.0,
+    -- Minimum seconds between two field revives (Config.Aftermath) for the same
+    -- player. The revive itself is a server export, so this is what stops a
+    -- client asking for one over and over.
+    fieldReviveCooldown = 300,
 
     -- Models to allowlist that the config tables above don't mention. You only
     -- need these if something outside Config.vehiclesByRegion / Config.polHelis
@@ -1449,11 +1573,34 @@ Config.Pursuit = {
     sightRange = 90.0,
     sightFov   = 160.0,
 
+    -- Other vehicles block a ground officer's view: a bus or a truck between
+    -- you and a cruiser hides you the same way a wall does. A car within a
+    -- few metres of the officer (the one they're taking cover behind) or of
+    -- you doesn't count. Air crews look down over traffic and are unaffected.
+    -- Set false to let officers see through traffic.
+    vehiclesBlockSight = true,
+
     -- Air crews. No cone: a helicopter carries a spotter whose entire job is
     -- looking down, and giving them a forward arc makes them useless at the one
     -- thing they exist for. This is what stops you breaking contact by turning a
     -- corner while a heli is overhead, and it is most of what justifies one.
     airSightRange = 250.0,
+
+    -- Darkness. From startHour until endHour on the in-game clock (a window
+    -- across midnight is fine) a car running with its lights off, or a
+    -- suspect on foot, is only seen at sightMultiplier of the normal range
+    -- (sightRange, or airSightRange from the air). Headlights or high beams
+    -- on put you back at lightsOnMultiplier -- full range by default: the
+    -- stealth is running dark, not the clock. A police helicopter with its
+    -- nightsun on sees you at full range regardless. The AI blip cones shrink
+    -- with the range they show. enabled = false: same range day and night.
+    night = {
+        enabled            = true,
+        startHour          = 21,
+        endHour            = 6,
+        sightMultiplier    = 0.6,
+        lightsOnMultiplier = 1.0,
+    },
 
     -- How long line of sight has to stay broken before contact is genuinely
     -- lost, in ms. Sight breaks constantly in city driving -- every corner,
@@ -1494,9 +1641,10 @@ Config.Pursuit = {
     -- wants to hear the street, not announce itself to it.
     quietSearch = true,
 
-    -- An officer who stops being refreshed by the chase loop for this long is
-    -- dropped from the perception set. This is how a deleted officer removes
-    -- itself without client.lua having to say so.
+    -- An officer who stops being refreshed by the chase loop for this long
+    -- (their unit is busy with a foot chase, an arrest, a stop or a retreat)
+    -- loses their blip but can still see you. A deleted or dead officer drops
+    -- out of the perception set without client.lua having to say so.
     observerTimeout = 4000,
 
     -- AI blips on responding officers, with the view cone that shows what each
@@ -1629,13 +1777,18 @@ Config.Driving = {
     -- Speed while sweeping a search area. Slow: they are looking, not chasing.
     searchSpeed = 16.0,
 
-    -- [Upstate Mafia] Half of the units still in the direct-response phase
-    -- (see applyGroundPursuitTask in server/server.lua) drive to a point this
-    -- far ahead of the player's current velocity instead of their live
-    -- position, so a response reads as officers cutting you off rather than
-    -- every unit converging from the same direction. Ignored below
-    -- interceptMinSpeed (m/s) -- leading a target that isn't meaningfully
-    -- moving just means driving to nowhere.
+    -- INTERCEPTORS --
+    -- Every other ground unit to join a pursuit is an interceptor. While
+    -- somebody can see the suspect and they are moving faster than
+    -- interceptMinSpeed (m/s), an interceptor not yet inside
+    -- chaseEnterDistance drives to the road interceptLeadDistance metres
+    -- ahead of where the suspect is heading instead of to the suspect, so a
+    -- response reads as officers cutting you off rather than every unit
+    -- converging from behind. Slower than that, leading the target just
+    -- means driving to nowhere, so it tails like everyone else; once close it
+    -- joins the chase proper. Re-pathed no more often than repathIntervalMs,
+    -- like any other drive-to. Set interceptors = false and every unit tails.
+    interceptors          = true,
     interceptLeadDistance = 70.0,
     interceptMinSpeed     = 4.0,
 
@@ -1659,6 +1812,18 @@ Config.Driving = {
     sweepHistorySize       = 3,     -- how many recent waypoints per unit count as "recently visited"
     sweepSampleAttempts    = 6,     -- candidate points tried before falling back to a plain wander for one cycle
 
+    -- A driver in contact switches from driving to the player's position to
+    -- TaskVehicleChase inside chaseEnterDistance, and only drops back to the
+    -- drive-to beyond chaseLeaveDistance. One line for both had units near it
+    -- flipping between the two every cycle.
+    chaseEnterDistance = 45.0,
+    chaseLeaveDistance = 90.0,
+
+    -- Minimum time between re-paths for a unit driving to a moving target, on
+    -- top of the target having moved 15 m. Every re-path is a road-node
+    -- request, and that pool is small enough for a busy pursuit to fill.
+    repathIntervalMs = 4000,
+
     -- Ideal following distance for the close-range TaskVehicleChase state
     -- (SET_TASK_VEHICLE_CHASE_IDEAL_PURSUIT_DISTANCE), indexed by wanted
     -- level like ability/aggression above. Never called before this existed,
@@ -1672,6 +1837,29 @@ Config.Driving = {
         [3] = 10.0,
         [4] = 8.0,
         [5] = 6.0,
+    },
+
+    -- CHASE TACTICS --
+    -- What a unit in the close-range TaskVehicleChase state is allowed to do
+    -- to the suspect's car, by wanted level. Every chase used to box in and
+    -- PIT at every level, so a one-star speeder got the same point-blank
+    -- box-in as a five-star cop killer. Each level lists the native's chase
+    -- behaviour flags to switch on; every other one is switched off:
+    --   1   aggressive ramming
+    --   2   ram attempts
+    --   8   boxing in, with the occasional PIT
+    --   16  ramming, a little gentler than 1 and 2
+    --   32  stay back, no contact at all -- following, convoy-style
+    -- A level with no entry uses the nearest level below it that has one
+    -- (boxing in, 8, if none does). Re-applied mid-chase when the wanted level
+    -- changes. enabled = false: flag 8 at every level, the old behaviour.
+    chaseTactics = {
+        enabled = true,
+        [1] = { 32 },       -- follow; no contact for a minor offence
+        [2] = { 32 },
+        [3] = { 8 },        -- boxing in, occasional PIT
+        [4] = { 8, 16 },    -- boxing in and ramming
+        [5] = { 8, 2 },     -- end it now
     },
 }
 
@@ -1710,6 +1898,12 @@ Config.Tactics = {
     -- route. Sampled far-to-near so a block lands at the far end of its band
     -- where possible, which is the difference between an obstacle and an ambush.
     placementAttempts = 12,
+
+    -- A spot ahead only counts as on the player's route if driving there is at
+    -- most this many times the straight-line distance. Catches the parallel
+    -- street, the crossing road and the overpass that happen to lie ahead in a
+    -- straight line. 0 disables the check.
+    routeRatio = 1.5,
 
     -- ── Sustained pursuit ───────────────────────────────────────────────────
     -- Road tactics used to be gated on wanted level alone, which meant a
@@ -1786,6 +1980,15 @@ Config.Roads = {
     --   'inner'   lane nearest the centre line.
     --   'random'  any lane travelling the right way.
     lanePreference = 'outer',
+
+    -- Lay out a two-way road's lanes outward from the gap between its two
+    -- directions (GET_CLOSEST_ROAD's last output) instead of centring the whole
+    -- lane set on the road's centre line. The two only differ on roads with a
+    -- median or an uneven lane split (2 one way, 1 the other), where the
+    -- centred layout can put a unit or a roadblock on the centre line or the
+    -- median. Off by default until checked on your map: `/fenixroads here`
+    -- prints both layouts for the road you are standing on.
+    medianAwareLanes = false,
 
     -- How far past the outermost lane a *parked* scene sits (radar traps,
     -- traffic stops), in metres from the edge of the carriageway. Because it is
@@ -2012,11 +2215,27 @@ Config.Jurisdiction = {
         -- },
     },
 
-    -- Units belonging to the outgoing region run through the same
-    -- Retreating/Regrouping states Config.Morale drives (client/morale.lua) --
-    -- "not my jurisdiction anymore" and "we're beaten" both mean "this unit
-    -- stops engaging and heads for its own turf", just with a different radio
-    -- line (FenixPursuit.announceHandoff).
+    -- Which agency polices each region key. Crossing between two regions of
+    -- the SAME agency (Paleto -> Sandy Shores, both the Sheriff) is not a
+    -- handoff at all. These names are also what the handoff radio call says.
+    -- A region not listed here (e.g. a custom zone's own region) counts as its
+    -- own agency.
+    agencies = {
+        losSantos   = 'LSPD',
+        paletoBay   = 'Sheriff',
+        sandyShores = 'Sheriff',
+        countryside = 'Sheriff',
+    },
+
+    -- How long, in ms, the player has to stay in the new region before a
+    -- crossing counts. Roads that run along a boundary cross it every few
+    -- seconds; without this every wobble was a handoff.
+    dwellMs = 8000,
+
+    -- Radio call on a confirmed handoff (FenixPursuit.announceHandoff). The
+    -- outgoing agency's units are released one at a time as the incoming
+    -- agency's units arrive, so the response swaps over a car at a time
+    -- rather than everyone turning round at the line.
     handoffRadio = true,
 }
 
@@ -2033,8 +2252,8 @@ Config.Dispatch = {
     -- briefly instead of vanishing immediately on resolution).
     incidentMaxAgeMs = 30 * 60 * 1000,
 
-    -- How long a CREATED/DISPATCHING incident can sit with zero assigned
-    -- units before it's treated as abandoned and cleaned up.
+    -- How long an incident can sit with zero assigned units, and nothing
+    -- happening on it, before it's treated as abandoned and cleaned up.
     abandonedIncidentMs = 5 * 60 * 1000,
 
     -- How far from an EMS/fire incident the server will look for a player
@@ -2043,6 +2262,24 @@ Config.Dispatch = {
     -- unanswered rather than being handed to someone who can't plausibly
     -- see it.
     maxHostSearchRadius = 300.0,
+
+    -- The host's client spawns the unit up to that responder's
+    -- spawnMaxDistance from the scene, and anything much past ~400 m from the
+    -- host is outside what its game has loaded (no collision, the unit never
+    -- arrives). The search radius above is cut to this minus spawnMaxDistance.
+    hostScopeRadius = 400.0,
+
+    -- A host can decline a call without saying so (already at its maxUnits,
+    -- nowhere legal to spawn). If no unit is assigned for a role this long
+    -- after asking, the next-nearest player who hasn't been asked gets it, up
+    -- to maxOffersPerRole players per role.
+    reofferAfterMs = 20000,
+    maxOffersPerRole = 3,
+
+    -- Gunfire and crash reports within this many metres of a wanted player
+    -- are dropped: they're the pursuit itself (the police shooting, PIT and
+    -- ram damage), not a fresh call.
+    wantedSuppressRadius = 80.0,
 
     -- Which agencies a given incident type calls for. Anything not listed
     -- defaults to {'police'} (see server/dispatch.lua agenciesFor()).
@@ -2079,7 +2316,10 @@ Config.Dispatch = {
 
 -- Civilian gunfire witnessing (client/witness.lua). Requires
 -- Config.Dispatch.enabled = true as well -- this only feeds incidents into
--- that system, it does nothing on its own.
+-- that system, it does nothing on its own. A caller who had just fired a gun
+-- themselves is listed as a suspect on the call
+-- (Config.Investigate.findSuspects); nobody is called in from a shooting
+-- range (Config.Investigate.exemptZones).
 Config.Witness = {
     enabled = false,
     debug = false,
@@ -2095,7 +2335,7 @@ Config.Witness = {
     reportCooldownMs = 20000,
 
     -- Server-side: how far a reported location may be from the reporting
-    -- player (anti-spoofing, same idea as Config.Security.maxAlertDistance).
+    -- player (anti-spoofing: a client can only report gunfire near itself).
     maxReportDistance = 80.0,
 
     -- Server-side: how many reports per minute a single player may send
@@ -2132,22 +2372,37 @@ Config.EMS = {
     arriveDistance = 8.0,
     driveSpeed = 20.0,
 
-    -- How long the treatment beat (CODE_HUMAN_MEDIC_KNEEL) runs before the
-    -- medic re-boards and the unit heads to hospital.
+    -- Lights-and-siren driving: steers and changes lanes around traffic and
+    -- doesn't wait at red lights. Style 1 (stop for cars, nothing else)
+    -- just queues behind anything stopped in its lane.
+    drivingStyle = 786469,
+
+    -- A unit that hasn't reached the scene in this long (wedged in traffic,
+    -- no road to it) is stood down, so it can't hold a maxUnits slot forever.
+    maxDriveMs = 120000,
+
+    -- How long the treatment beat (CODE_HUMAN_MEDIC_KNEEL) runs, counted
+    -- from when the medic is actually kneeling, before the medic re-boards
+    -- and the unit heads to hospital.
     treatmentTimeMs = 8000,
 
-    -- Incidents at or above this severity hold the ambulance back
-    -- (STAGING) for stagingHoldMs before it approaches -- a fixed timer
-    -- standing in for real "has police secured the scene" detection, which
-    -- needs the unit-position registry noted in server/dispatch.lua's
-    -- header comment. Set stagingHoldMs to 0 to disable staging entirely.
+    -- Incidents at or above this severity that police are also responding
+    -- to hold the ambulance back stagingDistance short of the scene
+    -- (STAGING) until a police unit is assigned to the call, or for
+    -- stagingHoldMs at most, before it approaches. Set stagingHoldMs to 0 to
+    -- disable staging entirely.
     dangerousSeverity = 3,
     stagingHoldMs = 8000,
+    stagingDistance = 60.0,
 
-    -- Pillbox Hospital, the same coordinate qbx_ambulancejob's own config
-    -- uses (resources/[qbx]/qbx_ambulancejob/config/shared.lua) so patients
-    -- end up at the hospital players already know as "the" hospital.
-    hospitalCoords = vector3(304.27, -600.33, 43.28),
+    -- Pillbox Hospital's ambulance bay on the street out front (where
+    -- qb/qbx_ambulancejob spawn their ambulances) -- a point an ambulance
+    -- can actually drive up to, unlike the check-in desk inside the lobby.
+    hospitalCoords = vector3(294.58, -574.76, 43.18),
+
+    -- Ceiling on the hospital run. The run also ends early as soon as the
+    -- ambulance is out of the player's sight, since nobody sees the rest.
+    maxHospitalDriveMs = 180000,
 
     tickMs = 1500,
 }
@@ -2167,11 +2422,18 @@ Config.Fire = {
     arriveDistance = 10.0,
     driveSpeed = 20.0,
 
-    -- Suppression polls FIRE::GET_NUMBER_OF_FIRES_IN_RANGE and calls
-    -- STOP_FIRE_IN_RANGE every tick within this radius until it reads zero
-    -- or maxSuppressMs elapses (whichever first -- a fire started by a
-    -- large explosion can outlast a single truck's crew).
+    -- Same lights-and-siren driving and stand-down timer as Config.EMS.
+    drivingStyle = 786469,
+    maxDriveMs = 120000,
+
+    -- A crew member works the fire with an extinguisher; once they've been
+    -- on it for suppressDelayMs, STOP_FIRE_IN_RANGE is called every tick
+    -- within suppressRadius until FIRE::GET_NUMBER_OF_FIRES_IN_RANGE reads
+    -- zero or maxSuppressMs (counted from arrival) elapses -- whichever
+    -- first, since a fire started by a large explosion can outlast a single
+    -- truck's crew.
     suppressRadius = 15.0,
+    suppressDelayMs = 6000,
     maxSuppressMs = 30000,
 
     tickMs = 1500,
@@ -2217,16 +2479,49 @@ Config.Investigate = {
     arriveDistance = 10.0,
     driveSpeed = 15.0,
 
+    -- No lights and siren on this unit, so it drives like a patrol: stops at
+    -- red lights, steers around stopped traffic. A unit that hasn't reached
+    -- the scene in maxDriveMs is stood down.
+    drivingStyle = 786603,
+    maxDriveMs = 120000,
+
     -- Before spawning a fresh unit, look for an already-wandering ambient
     -- patrol (client/ambient.lua) within this radius and reuse it instead
     -- (client/investigate.lua's ClaimNearbyPatrolForInvestigation). 0
     -- disables reuse and always spawns fresh.
     reuseNearbyPatrolRadius = 120.0,
 
-    -- How long the CODE_HUMAN_POLICE_INVESTIGATE beat runs before the
-    -- officer re-boards and clears -- see client/investigate.lua's header
-    -- for why this never actually finds anything yet.
+    -- How long the CODE_HUMAN_POLICE_INVESTIGATE beat runs, counted from
+    -- when the officer is actually on scene, before the officer re-boards
+    -- and clears if nobody has been found (see findSuspects below).
     investigateTimeMs = 15000,
+
+    -- Finding the shooter. A gunfire caller whose own client saw them fire a
+    -- gun in the moments before (client/witness.lua) is listed as a suspect
+    -- on the call. The investigating crew watches for listed suspects from
+    -- watchFromDistance out on the way in, and while on scene: one within
+    -- spotRange of an officer, in line of sight and visibly armed (a gun in
+    -- hand, or firing), is reported, and the server -- after checking the
+    -- sighting against its own view -- raises their wanted level to the
+    -- call's (Config.Dispatch.severityToWanted; never lowers one, and never
+    -- for a player who is already wanted). When that suspect is the unit's
+    -- own host player, the unit itself joins the pursuit instead of driving
+    -- off. Nobody seen in investigateTimeMs: the officer clears as before.
+    -- false: the unit only ever looks around and clears.
+    findSuspects = true,
+    spotRange = 40.0,
+    watchFromDistance = 80.0,
+
+    -- Places where gunfire is nobody's business: nobody inside one calls
+    -- gunfire in (Config.Witness), shots fired inside one don't count as
+    -- gunfire for a caller nearby, and nobody standing in one is ever
+    -- spotted. Applies to gunfire reports whether or not this block is
+    -- enabled. The shipped entries are the two Ammu-Nation shooting ranges;
+    -- add your own (a hunting lodge, a gun-club MLO) the same way. {} = none.
+    exemptZones = {
+        { coords = vector3(13.6, -1097.4, 29.8), radius = 25.0 },  -- Ammu-Nation range, Pillbox Hill (Adam's Apple Blvd)
+        { coords = vector3(821.7, -2163.4, 29.6), radius = 25.0 }, -- Ammu-Nation range, Cypress Flats
+    },
 
     tickMs = 1500,
 }
@@ -2255,9 +2550,12 @@ Config.Collision = {
 
 -- Live unit position registry (server/unit_registry.lua). The prerequisite
 -- server/dispatch.lua's header comment describes for real nearest-unit
--- dispatch -- collects data only in this pass, nothing yet reroutes a live
--- unit based on it. Off by default; even when off, client.lua's reporting
--- thread costs nothing beyond one idle Wait().
+-- dispatch. Nothing reroutes a live unit based on it; when on, dispatch
+-- prefers the player whose own ground unit is nearest a call as that call's
+-- host. Reports are only accepted for units the server already knows are the
+-- reporting player's, at the position the server itself sees. Off by
+-- default; even when off, client.lua's reporting thread costs nothing beyond
+-- one idle Wait().
 Config.UnitRegistry = {
     enabled = false,
 
@@ -2279,7 +2577,7 @@ Config.UnitRegistry = {
 Config.maxPoliceSpawnDistance = 140.0 -- This is the max distance around the player the spawn point for a new unit must be.
 Config.minPoliceSpawnDistance = 80.0 -- This is the min distance from the player a spawn point for a new unit must be.
 
-Config.maxHeliSpawnDistance = 500.0 -- This is the max distance around the player the spawn point for a new heli must be.
+Config.maxHeliSpawnDistance = 500.0 -- This is the max distance around the player the spawn point for a new heli must be. Pulled in to keep the heli inside OneSync scope (~400 m including its height).
 Config.minHeliSpawnDistance = 100.0 -- This is the min distance from the player a spawn point for a new heli must be. 
 Config.maxHeliSpawnHeight = 200.0 -- This is the max height the spawn point for a new heli must be.
 Config.minHeliSpawnHeight = 150.0 -- This is the min height the spawn point for a new heli must be.
@@ -2357,12 +2655,32 @@ Config.planeTooFarDistance = 800.0
 -- This is the number of seconds that must pass while a plane crew is too far away from the player before they are deleted.
 Config.farAirPilotCleanupTimer = 120 
 
--- This is the number of seconds that must pass after the player is no longer wanted before officers are deleted.
-Config.endWantedCleanupTimer = 5
+-- [Upstate Mafia] What becomes of the response once you have shaken it -- the
+-- wanted level ran out or decayed away. Every unit used to be deleted the
+-- moment the stars went, wherever it was, the cruiser at your bumper
+-- included. With this on they stand down instead: sirens off, officers on
+-- foot walk back to their car (one off screen is simply removed) and it
+-- drives off at an ordinary patrol pace; helicopters and planes climb away.
+-- Each is removed once it is off screen AND further than despawnDistance
+-- from you, or maxSeconds after it was sent off, in view or not. A unit
+-- leaving stays gone: wanted again before it is out of sight, you get fresh
+-- units while it keeps driving. A stolen cruiser is still yours to keep.
+--
+-- An arrest, a resource restart, or enabled = false removes every unit at
+-- once, as before. (This replaces Config.endWantedCleanupTimer, which nothing
+-- ever read.)
+Config.Departure = {
+    enabled = true,
+    despawnDistance = 150.0, -- metres from you, while off screen
+    maxSeconds = 45,         -- removed this long after leaving, regardless
+}
 
 -- This is the number of times a driver will try to unstick a vehicle before being teleported to the nearest road. 
 Config.maxCloseUnstuckAttempts = 4 
 Config.maxFarUnstuckAttempts = 4
+-- A unit standing still within this many metres of the player isn't treated
+-- as stuck: it's parked behind a car that has stopped, or closing in on foot.
+Config.unstuckMinPlayerDistance = 25.0
 --------------------
 
 

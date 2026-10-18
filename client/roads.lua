@@ -283,7 +283,7 @@ local function conservativeRoad(pos, heading)
         heading     = heading or 0.0,
         fwdLanes    = 1,
         bwdLanes    = 1,
-        width       = (cfg().laneWidth or 3.5) * 2.0,
+        width       = 0.0,
         approximate = true,
     }
 end
@@ -319,7 +319,9 @@ end
 ---   heading  number   heading of the src -> target direction ("direction A")
 ---   fwdLanes number   lanes travelling along direction A
 ---   bwdLanes number   lanes travelling against it
----   width    number   the road width the engine reports, for reference
+---   width    number   GET_CLOSEST_ROAD's last output, documented as the gap
+---                     between the two directions (the median); 0 on the
+---                     fallback shape. Only used with Config.Roads.medianAwareLanes.
 local function roadAt(x, y, z)
     local found, srcNode, targetNode, fwdLanes, bwdLanes, width =
         GetClosestRoad(x, y, z, 1.0, 1, true)
@@ -404,6 +406,62 @@ local function laneOffsetFromCentre(laneIndex, totalLanes, laneWidth)
     return (-(totalLanes * laneWidth) * 0.5) + ((laneIndex - 0.5) * laneWidth)
 end
 
+-- Ceiling on the median gap the median-aware layout will honour, so one bad
+-- reading can't throw a car off the road entirely.
+local MAX_MEDIAN = 15.0
+
+--- The gap between the two directions to lay lanes out from, or nil to use the
+--- centred layout above.
+---
+--- Config.Roads.medianAwareLanes, off by default. GET_CLOSEST_ROAD's last
+--- output is documented as the gap in the middle of the road between the
+--- forward and backward lanes, and on a two-way link the game lays each
+--- direction's lanes outward from that gap -- so the centred formula puts the
+--- inner lane of an uneven road (2 + 1) on the centre line, and the inner
+--- lanes of a boulevard on its median. Off until checked in-game with
+--- `/fenixroads here`, which prints both layouts. One-way links and the
+--- fallback shape always use the centred layout.
+local function medianOf(road, force)
+    if not force and cfg().medianAwareLanes ~= true then return nil end
+    if road.approximate or road.fwdLanes <= 0 or road.bwdLanes <= 0 then return nil end
+    local median = tonumber(road.width) or 0.0
+    return math.min(math.max(median, 0.0), MAX_MEDIAN)
+end
+
+--- Signed offset of lane `laneIndex` (numbered as above) from the centre line,
+--- in whichever layout is configured. Exposed so client/tactics.lua places
+--- roadblocks and strips in the same lanes units are spawned in.
+--- `forceMedian` is for the debug report only.
+local function laneOffset(road, laneIndex, laneWidth, forceMedian)
+    laneWidth = laneWidth or cfg().laneWidth or 3.5
+    local median = medianOf(road, forceMedian)
+    if not median then
+        return laneOffsetFromCentre(laneIndex, road.fwdLanes + road.bwdLanes, laneWidth)
+    end
+
+    -- Direction A holds the right-hand lanes, B the left-hand ones; k counts
+    -- out from the median, 1 being the innermost lane.
+    if laneIndex > road.bwdLanes then
+        local k = laneIndex - road.bwdLanes
+        return (median * 0.5) + ((k - 0.5) * laneWidth)
+    end
+    local k = road.bwdLanes - laneIndex + 1
+    return -((median * 0.5) + ((k - 0.5) * laneWidth))
+end
+FenixRoads.laneOffset = laneOffset
+
+--- Distance from the centre line to the outer edge of one direction's lanes,
+--- where the verge starts.
+local function edgeOffset(road, useA, laneWidth)
+    laneWidth = laneWidth or cfg().laneWidth or 3.5
+    local median = medianOf(road)
+    if not median then
+        return (road.fwdLanes + road.bwdLanes) * laneWidth * 0.5
+    end
+    return (median * 0.5) + ((useA and road.fwdLanes or road.bwdLanes) * laneWidth)
+end
+FenixRoads.edgeOffset = edgeOffset
+
 --- Put a vehicle in a real lane of `road`, travelling in a direction that road
 --- actually permits, preferring the direction that heads towards `towards`.
 ---
@@ -449,7 +507,7 @@ local function placeOnRoad(road, towards, opts)
     if opts.shoulder then
         -- Clear of every lane, on the verge to the right of travel. Right of
         -- direction B is the negative side of right-of-A.
-        offset = ((total * laneWidth) * 0.5) + (c.shoulderOffset or 1.5)
+        offset = edgeOffset(road, useA, laneWidth) + (c.shoulderOffset or 1.5)
         if not useA then offset = -offset end
     else
         -- Direction A occupies the rightmost `fwdLanes` slots and direction B
@@ -475,7 +533,7 @@ local function placeOnRoad(road, towards, opts)
             laneIndex = n                 -- count in from the left edge
         end
 
-        offset = laneOffsetFromCentre(laneIndex, total, laneWidth)
+        offset = laneOffset(road, laneIndex, laneWidth)
     end
 
     local rx, ry = rightOf(headingA)
@@ -666,6 +724,9 @@ local function reachable(pos, target, straightLine)
     return travel <= (straightLine * ratio)
 end
 
+-- How many of a pass's best-scored candidates get the reachable() check above.
+local MAX_ROUTE_CHECKS = 4
+
 
 --- Find somewhere a police vehicle can legitimately appear.
 ---
@@ -685,6 +746,13 @@ end
 ---   shoulder        boolean   park on the verge instead of in a lane
 ---   avoidVisible    boolean   never place inside the player's view
 ---   lanePreference  string    'outer' | 'inner' | 'random'
+---   maxForwardDot   number    how much of the player's forward arc is refused (see inFrontOfPlayer)
+---   separation      number    distance to keep from spots reserved by spawns in flight
+---                             (default Config.Roads.spawnSeparation)
+---   reserve         boolean   false: don't reserve the spot this returns (default true). For a
+---                             caller that creates the vehicle at once, with no spawn in flight
+---                             for later requests to keep clear of
+---   allowUnnamed, minDensity, clearance   passed through to FenixRoads.isSpawnable
 ---   reject          function  extra caller-supplied veto, receives coords, heading
 ---   score           function  extra caller-supplied bonus, receives coords, heading
 function FenixRoads.findSpawnPoint(origin, opts)
@@ -697,7 +765,7 @@ function FenixRoads.findSpawnPoint(origin, opts)
 
     local towards = opts.towards or origin
     local attempts = opts.attempts or c.spawnAttempts or 24
-    local bestPos, bestHeading, bestScore
+    local candidates = {}
     local lastReason = 'no road nearby'
 
     for _ = 1, attempts do
@@ -765,8 +833,6 @@ function FenixRoads.findSpawnPoint(origin, opts)
                         lastReason = 'in front of the player'
                     elseif opts.reject and opts.reject(pos, heading) then
                         lastReason = 'caller rejected'
-                    elseif not reachable(pos, towards, d) then
-                        lastReason = 'no road route to the target'
                     else
                         -- Mid-band is the sweet spot: close enough to matter,
                         -- far enough that the player drives up on it.
@@ -793,13 +859,29 @@ function FenixRoads.findSpawnPoint(origin, opts)
 
                         if opts.score then score = score + (opts.score(pos, heading) or 0.0) end
 
-                        if not bestScore or score > bestScore then
-                            bestPos, bestHeading, bestScore = pos, heading, score
-                        end
+                        -- A NaN score would make the sort below throw.
+                        if score ~= score then score = -math.huge end
+                        candidates[#candidates + 1] = { pos = pos, heading = heading, score = score, dist = d }
                     end
                 end
             end
         end
+    end
+
+    -- The route check runs last, best-scored first, and on only the top few:
+    -- CALCULATE_TRAVEL_DISTANCE_BETWEEN_POINTS is a synchronous path query,
+    -- and running it on every candidate of every pass made each dispatch a
+    -- visible frame hitch.
+    table.sort(candidates, function(a, b) return a.score > b.score end)
+
+    local bestPos, bestHeading
+    for i = 1, math.min(#candidates, MAX_ROUTE_CHECKS) do
+        local cand = candidates[i]
+        if reachable(cand.pos, towards, cand.dist) then
+            bestPos, bestHeading = cand.pos, cand.heading
+            break
+        end
+        lastReason = 'no road route to the target'
     end
 
     if not bestPos then
@@ -873,9 +955,21 @@ RegisterCommand('fenixroads', function(_, args)
         print(('  excluded   %s'):format(excluded and zoneName or 'no'))
         print(('  spawnable  %s'):format(ok and 'yes' or ('no - ' .. tostring(reason))))
         if road then
-            print(('  road       heading %.1f, %d lane(s) forward / %d back, width %.1f%s')
+            print(('  road       heading %.1f, %d lane(s) forward / %d back, median gap %.1f%s')
                 :format(road.heading, road.fwdLanes, road.bwdLanes, road.width,
                     road.approximate and '  [fallback: GET_CLOSEST_ROAD unavailable or failed the divided-road cross-check]' or ''))
+
+            -- Both lane layouts, so Config.Roads.medianAwareLanes can be
+            -- checked against the paint: stand on a lane and compare.
+            local lw = cfg().laneWidth or 3.5
+            local centred, aware = {}, {}
+            for lane = 1, road.fwdLanes + road.bwdLanes do
+                centred[#centred + 1] = ('%.1f'):format(laneOffsetFromCentre(lane, road.fwdLanes + road.bwdLanes, lw))
+                aware[#aware + 1] = ('%.1f'):format(laneOffset(road, lane, lw, true))
+            end
+            print(('  lanes      centred [%s]  median-aware [%s]  (in use: %s)')
+                :format(table.concat(centred, ', '), table.concat(aware, ', '),
+                    cfg().medianAwareLanes == true and 'median-aware' or 'centred'))
         else
             print('  road       none')
         end

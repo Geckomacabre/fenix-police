@@ -36,7 +36,95 @@ carjacking provenance note below.
 
 ---
 
-## Unreleased
+## 3.0.0 (2026-10-18): takedowns, felony stops, smarter chases, units that drive away
+
+A full fix pass over every subsystem plus nine new features. **None of the 3.0
+work has been run in a live session yet** -- it is lint-clean and compiles
+under Lua 5.4, but treat all of it as unplayed until tested (see Known
+limitations below). The entries further down, previously listed as
+unreleased, ship in this version too.
+
+### Added
+
+- **Less-lethal takedowns** (`Config.FootChase.takedown`): a non-hostile foot
+  chaser can tase you (wanted level 3 or lower, never while you hold a
+  firearm) or tackle you; once you're down, an officer close by cuffs you.
+- **Felony-stop surrender** (`Config.ArrestSystem.cover`, `heliOrbit`,
+  `surrenderHint`): one unit makes the arrest while the others stop, get out
+  and cover you without firing; a helicopter circles with its searchlight on;
+  on-screen hint shows how to cancel. Surrender now ends on death or after
+  `surrenderTimeoutMs` if nobody comes.
+- **Arrest presentation** (`Config.ArrestSystem.pairedCuffing`): the
+  arresting officer holsters and cuffs you with the paired arrest animation;
+  `bustedSubtitle` is drawn under BUSTED; a "suspect in custody" radio call.
+- **Chase tactics scale with wanted level** (`Config.Driving.chaseTactics`):
+  1-2 stars follow without contact, 3 boxes in, 4-5 ram.
+- **Interceptors** (`Config.Driving.interceptors`): every other ground unit
+  drives to the road ahead of you instead of tailing.
+- **Night and lights-off stealth** (`Config.Pursuit.night`): after dark,
+  running without lights (or on foot) shrinks how far officers can see you; a
+  heli's searchlight cancels it.
+- **Carjackings get called in** (`Config.Ambient.carjackResponse`): the
+  victim reports it, a nearby patrol or fresh units chase the carjacker, and
+  it ends like an ambient pursuit. This replaces the old "emergent via radar"
+  behaviour noted in earlier releases.
+- **Investigations can find the shooter** (`Config.Investigate.findSuspects`,
+  `spotRange`, `watchFromDistance`, `exemptZones`): an investigating unit
+  that sees the shooter visibly armed reports it, the server validates the
+  report and applies the wanted level, and the unit joins the pursuit.
+  Ammu-Nation shooting ranges are exempt.
+- **Units drive away instead of vanishing** (`Config.Departure`): when a
+  wanted level ends by evasion, units kill their sirens, re-board and drive
+  off, and are removed once out of sight and 150 m away (or after 45 s).
+  Replaces the never-read `Config.endWantedCleanupTimer`.
+- **Lint and CI**: `tools/lint.sh` (luacheck against the real FiveM native
+  lists, plus a `luac5.4` compile check), a lint workflow, and a release
+  workflow that attaches drop-in zips.
+
+### Changed
+
+- `Config.Toggles.arrestSystem` is now honoured and ships `true` (it was
+  `false` and never read).
+- `Config.Security.strictOwnership` now defaults to `true`;
+  `maxOwnedEntities` raised to 150; `maxAlertDistance` and the `alert` rate
+  limit removed; new `fieldReviveCooldown`.
+- Wanted status is reported on change plus a 15 s heartbeat instead of every
+  second.
+
+### Fixed
+
+Highlights of the fix pass (the commit history has the full list):
+
+- Surrender, arrest, ticket and WASTED flows can no longer lock the player
+  (frozen, cuffed, black screen or controls disabled) after an error, a
+  stalled fade or dying mid-flow; all waits are bounded.
+- Officers stop shooting a surrendering, arrested or downed player.
+- Units no longer stall forever: dead drivers are replaced, wrecked or
+  stolen cruisers are abandoned, foot chasers are recalled, stale tasks are
+  re-issued.
+- Helicopter/plane spawn requests can no longer lock air units out for the
+  rest of a pursuit; spawn caps count in-flight requests.
+- A vehicle with the player inside is never deleted from under them.
+- Per-unit state is cleaned up on every removal path, so recycled network
+  ids can't delete a live officer.
+- `client/client.lua` had grown past Lua's 200-locals limit and would not
+  compile; its self-contained sections are now scoped in `do ... end` blocks.
+
+### Known limitations
+
+- Nothing in 3.0 has been played. Timings and distances (heli orbit height,
+  paired-cuff timing, cover distance, departure distance) are first guesses.
+- Tasers assume a scripted shoot task will fire at a player in a passive
+  relationship group; if it doesn't, tasers simply never fire.
+- The Pillbox Hill Ammu-Nation exempt-zone coordinate is less certain than
+  Cypress Flats; check it with an in-game look before relying on it.
+- "Out of sight" for departing units is this client's view only.
+- The lint workflow's first run on GitHub never got a runner (no steps ran);
+  check the repository's Actions settings.
+
+---
+
+## Previously unreleased (ships in 3.0.0)
 
 ### Changed: qb-core/qbx_core is now optional, not required
 

@@ -66,11 +66,10 @@ local function pick(list)
 end
 
 --- Lane centre offset from the road's centre line, measured along right-of-A.
---- Same geometry as client/roads.lua uses to place a car in a lane — see the
---- comment on laneOffsetFromCentre there for why the centre line sits in the
---- middle of the full lane set.
-local function laneOffset(laneIndex, totalLanes, laneWidth)
-    return (-(totalLanes * laneWidth) * 0.5) + ((laneIndex - 0.5) * laneWidth)
+--- Straight from client/roads.lua, so a block or strip lands in exactly the
+--- lane a unit would be spawned in, whichever lane layout is configured there.
+local function laneOffset(road, laneIndex, laneWidth)
+    return FenixRoads.laneOffset(road, laneIndex, laneWidth)
 end
 
 --- Where the player is going, and how fast. Falls back to the ped's own heading
@@ -154,6 +153,56 @@ end
 -- Finding a spot ahead
 -------------------------------------------------------------------------------
 
+--- Would the player see something appear here?
+---
+--- In the camera's view AND with nothing solid between the camera and the
+--- spot. IS_SPHERE_VISIBLE alone is only a frustum test: to it everything ahead
+--- of a chase camera is "visible", hills and buildings in the way included, so
+--- nearly every spot ahead of the player was refused and blocks almost never
+--- got placed. The ray only runs for spots that pass the frustum test, and only
+--- from the tactics thread (never per frame) -- it waits a few frames for the
+--- result.
+local function inPlayerView(pos)
+    if not IsSphereVisible(pos.x, pos.y, pos.z, 6.0) then return false end
+
+    local cam = GetFinalRenderedCamCoord()
+    -- World geometry only (1): buildings, terrain, bridges. Props are left out
+    -- on purpose -- a lamp post in the way does not hide a roadblock.
+    local probe = StartShapeTestLosProbe(cam.x, cam.y, cam.z, pos.x, pos.y, pos.z + 1.5,
+        1, PlayerPedId(), 7)
+    for _ = 1, 30 do
+        local status, hit = GetShapeTestResult(probe)
+        if status == 2 then return not (hit == true or hit == 1) end
+        if status == 0 then break end
+        Wait(0)
+    end
+
+    -- No answer: assume it's in view rather than risk appearing in front of them.
+    return true
+end
+
+--- Is this spot on the road the player is actually driving, rather than a
+--- parallel street, a crossing road or an overpass that merely happens to be
+--- ahead in a straight line? The driving distance to it can't be much more
+--- than the straight-line one. (The road also has to run roughly the player's
+--- way; roadAhead checks that first, for free.)
+local function onPlayerRoute(from, road)
+    local ratio = cfg().routeRatio or 1.5
+    if ratio <= 0 then return true end
+
+    local straight = #(road.center - from)
+    local travel = CalculateTravelDistanceBetweenPoints(from.x, from.y, from.z,
+        road.center.x, road.center.y, road.center.z)
+    -- Zero or negative means the native had nothing to say; don't block on it.
+    if not travel or travel <= 0.0 then return true end
+    return travel <= (straight * ratio)
+end
+
+-- Route queries per roadAhead() call. CALCULATE_TRAVEL_DISTANCE_BETWEEN_POINTS
+-- is a synchronous path search, so it only runs for spots that passed every
+-- other test, and only this many times before the search waits for next time.
+local MAX_ROUTE_CHECKS = 3
+
 --- A road far enough ahead of the player, on the route they are actually taking.
 ---
 --- Returns the road info from client/roads.lua plus which of its two directions
@@ -166,6 +215,7 @@ local function roadAhead(minDist, maxDist)
     -- Sample from far to near: a block placed at the far end of the band gives
     -- the player longer to see it and decide, which is the difference between an
     -- obstacle and an ambush.
+    local routeChecks = 0
     for _ = 1, (cfg().placementAttempts or 12) do
         local dist = maxDist - (math.random() * (maxDist - minDist))
         local px = coords.x + (fx * dist)
@@ -173,16 +223,23 @@ local function roadAhead(minDist, maxDist)
 
         local road = FenixRoads.roadInfoAt(vector3(px, py, coords.z))
         if road then
-            local ok = FenixRoads.isSpawnable(road.center, { clearance = 0.0 })
-            if ok and not IsSphereVisible(road.center.x, road.center.y, road.center.z, 6.0) then
-                -- Which way along this road is the player going?
-                local rfx, rfy = forwardOf(road.heading)
-                local alongA = ((fx * rfx) + (fy * rfy)) >= 0.0
+            -- Which way along this road is the player going? A road running
+            -- across their path (|dot| small) is a cross street, not theirs.
+            local rfx, rfy = forwardOf(road.heading)
+            local dot = (fx * rfx) + (fy * rfy)
+            local alongA = dot >= 0.0
+            local lanes = alongA and road.fwdLanes or road.bwdLanes
 
-                local lanes = alongA and road.fwdLanes or road.bwdLanes
-                if lanes > 0 then
+            -- Cheapest first. The view check waits a frame or two for its ray;
+            -- the route check is the expensive one, so it goes last.
+            if lanes > 0 and math.abs(dot) >= 0.5
+                and FenixRoads.isSpawnable(road.center, { clearance = 0.0 })
+                and not inPlayerView(road.center) then
+                routeChecks = routeChecks + 1
+                if onPlayerRoute(coords, road) then
                     return road, alongA, lanes
                 end
+                if routeChecks >= MAX_ROUTE_CHECKS then return nil end
             end
         end
     end
@@ -198,8 +255,8 @@ end
 --- officers standing behind them.
 local function buildRoadblock()
     local c = cfg()
-    local road, alongA, lanes = roadAhead(c.roadblockMinDistance or 170.0,
-                                          c.roadblockMaxDistance or 300.0)
+    local road, alongA = roadAhead(c.roadblockMinDistance or 170.0,
+                                   c.roadblockMaxDistance or 300.0)
     if not road then return false end
     if tooCloseToExisting(road.center, c.minSpacing or 250.0) then return false end
 
@@ -231,14 +288,32 @@ local function buildRoadblock()
         firstLane, lastLane = 1, road.bwdLanes
     end
 
-    local model = pick(c.roadblockVehicles) or 'police'
+    -- Resolved up front (rather than inside createVehicle) so the spacing below
+    -- is measured off the model that will actually spawn.
+    local model = FenixLivery.resolveModel(pick(c.roadblockVehicles) or 'police', road.center)
+    local hash = GetHashKey(model)
+    if not loadModel(hash) then return false end
+
+    -- Broadside, each car spans its full length across the road, but a lane is
+    -- only laneWidth wide: one car per lane in a straight line overlaps its
+    -- neighbours by a metre or more, and cars spawned into each other get
+    -- thrown apart by the physics, scattering the block. Every other car is set
+    -- back by a car's width instead, so the line still leaves no gap.
+    local carLength, carWidth = 5.0, 2.2
+    local mn, mx = GetModelDimensions(hash)
+    if mn and mx and (mx.y - mn.y) > 1.0 and (mx.x - mn.x) > 0.5 then
+        carLength, carWidth = mx.y - mn.y, mx.x - mn.x
+    end
+    local stagger = ((carLength + 0.4) > laneWidth) and (carWidth + 0.5) or 0.0
+
     local built = 0
 
     for lane = firstLane, lastLane do
-        local off = laneOffset(lane, total, laneWidth)
+        local off = laneOffset(road, lane, laneWidth)
+        local back = (((lane - firstLane) % 2) == 1) and stagger or 0.0
         local rx, ry = rightOf(road.heading)
-        local x = road.center.x + (rx * off)
-        local y = road.center.y + (ry * off)
+        local x = road.center.x + (rx * off) + (awayX * back)
+        local y = road.center.y + (ry * off) + (awayY * back)
 
         local okGround, groundZ = GetGroundZFor_3dCoord(x, y, road.center.z + 3.0, false)
         local z = (okGround and math.abs(groundZ - road.center.z) < 6.0) and groundZ or road.center.z
@@ -292,13 +367,12 @@ end
 --- hundred metres is a decision.
 local function layStrips()
     local c = cfg()
-    local road, alongA, lanes = roadAhead(c.spikeMinDistance or 120.0,
-                                          c.spikeMaxDistance or 220.0)
+    local road, alongA = roadAhead(c.spikeMinDistance or 120.0,
+                                   c.spikeMaxDistance or 220.0)
     if not road then return false end
     if tooCloseToExisting(road.center, c.minSpacing or 250.0) then return false end
 
     local laneWidth = (Config.Roads and Config.Roads.laneWidth) or 3.5
-    local total = road.fwdLanes + road.bwdLanes
 
     local place = {
         kind = 'spikes',
@@ -306,13 +380,32 @@ local function layStrips()
         vehicles = {}, peds = {}, objects = {},
         createdAt = GetGameTimer(),
         armed = true,
-        radius = ((lanes * laneWidth) * 0.5) + 2.0,
     }
 
     local modelName = c.spikeModel or 'p_ld_stinger_s'
     local hash = GetHashKey(modelName)
     if not loadModel(hash) then return false end
 
+    -- Which way the strip model runs, read from the model rather than assumed
+    -- so a replacement spikeModel lies down correctly too. Its long axis has
+    -- to lie ACROSS the lane: laid along it, a strip only catches a car that
+    -- drives straight down its length. The same numbers drive the hit test.
+    local mn, mx = GetModelDimensions(hash)
+    local sizeX, sizeY = 0.0, 0.0
+    if mn and mx then sizeX, sizeY = mx.x - mn.x, mx.y - mn.y end
+    local longOnY = sizeY > sizeX
+    place.strip = {
+        longOnY   = longOnY,
+        halfLen   = math.max(sizeX, sizeY) * 0.5,
+        halfDepth = math.min(sizeX, sizeY) * 0.5,
+    }
+    if place.strip.halfLen < 0.5 then
+        -- No usable dimensions: assume a strip one lane long.
+        place.strip.halfLen, place.strip.halfDepth = laneWidth * 0.5, 0.3
+    end
+    local stripHeading = longOnY and ((road.heading + 90.0) % 360.0) or road.heading
+
+    local total = road.fwdLanes + road.bwdLanes
     local firstLane, lastLane
     if alongA then
         firstLane, lastLane = total - road.fwdLanes + 1, total
@@ -324,18 +417,16 @@ local function layStrips()
     local laid = 0
 
     for lane = firstLane, lastLane do
-        local off = laneOffset(lane, total, laneWidth)
+        local off = laneOffset(road, lane, laneWidth)
         local x = road.center.x + (rx * off)
         local y = road.center.y + (ry * off)
 
         local okGround, groundZ = GetGroundZFor_3dCoord(x, y, road.center.z + 3.0, false)
         local z = (okGround and math.abs(groundZ - road.center.z) < 6.0) and groundZ or road.center.z
 
-        -- The strip model is long on its own X, so it lies across the road at
-        -- the road's own heading rather than perpendicular to it.
         local obj = CreateObject(hash, x, y, z, false, false, false)
         if DoesEntityExist(obj) then
-            SetEntityHeading(obj, road.heading)
+            SetEntityHeading(obj, stripHeading)
             PlaceObjectOnGroundProperly(obj)
             SetEntityAsMissionEntity(obj, true, true)
             FreezeEntityPosition(obj, true)
@@ -352,7 +443,7 @@ local function layStrips()
     end
 
     -- The officer who laid them, on the verge and out of the way.
-    local shoulder = ((total * laneWidth) * 0.5) + 3.0
+    local shoulder = FenixRoads.edgeOffset(road, alongA, laneWidth) + 3.0
     if not alongA then shoulder = -shoulder end
     local px = road.center.x + (rx * shoulder)
     local py = road.center.y + (ry * shoulder)
@@ -365,36 +456,105 @@ local function layStrips()
     return true
 end
 
+-- Wheel bone -> tyre index for SET_VEHICLE_TYRE_BURST. Bikes use the lf/lr
+-- pair (0 front, 4 rear), six-wheelers add the middle pair.
+local WHEELS = {
+    { 'wheel_lf', 0 }, { 'wheel_rf', 1 },
+    { 'wheel_lm1', 2 }, { 'wheel_rm1', 3 },
+    { 'wheel_lr', 4 }, { 'wheel_rr', 5 },
+}
+
+-- Bone indices for the vehicle last checked, so they're looked up once per
+-- vehicle rather than six times every tick.
+local wheelVeh, wheelModel, wheelBones = 0, 0, {}
+
+local function wheelsOf(veh)
+    local model = GetEntityModel(veh)
+    if veh ~= wheelVeh or model ~= wheelModel then
+        wheelVeh, wheelModel, wheelBones = veh, model, {}
+        for _, w in ipairs(WHEELS) do
+            local bone = GetEntityBoneIndexByName(veh, w[1])
+            if bone ~= -1 then wheelBones[#wheelBones + 1] = { bone = bone, tyre = w[2] } end
+        end
+    end
+    return wheelBones
+end
+
+-- After the first tyre goes, a strip stays live this long so the rest of the
+-- same car's wheels can cross it too, then it's spent.
+local SPIKE_SPENT_MS = 2000
+
 --- Burst the tyres of anything that drives over a live strip.
 ---
 --- Scripted rather than left to the model's own collision, because the stinger
 --- prop has none that does this — in the base game the effect is driven entirely
 --- by mission script.
+---
+--- Tested per wheel against each strip's own footprint: only a tyre that rolls
+--- over a strip bursts. A wheel that moved from one side of the strip to the
+--- other since the last tick counts as having crossed it, so a fast car can't
+--- skip over a 0.3m strip between two 50ms ticks.
 local function checkSpikeHits()
     local ped = PlayerPedId()
     local veh = GetVehiclePedIsIn(ped, false)
     if veh == 0 then return end
-    if GetEntitySpeed(veh) < 2.0 then return end
+
+    -- Another player driving: their client owns the car, so a burst from here
+    -- wouldn't take.
+    local driver = GetPedInVehicleSeat(veh, -1)
+    if driver ~= 0 and driver ~= ped and IsPedAPlayer(driver) then return end
 
     local vc = GetEntityCoords(veh)
+    local now = GetGameTimer()
 
     for _, place in ipairs(placements) do
-        if place.kind == 'spikes' and place.armed and #(vc - place.coords) < (place.radius or 8.0) then
-            place.armed = false
-
-            local burst = 0
-            -- Wheel indices: 0/1 front, 2/3 mid (six-wheelers), 4/5 rear.
-            for wheel = 0, 5 do
-                if not IsVehicleTyreBurst(veh, wheel, false) then
-                    SetVehicleTyreBurst(veh, wheel, false, 1000.0)
-                    burst = burst + 1
+        if place.kind == 'spikes' and place.armed and place.strip then
+            if place.spentAt and now >= place.spentAt then
+                place.armed = false
+            elseif #(vc - place.coords) > 40.0 then
+                place.lastAcross = nil
+            else
+                if place.lastVeh ~= veh then
+                    place.lastVeh, place.lastAcross = veh, nil
                 end
-            end
+                place.lastAcross = place.lastAcross or {}
 
-            if burst > 0 then
-                dbg(('spikes hit: %d tyre(s)'):format(burst))
-                if cfg().spikeNotify ~= false then
-                    FenixFramework.Notify(cfg().spikeMessage or 'Spike strip!', 'error', 4000)
+                local s = place.strip
+                local burst = 0
+
+                for _, obj in ipairs(place.objects) do
+                    if DoesEntityExist(obj) then
+                        local prev = place.lastAcross[obj] or {}
+                        place.lastAcross[obj] = prev
+
+                        for _, w in ipairs(wheelsOf(veh)) do
+                            local wp = GetWorldPositionOfEntityBone(veh, w.bone)
+                            local off = GetOffsetFromEntityGivenWorldCoords(obj, wp.x, wp.y, wp.z)
+                            local along = s.longOnY and off.y or off.x
+                            local across = s.longOnY and off.x or off.y
+                            local before = prev[w.tyre]
+                            prev[w.tyre] = across
+
+                            local crossed = before ~= nil and (before < 0.0) ~= (across < 0.0)
+                                and math.abs(before) < 10.0 and math.abs(across) < 10.0
+                            if math.abs(along) <= (s.halfLen + 0.25) and math.abs(off.z) < 1.2
+                                and (math.abs(across) <= (s.halfDepth + 0.2) or crossed)
+                                and not IsVehicleTyreBurst(veh, w.tyre, false) then
+                                SetVehicleTyreBurst(veh, w.tyre, false, 1000.0)
+                                burst = burst + 1
+                            end
+                        end
+                    end
+                end
+
+                if burst > 0 then
+                    dbg(('spikes hit: %d tyre(s)'):format(burst))
+                    if not place.spentAt then
+                        place.spentAt = now + SPIKE_SPENT_MS
+                        if cfg().spikeNotify ~= false then
+                            FenixFramework.Notify(cfg().spikeMessage or 'Spike strip!', 'error', 4000)
+                        end
+                    end
                 end
             end
         end
@@ -415,6 +575,10 @@ function FenixTactics.clearPlacement(place)
             -- from under them is not.
             if not IsPedInVehicle(PlayerPedId(), veh, false) then
                 DeleteEntity(veh)
+            else
+                -- Theirs now: hand it to the game's population manager rather
+                -- than leaving it a mission entity that is never cleaned up.
+                SetEntityAsNoLongerNeeded(veh)
             end
         end
     end
@@ -495,6 +659,13 @@ CreateThread(function()
             -- during a search nobody does — which is also what stops a search
             -- turning into a wall of roadblocks in every direction.
             if not FenixPursuit.hasContact() then goto continue end
+
+            -- A road tactic means nothing to a suspect in the air or on the
+            -- water; placing one under a helicopter is just scenery.
+            local playerPed = PlayerPedId()
+            if IsPedInAnyHeli(playerPed) or IsPedInAnyPlane(playerPed) or IsPedInAnyBoat(playerPed) then
+                goto continue
+            end
 
             local _, _, speed = playerVector()
             local now = GetGameTimer()

@@ -136,6 +136,25 @@ function FenixJurisdiction.currentRegion()
     return cachedRegion
 end
 
+-- Which agency polices each region. Paleto, Sandy Shores and the countryside
+-- are all the County Sheriff, so crossing between them is not a handoff at all.
+local DEFAULT_AGENCIES = {
+    losSantos   = 'LSPD',
+    paletoBay   = 'Sheriff',
+    sandyShores = 'Sheriff',
+    countryside = 'Sheriff',
+}
+
+--- Human-readable agency for a region key: Config.Jurisdiction.agencies, then
+--- the defaults above, then the key itself for a region nobody named (a custom
+--- zone's own region is its own agency).
+function FenixJurisdiction.agencyOf(region)
+    if region == nil then return nil end
+    local agencies = cfg().agencies
+    if type(agencies) == 'table' and agencies[region] then return agencies[region] end
+    return DEFAULT_AGENCIES[region] or region
+end
+
 -------------------------------------------------------------------------------
 -- Crossing detection
 -------------------------------------------------------------------------------
@@ -148,35 +167,72 @@ end
 
 local lastRegion = nil
 
+-- A region the player has entered but not yet held for dwellMs. Roads that run
+-- along a boundary cross it every few seconds; without the dwell every one of
+-- those wobbles was a full handoff, radio call and all.
+local pendingRegion, pendingSince = nil, 0
+
+-- Last checkCrossing() call. client.lua only calls it while the player is
+-- wanted, so a long gap means no pursuit was running in between and the
+-- region seen last is stale -- the next call starts fresh instead of reporting
+-- wherever the player drove in the meantime as a crossing.
+local lastCheckAt = 0
+local STALE_AFTER_MS = 5000
+
+--- Forget the region history. Called when a pursuit ends, so the next one
+--- starts from wherever it starts rather than "crossing" out of the last one.
+function FenixJurisdiction.reset()
+    lastRegion = nil
+    pendingRegion, pendingSince = nil, 0
+    lastCheckAt = 0
+end
+
 --- Call once per maintainPoliceUnits pass. Returns fromRegion, toRegion when a
---- crossing just happened during an active pursuit, or nil otherwise —
---- client.lua uses a non-nil return to hand its currently-spawned units to
---- FenixMorale's retreat/regroup machinery and to key the radio handoff call.
+--- confirmed crossing between two DIFFERENT agencies just happened during an
+--- active pursuit, or nil otherwise. Confirmed means the new region has been
+--- held continuously for Config.Jurisdiction.dwellMs. This only reports and
+--- keys the radio; what happens to the units on scene is client.lua's call.
 function FenixJurisdiction.checkCrossing(pursuitActive)
     if cfg().enabled == false then return nil end
 
     local region = FenixJurisdiction.currentRegion()
+    local now = GetGameTimer()
+    local stale = (now - lastCheckAt) > STALE_AFTER_MS
+    lastCheckAt = now
 
-    if lastRegion == nil then
+    if lastRegion == nil or stale or not pursuitActive then
+        -- Wandering between regions with nobody chasing you is just driving
+        -- around; nothing hands off because nothing is currently responding.
         lastRegion = region
+        pendingRegion = nil
         return nil
     end
 
-    if region == lastRegion then return nil end
+    if region == lastRegion then
+        pendingRegion = nil
+        return nil
+    end
+
+    if region ~= pendingRegion then
+        pendingRegion, pendingSince = region, now
+        return nil
+    end
+    if (now - pendingSince) < (cfg().dwellMs or 8000) then return nil end
 
     local from = lastRegion
     lastRegion = region
+    pendingRegion = nil
 
-    if not pursuitActive then
-        -- Wandering between regions with nobody chasing you is just driving
-        -- around; nothing hands off because nothing is currently responding.
+    local fromAgency, toAgency = FenixJurisdiction.agencyOf(from), FenixJurisdiction.agencyOf(region)
+    if fromAgency == toAgency then
+        dbg(('crossing %s -> %s, same agency (%s), no handoff'):format(tostring(from), tostring(region), tostring(toAgency)))
         return nil
     end
 
-    dbg(('crossing: %s -> %s'):format(tostring(from), tostring(region)))
+    dbg(('crossing: %s -> %s (%s -> %s)'):format(tostring(from), tostring(region), tostring(fromAgency), tostring(toAgency)))
 
     if cfg().handoffRadio ~= false and FenixPursuit and FenixPursuit.announceHandoff then
-        FenixPursuit.announceHandoff(from, region)
+        FenixPursuit.announceHandoff(fromAgency, toAgency)
     end
 
     return from, region
@@ -184,5 +240,6 @@ end
 
 RegisterCommand('fenixjurisdiction', function()
     local region = FenixJurisdiction.currentRegion()
-    print(('[FENIX-JURISDICTION] current region: %s'):format(tostring(region)))
+    print(('[FENIX-JURISDICTION] current region: %s (%s)'):format(tostring(region),
+        tostring(FenixJurisdiction.agencyOf(region))))
 end, false)

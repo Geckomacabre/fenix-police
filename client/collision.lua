@@ -29,18 +29,31 @@ local function dbg(...)
     end
 end
 
+local lastVehicle = nil
 local lastHealth = nil
 local lastSpeed = 0.0
 local lastReportAt = 0
 
 local function checkForCrash()
     local playerPed = PlayerPedId()
-    if not IsPedInAnyVehicle(playerPed, false) then
+
+    -- A wanted player's knocks are the pursuit itself (PIT, rams, gunfire on
+    -- the car), not a collision anyone calls in. The sample is dropped too, so
+    -- the damage taken during the chase doesn't read as one crash when it ends.
+    if not IsPedInAnyVehicle(playerPed, false) or GetPlayerWantedLevel(PlayerId()) > 0 then
         lastHealth = nil
         return
     end
 
     local vehicle = GetVehiclePedIsIn(playerPed, false)
+
+    -- Samples only compare within one vehicle: swapping into an already
+    -- damaged car would otherwise read as a crash.
+    if vehicle ~= lastVehicle then
+        lastVehicle = vehicle
+        lastHealth = nil
+    end
+
     local health = GetVehicleBodyHealth(vehicle)
     local speed = GetEntitySpeed(vehicle)
 

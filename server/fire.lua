@@ -31,6 +31,7 @@ AddEventHandler('fenix-police:server:reportFire', function(coords)
         witnesses = { src },
         dedupeRadius = watchCfg.dedupeRadius or 50.0,
         dedupeWindowMs = watchCfg.dedupeWindowMs or 30000,
+        bucket = GetPlayerRoutingBucket(src),
     })
 end)
 

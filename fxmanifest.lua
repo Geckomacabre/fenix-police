@@ -1,9 +1,10 @@
 fx_version "cerulean"
 resource_manifest_version "05cfa83c-a124-4cfa-a768-c24a5811d8f9"
 game "gta5"
+lua54 "yes"
 author "Fenix, fork by Upstate Mafia"
 description "AI police dispatch and wanted levels, with ambient enforcement"
-version "2.7.0"
+version "3.0.0"
 
 shared_scripts {
     -- Needed by client/tracker.lua (lib.notify, lib.progressCircle). Nothing
@@ -37,7 +38,8 @@ client_scripts {
     'client/framework.lua',
 
     -- Applies ped combat/task natives on the server's behalf -- those natives
-    -- don't exist server-side. Self-contained, no ordering requirement.
+    -- don't exist server-side. Also defines ApplyChaseTactics, which
+    -- client.lua calls -- keep it above client.lua.
     'client/combat_bridge.lua',
 
     -- Shared road/lane/no-go-zone helper. Loaded first: both scripts below call
@@ -91,8 +93,8 @@ client_scripts {
     'client/investigate.lua',
 
     -- Moving violations (no helmet, wheelie, phone use). Loaded last: reads
-    -- ApplyWantedLevel from client.lua and calls
-    -- exports('fenix-police'):IsWitnessed, added in ambient.lua.
+    -- SetWantedLevel from client.lua and calls this resource's IsWitnessed
+    -- export, added in ambient.lua.
     'client/violations.lua'
 }
 
