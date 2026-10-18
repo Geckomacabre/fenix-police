@@ -896,6 +896,38 @@ Config.FootChase = {
         enabled = true,
         durationMs = 2500,
     },
+
+    -- Less-lethal takedowns. Without them a suspect who kept running was
+    -- followed forever or shot: surrender was the only way an arrest ever
+    -- started. A committed chaser who isn't shooting (see combatRange and
+    -- Config.Combat -- hostile chasers still shoot, as before) tases a
+    -- suspect in range at the lower wanted levels, or tackles one they've
+    -- caught up with. A suspect who goes down -- taser, tackle, K9, a fall --
+    -- with that officer within cuffRange is arrested through
+    -- Config.ArrestSystem, which has to be on for any of this to happen.
+    -- Never used against an on-duty police player. enabled = false: chasers
+    -- just chase, as before.
+    takedown = {
+        enabled = true,
+        taser = {
+            enabled = true,
+            maxWantedLevel = 3,          -- at or below this, a chaser draws a taser instead of chasing forever
+            weapon = 'WEAPON_STUNGUN',   -- given for the shot and taken back after, unless the officer carries one
+            minRange = 3.0, maxRange = 12.0,
+            cooldownMs = 6000,           -- per officer between shots (cartridge reload)
+            firearmBlocks = true,        -- never tase a suspect holding a firearm (that's a gun call, Config.Combat decides)
+        },
+        tackle = {
+            enabled = true,
+            maxWantedLevel = 5,
+            range = 1.8,                 -- chaser within this of a running suspect may tackle
+            chance = 0.45,               -- per attempt
+            cooldownMs = 3500,
+            ragdollMs = 2500,
+        },
+        cuffRange = 3.0,                 -- an officer this close to a downed suspect starts the arrest
+        getUpGraceMs = 4000,             -- wait at most this long for the ragdoll to end before cuffing
+    },
 }
 
 
@@ -990,13 +1022,51 @@ Config.ArrestSystem = {
     surrenderTimeoutMs = 90000,
     surrenderTimeoutMessage = 'Nobody came to take you in. Your hands are down.',
 
+    -- The felony stop. While one officer walks over, the units holding back
+    -- pull up and their officers get out and cover you from beside their
+    -- cars -- weapons on you, nobody firing -- until you're in cuffs, or the
+    -- surrender ends and they get back in. A unit gets out once its car
+    -- has stopped within `distance` metres of you; an officer already on foot
+    -- that close covers from where they are. enabled = false keeps everyone
+    -- seated and holding, as before.
+    cover = {
+        enabled = true,
+        distance = 45.0,
+    },
+
+    -- A police helicopter overhead circles you with its searchlight on while
+    -- your hands are up, then goes back to the chase or the search when the
+    -- surrender ends. radius and height/minHeight (the height it flies at,
+    -- and the lowest it will go) in metres, speed in m/s. enabled = false
+    -- leaves it on whatever it was doing.
+    heliOrbit = {
+        enabled = true,
+        radius = 30.0,
+        height = 45.0,
+        minHeight = 30.0,
+        speed = 12.0,
+    },
+
+    -- On-screen help while your hands are up. {key} is replaced with the key
+    -- the surrender command is bound to in your settings (H unless rebound).
+    -- Unset, this built-in text is used; '' shows no help text at all.
+    -- surrenderHint = 'Hands up. Officers are moving in — [{key}] to cancel',
+
     -- How long the BUSTED screen holds, in REAL milliseconds. This is measured
     -- with GetNetworkTime rather than GetGameTimer, because the cinematic runs at
     -- SetTimeScale(0.15) and game time would stretch 6s into roughly 40s.
     bustedDuration = 6000,
     bustedMaxDuration = 30000,     -- Hard ceiling, whatever bustedDuration says
     bustedSkippable = true,        -- SPACE or ENTER skips the rest of the cinematic
-    bustedSubtitle = 'Taken into custody',
+    bustedSubtitle = 'Taken into custody', -- line drawn under BUSTED; '' for none
+
+    -- The arresting officer holsters, steps round behind you and cuffs you
+    -- with the game's own paired arrest animation (pairedCuffMs long) before
+    -- the escort below. Anything that stops it -- the animation not loading,
+    -- the officer unable to get behind you -- falls back to the kneel, which
+    -- is also what false gives you.
+    pairedCuffing = true,
+    pairedCuffMs = 3500,
 
     -- Where you wake up: 'nearest' picks the closest station to the arrest,
     -- 'random' picks any station in the list below.
