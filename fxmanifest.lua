@@ -38,7 +38,8 @@ client_scripts {
     'client/framework.lua',
 
     -- Applies ped combat/task natives on the server's behalf -- those natives
-    -- don't exist server-side. Self-contained, no ordering requirement.
+    -- don't exist server-side. Also defines ApplyChaseTactics, which
+    -- client.lua calls -- keep it above client.lua.
     'client/combat_bridge.lua',
 
     -- Shared road/lane/no-go-zone helper. Loaded first: both scripts below call
