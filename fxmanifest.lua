@@ -4,7 +4,7 @@ game "gta5"
 lua54 "yes"
 author "Fenix, fork by Upstate Mafia"
 description "AI police dispatch and wanted levels, with ambient enforcement"
-version "2.7.0"
+version "3.0.0"
 
 shared_scripts {
     -- Needed by client/tracker.lua (lib.notify, lib.progressCircle). Nothing

@@ -746,6 +746,13 @@ local MAX_ROUTE_CHECKS = 4
 ---   shoulder        boolean   park on the verge instead of in a lane
 ---   avoidVisible    boolean   never place inside the player's view
 ---   lanePreference  string    'outer' | 'inner' | 'random'
+---   maxForwardDot   number    how much of the player's forward arc is refused (see inFrontOfPlayer)
+---   separation      number    distance to keep from spots reserved by spawns in flight
+---                             (default Config.Roads.spawnSeparation)
+---   reserve         boolean   false: don't reserve the spot this returns (default true). For a
+---                             caller that creates the vehicle at once, with no spawn in flight
+---                             for later requests to keep clear of
+---   allowUnnamed, minDensity, clearance   passed through to FenixRoads.isSpawnable
 ---   reject          function  extra caller-supplied veto, receives coords, heading
 ---   score           function  extra caller-supplied bonus, receives coords, heading
 function FenixRoads.findSpawnPoint(origin, opts)
