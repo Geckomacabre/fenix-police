@@ -94,6 +94,14 @@ local spawnedAirUnits = {} -- Table to store {unit = unit, officers = {driver = 
 local deadAirPeds = {} -- Table to store {officer = ped, timer = 0}
 local farAirPeds = {} -- Table to store {officer = ped, timer = 0}
 
+-- Units sent off at the end of a pursuit and still on their way out (see
+-- handleEndWantedTasks). Out of the three tables above, so nothing in the
+-- pursuit tasks or counts them again; their own ticker removes them once
+-- nobody can see them. Keyed by the record itself rather than the vehNetID:
+-- a record whose car is already gone can still have officers walking off
+-- while that id comes back on a newer unit.
+local departingUnits = {}
+
 local stuckAttempts = {}  -- Table to keep track of the number of attempts to unstick vehicle for each vehicle
 local stolenVehicles = {} -- Table to store vehicles by netID that the player stole and were not cleaned up, to delete later when the player has abandoned them
 
@@ -3500,372 +3508,670 @@ end
 
 
 
--- This function handles re-tasking the police when you first lose your wanted level so they drive off and stop pursuing the player.
-local function handleEndWantedTasks()
-
-
-    for vehNetID, vehicleData in pairs(spawnedVehicles) do
-        local vehicle = NetToVeh(vehNetID) -- vehicleData.vehicle -- NetToVeh(vehNetID)
-        
-        -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
-        local waitCount = 0
-        while (not vehicle or vehicle == 0) and waitCount < Config.controlWaitCount do
-            vehicle = NetToVeh(vehNetID)
-            Wait(Config.netWaitTime)
-            waitCount = waitCount + 1
-        end
-        if (not vehicle or vehicle == 0) then
-            if Config.isDebug then print('EndWantedUnit vehicle ID ' .. vehNetID .. ' NetToVeh still nil or 0, gave up ') end
-        end
-        --if Config.isDebug then print('CLIENT NetToVeh for netID ' ..vehNetID .. ' returned entityID ' .. vehicle)  end
-        --if Config.isDebug then print('CLIENT VehToNet for entityID ' ..vehicle.. ' returned NetID = ' .. VehToNet(vehicle))  end
-
-        for pedNetID, officerData in pairs(vehicleData.officers) do
-            local officer = NetToPed(pedNetID) --officerData -- NetToPed(pedNetID)
-
-            -- I've found that one call isn't enough, and it can take multiple NetToPed calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
-            local waitCount = 0
-            while (not officer or officer == 0) and waitCount < Config.controlWaitCount do
-                officer = NetToPed(pedNetID)
-                Wait(Config.netWaitTime)
-                waitCount = waitCount + 1
-            end
-            if not DoesEntityExist(officer) or officer == 0 then
-                if Config.isDebug then print('EndWantedUnit ped ID ' .. pedNetID .. ' NetToPed still nil or 0, gave up ') end
-            end
-            --if Config.isDebug then print('CLIENT NetToPed for netID ' ..pedNetID .. ' returned entityID ' .. officer)  end
-            --if Config.isDebug then print('CLIENT PedToNet for entityID ' ..officer.. ' returned NetID = ' .. PedToNet(officer))  end
-
-            if DoesEntityExist(officer) then
-                if Config.isDebug then print('Terminating tasks and setting cruise') end 
-
-                
-                if IsPedInVehicle(officer, vehicle, false) then
-                    ClearPedTasks(officer)
-                    TaskVehicleDriveWander(officer, vehicle, 30.0, 262571) 
-                    SetSirenKeepOn(vehicle, false) 
-                else
-                    ClearPedTasksImmediately(officer)
-                    if DoesEntityExist(vehicle) then
-                        -- Try to get back into own vehicle, not sure if tasks will be executed in order or if they will fail to drive off after?
-                        TaskEnterVehicle(officer, vehicle, 20000, -1, 1.5, 8, 0)
-                        TaskVehicleDriveWander(officer, vehicle, 30.0, 262571) 
-                    else
-                        TaskWanderStandard(officer, 10.0, 10)
-                    end    
-                end
-            end
-        end
-    end
-
-    for vehNetID, vehicleData in pairs(spawnedHeliUnits) do
-        local vehicle = NetToVeh(vehNetID)
-        
-        -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
-        local waitCount = 0
-        while (not vehicle or vehicle == 0) and waitCount < Config.controlWaitCount do
-            vehicle = NetToVeh(vehNetID)
-            Wait(Config.netWaitTime)
-            waitCount = waitCount + 1
-        end
-        if (not vehicle or vehicle == 0) then
-            if Config.isDebug then print('EndWantedHeli vehicle ID ' .. vehNetID .. ' NetToVeh still nil or 0, gave up ') end
-        end
-        --if Config.isDebug then print('CLIENT NetToVeh for netID ' ..vehNetID .. ' returned entityID ' .. vehicle)  end
-        --if Config.isDebug then print('CLIENT VehToNet for entityID ' ..vehicle.. ' returned NetID = ' .. VehToNet(vehicle))  end
-
-
-        for pedNetID, officerData in pairs(vehicleData.officers) do
-            local officer = NetToPed(pedNetID)
-
-            -- I've found that one call isn't enough, and it can take multiple NetToPed calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
-            local waitCount = 0
-            while (not officer or officer == 0) and waitCount < Config.controlWaitCount do
-                officer = NetToPed(pedNetID)
-                Wait(Config.netWaitTime)
-                waitCount = waitCount + 1
-            end
-            if not DoesEntityExist(officer) or officer == 0 then
-                if Config.isDebug then print('EndWantedHeli ped ID ' .. pedNetID .. ' NetToPed still nil or 0, gave up ') end
-            end
-            --if Config.isDebug then print('CLIENT NetToPed for netID ' ..pedNetID .. ' returned entityID ' .. officer)  end
-            --if Config.isDebug then print('CLIENT PedToNet for entityID ' ..officer.. ' returned NetID = ' .. PedToNet(officer))  end
-
-            if DoesEntityExist(officer) then
-
-                local driver = GetPedInVehicleSeat(vehicle, -1) 
-                if driver == officer then
-                    ClearPedTasks(officer)
-                    -- Re-use this logic to get point near here to fly to
-                    local flyPoint = getRandomPointInRange(GetEntityCoords(officer), Config.minHeliSpawnDistance, Config.maxHeliSpawnDistance, Config.minHeliSpawnHeight, Config.maxHeliSpawnHeight) 
-                    if flyPoint then
-                        TaskVehicleDriveToCoord(officer, vehicle, flyPoint.x, flyPoint.y, flyPoint.z, 60.0, 1, GetEntityModel(vehicle), 16777248, 70.0, true)
-                    end
-                else
-                    -- Prevent ped from leaving the vehicle
-                    TaskSetBlockingOfNonTemporaryEvents(officer, true)
-                    -- Clear specific combat-related tasks
-                    ClearPedTasks(officer)
-                    TaskSetBlockingOfNonTemporaryEvents(officer, false)
-                end
-            end
-        end
-    end
-
-    for vehNetID, vehicleData in pairs(spawnedAirUnits) do
-        local vehicle = NetToVeh(vehNetID)
-        
-        -- I've found that one call isn't enough, and it can take multiple NetToVeh calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
-        local waitCount = 0
-        while (not vehicle or vehicle == 0) and waitCount < Config.controlWaitCount do
-            vehicle = NetToVeh(vehNetID)
-            Wait(Config.netWaitTime)
-            waitCount = waitCount + 1
-        end
-        if (not vehicle or vehicle == 0) then
-            if Config.isDebug then print('EndWantedAir vehicle ID ' .. vehNetID .. ' NetToVeh still nil or 0, gave up ') end
-        end
-        --if Config.isDebug then print('CLIENT NetToVeh for netID ' ..vehNetID .. ' returned entityID ' .. vehicle)  end
-        --if Config.isDebug then print('CLIENT VehToNet for entityID ' ..vehicle.. ' returned NetID = ' .. VehToNet(vehicle))  end
-
-
-        for pedNetID, officerData in pairs(vehicleData.officers) do
-            local officer = NetToPed(pedNetID)
-
-            -- I've found that one call isn't enough, and it can take multiple NetToPed calls before it is not nil or == 0 regardless of the time that has passed since spawn. 
-            local waitCount = 0
-            while (not officer or officer == 0) and waitCount < Config.controlWaitCount do
-                officer = NetToPed(pedNetID)
-                Wait(Config.netWaitTime)
-                waitCount = waitCount + 1
-            end
-            if not DoesEntityExist(officer) or officer == 0 then
-                if Config.isDebug then print('EndWantedAir ped ID ' .. pedNetID .. ' NetToPed still nil or 0, gave up ') end
-            end
-            --if Config.isDebug then print('CLIENT NetToPed for netID ' ..pedNetID .. ' returned entityID ' .. officer)  end
-            --if Config.isDebug then print('CLIENT PedToNet for entityID ' ..officer.. ' returned NetID = ' .. PedToNet(officer))  end
-
-            if DoesEntityExist(officer) then
-                if Config.isDebug then print('Terminating tasks and setting cruise') end
-
-                local driver = GetPedInVehicleSeat(vehicle, -1) 
-                if driver == officer then
-                    ClearPedTasks(officer)
-                    -- Re-use this logic to get point near here to fly to
-                    local flyPoint = getRandomPointInRange(GetEntityCoords(officer), Config.minAirSpawnDistance, Config.maxAirSpawnDistance, Config.minAirSpawnHeight, Config.maxAirSpawnHeight) 
-                    if flyPoint then
-                        TaskVehicleDriveToCoord(officer, vehicle, flyPoint.x, flyPoint.y, flyPoint.z, 60.0, 1, GetEntityModel(vehicle), 16777248, 70.0, true)
-                    end
-                else
-                    -- Prevent ped from leaving the vehicle
-                    TaskSetBlockingOfNonTemporaryEvents(officer, true)
-                    -- Clear specific combat-related tasks
-                    ClearPedTasks(officer)
-                    TaskSetBlockingOfNonTemporaryEvents(officer, false)
-                end
-                
-            end
-        end
-    end
-
-end
-
-
-
-
--- This function handles deleting the police units when you have lost your wanted level and the timer has expired.
--- The above function + this function attempts to have the police drive off, then when far enough away delete them.
---
--- [Upstate Mafia] Single choke point for the aftermath.active guard, rather
--- than gating every caller individually. There are THREE independent paths
--- that call this: the main loop, a standalone watchdog thread, and the
--- fenix-police:cleanupAllPolice net event the server broadcasts. Gating them
--- one at a time missed the third one -- the server-triggered broadcast has
--- no idea aftermath exists at all, so it kept nuking every officer regardless
--- of what the client was doing. Gating the function itself covers all three
--- (and any future caller) in one place instead of relying on every call site
--- remembering to check.
-
---- Best-effort delete of a networked entity this client might not actually
---- own yet. NetworkRequestControlOfEntity is a REQUEST, not an instant grant
---- -- the transfer happens over subsequent network frames -- so calling
---- DeleteEntity in the same tick can silently no-op if it hasn't landed yet.
---- That is what a pursuit unit that "won't die" on cleanup actually is: not
---- every entity below requested control at the same moment, and only the
---- ones whose transfer happened to land before this ran got deleted, leaving
---- the rest (a heli is a single entity with no second chance from the 5-pass
---- watchdog's per-officer redundancy, which is why it tends to be the one
---- that visibly survives). Waits up to 150ms for control to actually land;
---- still attempts the delete either way, since an entity nobody else claims
---- ownership of eventually falls to whichever client is left holding it.
-local function deleteNetworkedEntity(entity)
-    if not DoesEntityExist(entity) then return end
-    if not NetworkHasControlOfEntity(entity) then
-        NetworkRequestControlOfEntity(entity)
-        local waited = 0
-        while not NetworkHasControlOfEntity(entity) and waited < 150 do
-            Wait(25)
-            waited = waited + 25
-        end
-    end
-    DeleteEntity(entity)
-end
-
---- Whether a player sits in any seat of `vehicle` -- a cruiser they stole.
-local function hasPlayerAboard(vehicle)
-    for seat = -1, GetVehicleMaxNumberOfPassengers(vehicle) - 1 do
-        local ped = GetPedInVehicleSeat(vehicle, seat)
-        if ped ~= 0 and IsPedAPlayer(ped) then return true end
-    end
-    return false
-end
-
---- A unit's vehicle at the end-of-wanted sweep. One with a player in it is
---- left to the server, which refuses an occupied vehicle and has this client
---- track it as stolen instead: deleted here, client-side, the car the player
---- had taken vanished from under them, and a kept stolen cruiser with it.
-local function deleteUnitVehicle(vehNetID)
-    local vehicle = vehFromNet(vehNetID)
-    if vehicle ~= 0 and not hasPlayerAboard(vehicle) then
-        deleteNetworkedEntity(vehicle)
-    end
-    TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
-end
-
 -- Foot-chase escalation state (see the FOOT CHASE section below). Declared up
 -- here so the sweep below can reset it: a pursuit starting inside the decay
 -- window used to open at the last one's escalation tier.
 local breachResistance = 0
 local lastBreachResistanceAt = 0
 
-local function handleEndWantedDelete(force)
-    if aftermath.active then return end
-    -- [Upstate Mafia] Don't let a stray/global cleanup (the watchdog below, or
-    -- the server's cleanupAllPolice broadcast reacting to another player's
-    -- wanted status) delete the officer that's mid-approach to arrest you.
-    -- Without this, a brief wanted-level blip while you're surrendering wipes
-    -- the responding unit before it ever reaches arrestDistance -- the cop
-    -- "disappears" and isSurrendering never gets a wanted-level-cleared tick
-    -- to release the control lock, so you're stuck. The arrest itself is held
-    -- the same way: triggerArrest() clears isSurrendering as it starts, and
-    -- the wanted level decaying during the escort deleted the officers and the
-    -- car the player was being walked to. triggerArrest() passes force=true
-    -- for its own end-of-cinematic cleanup, which must run even while
-    -- isBeingArrested is still true.
-    if not force and (isSurrendering or isBeingArrested) then return end
+-- END OF A PURSUIT --
+--
+-- What becomes of the response once the wanted level is gone. Shaken -- run
+-- out or decayed away -- every unit is sent off (handleEndWantedTasks):
+-- sirens off, officers walk back to their car and it drives away at a patrol
+-- pace, aircraft climb away, and each is removed only once nobody can see it
+-- (Config.Departure). Ended by force -- the arrest, the resource stopping --
+-- or with Config.Departure.enabled = false, everything goes at once
+-- (handleEndWantedDelete), the units already leaving included.
+--
+-- Everything here lives inside one block. Lua caps a chunk at 200 local
+-- variables, this file is up against that cap, and only the two entry points
+-- below are needed by the rest of it.
+local handleEndWantedTasks
+local handleEndWantedDelete
 
-    -- [Upstate Mafia] Every officer is about to be wiped below regardless of
-    -- which unit/task they belonged to, so any outstanding breach shield
-    -- (client.lua's escalation section) goes with them in one pass here
-    -- rather than relying on each unit's own foot-chase cleanup path to have
-    -- caught its own -- ReleaseAllBreachShields is safe to call even when
-    -- nothing is outstanding.
-    ReleaseAllBreachShields()
+do
+    -- How long a unit waits for its officers on foot to climb back in before
+    -- it drives off without whoever hasn't.
+    local DEPARTURE_BOARD_MS = 15000
 
-    -- Everything below is about to be wiped regardless of per-unit state, so
-    -- the event-driven backup score and any in-progress retreat/regroup
-    -- bookkeeping go with it -- the next pursuit starts clean rather than
-    -- inheriting a decaying score or a phantom "unit X is retreating" record
-    -- for a unit that no longer exists.
-    if FenixBackup then FenixBackup.reset() end
-    if FenixMorale then FenixMorale.resetAll() end
+    -- The drive away is dismissUnit's roadside-stop send-off, so the two read
+    -- alike from the kerb: an ordinary patrol pace, obeying lights and
+    -- avoiding traffic (786603).
+    local DEPARTURE_DRIVE_SPEED = 16.0
+    local DEPARTURE_DRIVING_STYLE = 786603
 
-    -- Collect keys BEFORE iterating so that nilling entries mid-loop (which Lua's
-    -- pairs iterator can silently skip) doesn't leave orphan units behind.
+    -- An aircraft climbs away to a point this far out along the line from the
+    -- player through it, this much higher than whichever is higher, itself or
+    -- the ground there. A plane covers a helicopter's leg in a few seconds and
+    -- then has nowhere left to go, so it gets a longer one.
+    local DEPARTURE_FLIGHT_DISTANCE = { heli = 600.0, air = 2000.0 }
+    local DEPARTURE_CLIMB = 100.0
 
-    -- K9s are client-local (not networked, not server-owned), so the dog is
-    -- the one entity in the whole sweep that's a plain DeleteEntity rather
-    -- than deleteNetworkedEntity/deleteSpawnedPed -- see deleteK9 and
-    -- Config.K9's header comment. Its car is about to be deleted below, so
-    -- there's nothing left for it to run back to.
-    deleteK9()
+    local TASK_DRIVE_WANDER = GetHashKey('SCRIPT_TASK_VEHICLE_DRIVE_WANDER')
 
-    -- Ground units
-    local groundKeys = {}
-    for k in pairs(spawnedVehicles) do table.insert(groundKeys, k) end
-    for _, vehNetID in ipairs(groundKeys) do
-        local vehicleData = spawnedVehicles[vehNetID]
-        if vehicleData then
-            local pedKeys = {}
-            for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
-            for _, pedNetID in ipairs(pedKeys) do
-                deleteNetworkedEntity(pedFromNet(pedNetID))
-                TriggerServerEvent('deleteSpawnedPed', pedNetID)
-                if Config.isDebug then print('Cleaned up police officer ' .. pedNetID) end
+    local function departureCfg() return Config.Departure or {} end
+    local function departuresEnabled() return departureCfg().enabled ~= false end
+
+    --- Best-effort delete of a networked entity this client might not actually
+    --- own yet. NetworkRequestControlOfEntity is a REQUEST, not an instant grant
+    --- -- the transfer happens over subsequent network frames -- so calling
+    --- DeleteEntity in the same tick can silently no-op if it hasn't landed yet.
+    --- That is what a pursuit unit that "won't die" on cleanup actually is: not
+    --- every entity below requested control at the same moment, and only the
+    --- ones whose transfer happened to land before this ran got deleted, leaving
+    --- the rest (a heli is a single entity with no second chance from the 5-pass
+    --- watchdog's per-officer redundancy, which is why it tends to be the one
+    --- that visibly survives). Waits up to 150ms for control to actually land;
+    --- still attempts the delete either way, since an entity nobody else claims
+    --- ownership of eventually falls to whichever client is left holding it.
+    local function deleteNetworkedEntity(entity)
+        if not DoesEntityExist(entity) then return end
+        if not NetworkHasControlOfEntity(entity) then
+            NetworkRequestControlOfEntity(entity)
+            local waited = 0
+            while not NetworkHasControlOfEntity(entity) and waited < 150 do
+                Wait(25)
+                waited = waited + 25
             end
-            deleteUnitVehicle(vehNetID)
-            if Config.isDebug then print('Cleaned up police vehicle ' .. vehNetID) end
-            spawnedVehicles[vehNetID] = nil
+        end
+        DeleteEntity(entity)
+    end
+
+    --- Whether a player sits in any seat of `vehicle` -- a cruiser they stole.
+    local function hasPlayerAboard(vehicle)
+        for seat = -1, GetVehicleMaxNumberOfPassengers(vehicle) - 1 do
+            local ped = GetPedInVehicleSeat(vehicle, seat)
+            if ped ~= 0 and IsPedAPlayer(ped) then return true end
+        end
+        return false
+    end
+
+    --- A unit's vehicle at the end-of-wanted sweep. One with a player in it is
+    --- left to the server, which refuses an occupied vehicle and has this client
+    --- track it as stolen instead: deleted here, client-side, the car the player
+    --- had taken vanished from under them, and a kept stolen cruiser with it.
+    local function deleteUnitVehicle(vehNetID)
+        local vehicle = vehFromNet(vehNetID)
+        if vehicle ~= 0 and not hasPlayerAboard(vehicle) then
+            deleteNetworkedEntity(vehicle)
+        end
+        TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
+    end
+
+    --- One entity of a departing unit, gone through the same server delete
+    --- events the sweep sends, so the server's ownership checks decide exactly
+    --- as they always have. Deleted here as well only when this client owns it
+    --- already: a departure never waits on a control request, so nothing in it
+    --- yields and no other pass can find a unit half handled.
+    local function dropEntity(entity, netID, event)
+        if DoesEntityExist(entity) and NetworkHasControlOfEntity(entity) then
+            DeleteEntity(entity)
+        end
+        TriggerServerEvent(event, netID)
+    end
+
+    --- The net id a living officer of this departing unit is tracked under;
+    --- nil for a body, a player, or anybody else.
+    local function departingOfficer(record, ped)
+        if ped == 0 or IsPedAPlayer(ped) or IsPedDeadOrDying(ped, true) then return nil end
+        for pedNetID, handle in pairs(record.officers) do
+            if handle == ped then return pedNetID end
+        end
+        return nil
+    end
+
+    --- A free seat for an officer walking back that no crewmate is already
+    --- heading for. The wheel first, so whoever reaches the car first can take
+    --- it away.
+    local function departureSeat(record, vehicle, pedNetID)
+        for seat = -1, GetVehicleMaxNumberOfPassengers(vehicle) - 1 do
+            if IsVehicleSeatFree(vehicle, seat) then
+                local claimed = false
+                for other, otherSeat in pairs(record.seats) do
+                    if other ~= pedNetID and otherSeat == seat then
+                        claimed = true
+                        break
+                    end
+                end
+                if not claimed then return seat end
+            end
+        end
+        return nil
+    end
+
+    --- Sirens are already off: the driver takes the car away at a patrol pace.
+    local function driveOff(record, pedNetID, driver, vehicle)
+        if not NetworkHasControlOfEntity(driver) then NetworkRequestControlOfEntity(driver) end
+        ClearPedTasks(driver)
+        SetDriverAbility(driver, 0.9)
+        SetDriverAggressiveness(driver, 0.2)
+        TaskVehicleDriveWander(driver, vehicle, DEPARTURE_DRIVE_SPEED, DEPARTURE_DRIVING_STYLE)
+        record.driver = driver
+        markTaskIssued(record, pedNetID)
+    end
+
+    --- A straight climb away from the player. Directly overhead, any direction
+    --- is away.
+    local function climbAway(pilot, aircraft, kind, playerCoords)
+        local pos = GetEntityCoords(aircraft)
+        local dirX, dirY = pos.x - playerCoords.x, pos.y - playerCoords.y
+        local flat = math.sqrt((dirX * dirX) + (dirY * dirY))
+        if flat < 1.0 then
+            local bearing = math.random() * 2.0 * math.pi
+            dirX, dirY = math.cos(bearing), math.sin(bearing)
+        else
+            dirX, dirY = dirX / flat, dirY / flat
+        end
+
+        local distance = DEPARTURE_FLIGHT_DISTANCE[kind] or DEPARTURE_FLIGHT_DISTANCE.heli
+        local x, y = pos.x + (dirX * distance), pos.y + (dirY * distance)
+        local z = math.max(pos.z, GetHeightmapTopZForPosition(x, y) or pos.z) + DEPARTURE_CLIMB
+
+        if kind == 'air' then
+            -- 4 = go to. Flight height is above sea level; 80 m clear of terrain.
+            TaskPlaneMission(pilot, aircraft, 0, 0, x, y, z, 4, 70.0, 100.0, -1.0, math.floor(z), 80, true)
+        else
+            -- 4 = go to, at 35 m/s; no height cap, never below 60 m.
+            TaskHeliMission(pilot, aircraft, 0, 0, x, y, z, 4, 35.0, 30.0, -1.0, -1, 60, -1.0, 0)
         end
     end
 
-    -- Heli units
-    local heliKeys = {}
-    for k in pairs(spawnedHeliUnits) do table.insert(heliKeys, k) end
-    for _, vehNetID in ipairs(heliKeys) do
-        local vehicleData = spawnedHeliUnits[vehNetID]
-        if vehicleData then
-            local pedKeys = {}
-            for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
-            for _, pedNetID in ipairs(pedKeys) do
-                deleteNetworkedEntity(pedFromNet(pedNetID))
-                TriggerServerEvent('deleteSpawnedPed', pedNetID)
-                if Config.isDebug then print('Cleaned up heli officer ' .. pedNetID) end
+    --- One tick of one departing unit, which leaves departingUnits once
+    --- nothing of it is left. The officers and the car each go on their own:
+    --- an officer on foot as soon as he is off screen -- a walk back to the
+    --- car nobody is watching isn't worth waiting for -- and a body, or a car
+    --- with whoever is in it, once off screen AND further than despawnDistance;
+    --- all of it at maxSeconds regardless, or now with `force`. Anything that
+    --- has left this client's scope is deleted through the server by net id.
+    --- Never yields.
+    local function tickDeparture(record, playerCoords, now, force)
+        local c = departureCfg()
+        local expired = force or now - record.since >= (tonumber(c.maxSeconds) or 45) * 1000
+        local despawnDistance = tonumber(c.despawnDistance) or 150.0
+        local function outOfSight(entity)
+            return not IsEntityOnScreen(entity) and #(GetEntityCoords(entity) - playerCoords) > despawnDistance
+        end
+
+        -- The car, while it is still here and still ours to drive.
+        local vehicle, vehicleOutOfScope = 0, false
+        if record.vehicle ~= 0 then
+            local current = vehFromNet(record.vehNetID)
+            if current == 0 then
+                -- Out of this client's scope; deleted after its crew, below.
+                vehicleOutOfScope = true
+            elseif current ~= record.vehicle then
+                -- The id names another vehicle now: ours is already gone,
+                -- and that one isn't ours to touch.
+                record.vehicle = 0
+            elseif hasPlayerAboard(current) then
+                -- Taken on its way out: the player's, as in the sweep.
+                TriggerServerEvent('deleteSpawnedVehicle', record.vehNetID)
+                record.vehicle = 0
+            else
+                vehicle = current
             end
-            deleteUnitVehicle(vehNetID)
-            if Config.isDebug then print('Cleaned up heli unit ' .. vehNetID) end
-            spawnedHeliUnits[vehNetID] = nil
+        end
+        if vehicle ~= 0 and record.usable and (IsEntityDead(vehicle) or not IsVehicleDriveable(vehicle, false)) then
+            record.usable = false
+        end
+        local usable = vehicle ~= 0 and record.usable and not expired
+        if not usable then
+            -- Nothing to walk back to any more: whoever was is let go below.
+            for pedNetID in pairs(record.seats) do record.seats[pedNetID] = nil end
+        end
+
+        for pedNetID, ped in pairs(record.officers) do
+            local current = pedFromNet(pedNetID)
+            local seatVehicle = current == ped and GetVehiclePedIsIn(ped, false) or 0
+            local remove
+            if current ~= ped or expired then
+                remove = true
+            elseif seatVehicle ~= 0 then
+                remove = outOfSight(seatVehicle)
+            elseif IsPedDeadOrDying(ped, true) then
+                remove = outOfSight(ped)
+            else
+                remove = not IsEntityOnScreen(ped)
+            end
+
+            if remove then
+                if current == ped then
+                    dropEntity(ped, pedNetID, 'deleteSpawnedPed')
+                elseif current == 0 then
+                    TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                end
+                record.officers[pedNetID] = nil
+                record.seats[pedNetID] = nil
+            elseif not IsPedDeadOrDying(ped, true) then
+                if seatVehicle == 0 then
+                    -- No car to go back to, no room in it, or it left
+                    -- without him: he walks off instead.
+                    if not record.seats[pedNetID] and not record.walking[pedNetID] then
+                        TaskWanderStandard(ped, 10.0, 10)
+                        record.walking[pedNetID] = true
+                    end
+                elseif (seatVehicle ~= vehicle or not usable) and not record.exiting[pedNetID]
+                    and not IsEntityInAir(seatVehicle) then
+                    -- Sat in a wreck, or in a car the player has taken.
+                    TaskLeaveVehicle(ped, seatVehicle, 0)
+                    record.exiting[pedNetID] = true
+                end
+            end
+        end
+
+        if usable and record.kind == 'ground' then
+            if record.phase == 'boarding' then
+                local waiting = record.k9 ~= nil and activeK9 == record.k9
+                for pedNetID, seat in pairs(record.seats) do
+                    local ped = record.officers[pedNetID]
+                    if IsPedDeadOrDying(ped, true) or GetVehiclePedIsIn(ped, false) == vehicle then
+                        record.seats[pedNetID] = nil
+                    else
+                        waiting = true
+                        -- Knocked off the walk back or beaten to the seat --
+                        -- or the wheel is free again, the officer heading for
+                        -- it removed on the way: again, to a seat still free.
+                        -- Left as it was, the car would wait for everyone and
+                        -- then have nobody to drive it.
+                        local takeWheel = seat ~= -1 and departureSeat(record, vehicle, pedNetID) == -1
+                        if takeWheel or taskLapsed(record, pedNetID, ped, TASK_ENTER_VEHICLE) then
+                            local retry = takeWheel and -1
+                                or (IsVehicleSeatFree(vehicle, seat) and seat or departureSeat(record, vehicle, pedNetID))
+                            record.seats[pedNetID] = retry
+                            if retry then
+                                TaskEnterVehicle(ped, vehicle, DEPARTURE_BOARD_MS, retry, 2.0, 1, 0)
+                                markTaskIssued(record, pedNetID)
+                            end
+                        end
+                    end
+                end
+
+                if not waiting or now - record.since >= DEPARTURE_BOARD_MS then
+                    record.phase = 'leaving'
+                    for pedNetID in pairs(record.seats) do
+                        TaskWanderStandard(record.officers[pedNetID], 10.0, 10)
+                        record.walking[pedNetID] = true
+                        record.seats[pedNetID] = nil
+                    end
+                end
+            end
+
+            if record.phase == 'leaving' then
+                local driver = GetPedInVehicleSeat(vehicle, -1)
+                local driverNetID = departingOfficer(record, driver)
+                if driverNetID then
+                    if record.driver ~= driver or taskLapsed(record, driverNetID, driver, TASK_DRIVE_WANDER) then
+                        driveOff(record, driverNetID, driver, vehicle)
+                    end
+                elseif driver == 0 and not record.shuffled then
+                    -- Nobody came back for the wheel: the front passenger
+                    -- moves across.
+                    local front = GetPedInVehicleSeat(vehicle, 0)
+                    if departingOfficer(record, front) then
+                        TaskShuffleToNextVehicleSeat(front, vehicle)
+                        record.shuffled = true
+                    end
+                end
+            end
+        elseif usable and not record.driver then
+            local pilot = GetPedInVehicleSeat(vehicle, -1)
+            if departingOfficer(record, pilot) then
+                climbAway(pilot, vehicle, record.kind, playerCoords)
+                record.driver = pilot
+            end
+        end
+
+        if vehicleOutOfScope then
+            TriggerServerEvent('deleteSpawnedVehicle', record.vehNetID)
+            record.vehicle = 0
+        elseif vehicle ~= 0 then
+            local crewAboard = false
+            for _, ped in pairs(record.officers) do
+                if GetVehiclePedIsIn(ped, false) == vehicle then
+                    crewAboard = true
+                    break
+                end
+            end
+            if not crewAboard and (expired or outOfSight(vehicle)) then
+                dropEntity(vehicle, record.vehNetID, 'deleteSpawnedVehicle')
+                record.vehicle = 0
+            end
+        end
+
+        if record.vehicle == 0 and next(record.officers) == nil then
+            departingUnits[record] = nil
+            -- The dog doesn't outlast its unit, as it didn't in the sweep.
+            if record.k9 and activeK9 == record.k9 then deleteK9() end
         end
     end
 
-    -- Air units
-    local airKeys = {}
-    for k in pairs(spawnedAirUnits) do table.insert(airKeys, k) end
-    for _, vehNetID in ipairs(airKeys) do
-        local vehicleData = spawnedAirUnits[vehNetID]
-        if vehicleData then
-            local pedKeys = {}
-            for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
-            for _, pedNetID in ipairs(pedKeys) do
-                deleteNetworkedEntity(pedFromNet(pedNetID))
-                TriggerServerEvent('deleteSpawnedPed', pedNetID)
-                if Config.isDebug then print('Cleaned up air officer ' .. pedNetID) end
-            end
-            deleteUnitVehicle(vehNetID)
-            if Config.isDebug then print('Cleaned up air unit ' .. vehNetID) end
-            spawnedAirUnits[vehNetID] = nil
+    --- tickDeparture under pcall. A unit that errors is removed outright
+    --- rather than left erroring every tick -- by id through the server if
+    --- even that fails, so it can't be left in the world untracked.
+    local function safeTickDeparture(record, playerCoords, now, force)
+        local ok, err = pcall(tickDeparture, record, playerCoords, now, force)
+        if ok then return end
+        print(('^1[fenix-police] departing unit %s errored, removing it: %s^7'):format(tostring(record.vehNetID), tostring(err)))
+        if not pcall(tickDeparture, record, playerCoords, now, true) then
+            for pedNetID in pairs(record.officers) do TriggerServerEvent('deleteSpawnedPed', pedNetID) end
+            if record.vehicle ~= 0 then TriggerServerEvent('deleteSpawnedVehicle', record.vehNetID) end
+            departingUnits[record] = nil
         end
     end
 
-    -- Reset pending spawn counters so the next chase starts clean
-    pendingGroundSpawns = 0
-    pendingHeliSpawns   = 0
-    pendingAirSpawns    = 0
+    --- Takes one unit out of the pursuit and starts it leaving: a record the
+    --- departure ticker owns from here on, sirens off, every officer stood
+    --- down. Nothing they see or hear on the way out turns them back -- a
+    --- suspect who is wanted again is answered by fresh units, not these.
+    --- Who walks back to the car is decided here; the rest of the tasking is
+    --- tickDeparture's, run straight after. The record is complete before
+    --- anything is tasked, so a unit this errors on partway is still removed
+    --- by the ticker in the end.
+    local function sendUnitAway(vehNetID, vehicleData, kind, now)
+        local record = {
+            vehNetID = vehNetID, kind = kind, since = now, phase = 'leaving',
+            vehicle = 0, usable = false,
+            officers = {}, seats = {}, walking = {}, exiting = {},
+        }
+        departingUnits[record] = true
 
-    -- Per-net-id bookkeeping goes with the units it describes. OneSync reuses
-    -- network ids, so anything left here attaches itself to whatever entity
-    -- gets the id next: a dead/far timer from this pursuit resumed in the next
-    -- one and sent deleteSpawnedPed for a live officer that now held the id,
-    -- and a unit whose stuck counter had hit its limit left the next unit with
-    -- that id never monitored at all.
-    stuckAttempts = {}
-    deadPeds = {}
-    farOfficers = {}
-    deadHeliPeds = {}
-    farHeliPeds = {}
-    deadAirPeds = {}
-    farAirPeds = {}
+        for pedNetID in pairs(vehicleData.officers) do
+            local ped = pedFromNet(pedNetID)
+            if ped == 0 then
+                -- Out of this client's scope: nobody here can see them go,
+                -- and the server can still reach them by id.
+                TriggerServerEvent('deleteSpawnedPed', pedNetID)
+            else
+                record.officers[pedNetID] = ped
+            end
+        end
 
-    -- The escalation tier belongs to the pursuit that earned it.
-    breachResistance = 0
-    lastBreachResistanceAt = 0
+        local vehicle = vehFromNet(vehNetID)
+        if vehicle == 0 or hasPlayerAboard(vehicle) then
+            -- Out of scope, where only the server can reach it; or a car the
+            -- player has taken, which the server refuses while they're in it
+            -- and has this client track as stolen -- as the sweep does.
+            TriggerServerEvent('deleteSpawnedVehicle', vehNetID)
+            vehicle = 0
+        end
+        record.vehicle = vehicle
 
-    -- Close the spawn gate so any in-flight server responses that arrive AFTER this
-    -- cleanup are discarded rather than re-populating the tracking tables with cops
-    -- that will never be cleaned up again.
-    spawnGate = false
+        for _, ped in pairs(record.officers) do
+            if not IsPedDeadOrDying(ped, true) then
+                standDownOfficer(ped)
+                SetBlockingOfNonTemporaryEvents(ped, true)
+                -- Ends a firefight, a foot chase or a scenario at the scene.
+                -- A seated officer stays seated.
+                ClearPedTasks(ped)
+            end
+        end
+        if vehicle == 0 then return record end
 
-    if Config.isDebug then print('All Units Cleaned Up') end
+        if not NetworkHasControlOfEntity(vehicle) then NetworkRequestControlOfEntity(vehicle) end
+        SetVehicleHasMutedSirens(vehicle, false)
+        SetSirenKeepOn(vehicle, false)
+        SetVehicleSiren(vehicle, false)
+        -- An aftermath hold parks its units with the hazards on.
+        SetVehicleIndicatorLights(vehicle, 0, false)
+        SetVehicleIndicatorLights(vehicle, 1, false)
+        if kind == 'heli' and DoesVehicleHaveSearchlight(vehicle) then
+            SetVehicleSearchlight(vehicle, false, false)
+        end
+
+        record.usable = not (vehicleData.abandoned or vehicleData.downed)
+            and not IsEntityDead(vehicle) and IsVehicleDriveable(vehicle, false)
+            and not (kind == 'ground' and IsVehicleStuckOnRoof(vehicle))
+        if not record.usable or kind ~= 'ground' then return record end
+
+        -- Everyone on foot in view walks back, and the car waits for them --
+        -- and for its dog, which the K9 watcher loads up when it gets there.
+        -- One out of view is removed on the first tick instead, so he isn't
+        -- given a seat, the wheel above all, that nobody will be coming for.
+        for pedNetID, ped in pairs(record.officers) do
+            if not IsPedDeadOrDying(ped, true) and not IsPedInAnyVehicle(ped, false) and IsEntityOnScreen(ped) then
+                local seat = departureSeat(record, vehicle, pedNetID)
+                if seat then
+                    TaskEnterVehicle(ped, vehicle, DEPARTURE_BOARD_MS, seat, 2.0, 1, 0)
+                    record.seats[pedNetID] = seat
+                    markTaskIssued(record, pedNetID)
+                end
+            end
+        end
+        if activeK9 and activeK9.vehNetID == vehNetID then record.k9 = activeK9 end
+
+        if next(record.seats) or record.k9 then
+            record.phase = 'boarding'
+            -- Stopped where it is, the way the surrender hold stops a car.
+            if departingOfficer(record, GetPedInVehicleSeat(vehicle, -1)) then
+                BringVehicleToHalt(vehicle, 6.0, 2, false)
+            end
+        end
+        return record
+    end
+
+    -- This function handles re-tasking the police when you first lose your
+    -- wanted level so they drive off and stop pursuing the player. Every unit
+    -- still in the pursuit's tables moves into departingUnits and is started
+    -- on its way. The main loop never sees it again, so a wanted level that
+    -- comes back is answered by fresh units while these carry on leaving.
+    -- Units already leaving are left alone.
+    function handleEndWantedTasks()
+        local playerCoords = GetEntityCoords(PlayerPedId())
+        local now = GetGameTimer()
+        local sent = 0
+
+        -- Back to its car, which waits for it (see sendUnitAway).
+        recallK9('pursuit over')
+
+        for _, fleet in ipairs({ { 'ground', spawnedVehicles }, { 'heli', spawnedHeliUnits }, { 'air', spawnedAirUnits } }) do
+            local kind, units = fleet[1], fleet[2]
+            local keys = {}
+            for vehNetID in pairs(units) do table.insert(keys, vehNetID) end
+            for _, vehNetID in ipairs(keys) do
+                local vehicleData = units[vehNetID]
+                if vehicleData then
+                    units[vehNetID] = nil
+                    sent = sent + 1
+                    local ok, record = pcall(sendUnitAway, vehNetID, vehicleData, kind, now)
+                    if ok then
+                        safeTickDeparture(record, playerCoords, now)
+                        if Config.isDebug then print(('Sent %s unit %s away'):format(kind, vehNetID)) end
+                    else
+                        -- Its record is already with the ticker, which takes
+                        -- it from here; the rest of the units still go.
+                        print(('^1[fenix-police] sending %s unit %s away errored: %s^7'):format(kind, tostring(vehNetID), tostring(record)))
+                    end
+                end
+            end
+        end
+
+        -- pursuit.lua keeps an officer it stops hearing about as a pair of
+        -- eyes until he is dead or gone, and these are neither for a while
+        -- yet: still registered, a car on its way out was still watching for
+        -- the next pursuit. The main loop resets it as a pursuit ends as well,
+        -- but not when the wanted level is back before it has looked.
+        if sent > 0 then FenixPursuit.reset() end
+    end
+
+    -- This function handles deleting the police units when you have lost your
+    -- wanted level -- or, with Config.Departure on and nothing forcing it,
+    -- sending them away through handleEndWantedTasks above, so they drive off
+    -- and are deleted once far enough away.
+    --
+    -- [Upstate Mafia] Single choke point for the aftermath.active guard, rather
+    -- than gating every caller individually. There are THREE independent paths
+    -- that call this: the main loop, a standalone watchdog thread, and the
+    -- fenix-police:cleanupAllPolice net event the server broadcasts. Gating them
+    -- one at a time missed the third one -- the server-triggered broadcast has
+    -- no idea aftermath exists at all, so it kept nuking every officer regardless
+    -- of what the client was doing. Gating the function itself covers all three
+    -- (and any future caller) in one place instead of relying on every call site
+    -- remembering to check.
+    function handleEndWantedDelete(force)
+        if aftermath.active then return end
+        -- [Upstate Mafia] Don't let a stray/global cleanup (the watchdog below, or
+        -- the server's cleanupAllPolice broadcast reacting to another player's
+        -- wanted status) delete the officer that's mid-approach to arrest you.
+        -- Without this, a brief wanted-level blip while you're surrendering wipes
+        -- the responding unit before it ever reaches arrestDistance -- the cop
+        -- "disappears" and isSurrendering never gets a wanted-level-cleared tick
+        -- to release the control lock, so you're stuck. The arrest itself is held
+        -- the same way: triggerArrest() clears isSurrendering as it starts, and
+        -- the wanted level decaying during the escort deleted the officers and the
+        -- car the player was being walked to. triggerArrest() passes force=true
+        -- for its own end-of-cinematic cleanup, which must run even while
+        -- isBeingArrested is still true.
+        if not force and (isSurrendering or isBeingArrested) then return end
+
+        -- [Upstate Mafia] Every officer is about to be wiped below regardless of
+        -- which unit/task they belonged to, so any outstanding breach shield
+        -- (client.lua's escalation section) goes with them in one pass here
+        -- rather than relying on each unit's own foot-chase cleanup path to have
+        -- caught its own -- ReleaseAllBreachShields is safe to call even when
+        -- nothing is outstanding. Units sent away rather than wiped stow theirs
+        -- the same way.
+        ReleaseAllBreachShields()
+
+        -- Everything below is about to be wiped regardless of per-unit state, so
+        -- the event-driven backup score and any in-progress retreat/regroup
+        -- bookkeeping go with it -- the next pursuit starts clean rather than
+        -- inheriting a decaying score or a phantom "unit X is retreating" record
+        -- for a unit that no longer exists. A unit sent away is out of the
+        -- pursuit just the same, and morale.lua must stop driving it.
+        if FenixBackup then FenixBackup.reset() end
+        if FenixMorale then FenixMorale.resetAll() end
+
+        local sendAway = not force and departuresEnabled()
+        if sendAway then
+            -- Shaken rather than ended: the units leave instead of vanishing.
+            -- The watchdog's later passes, the main loop's and a server
+            -- cleanup broadcast all land here too; each sends away whatever
+            -- has turned up since and leaves the units already on their way
+            -- to finish leaving.
+            handleEndWantedTasks()
+        else
+            -- K9s are client-local (not networked, not server-owned), so the dog is
+            -- the one entity in the whole sweep that's a plain DeleteEntity rather
+            -- than deleteNetworkedEntity/deleteSpawnedPed -- see deleteK9 and
+            -- Config.K9's header comment. Its car is about to be deleted below, so
+            -- there's nothing left for it to run back to.
+            deleteK9()
+
+            -- Units still leaving from an earlier end of wanted go too, and
+            -- first: removing them never yields, while every delete below can
+            -- wait on a control request -- and a stopping resource may never
+            -- come back from one.
+            local playerCoords = GetEntityCoords(PlayerPedId())
+            local now = GetGameTimer()
+            for record in pairs(departingUnits) do safeTickDeparture(record, playerCoords, now, true) end
+
+            -- Collect keys BEFORE iterating so that nilling entries mid-loop (which Lua's
+            -- pairs iterator can silently skip) doesn't leave orphan units behind.
+
+            -- Ground units
+            local groundKeys = {}
+            for k in pairs(spawnedVehicles) do table.insert(groundKeys, k) end
+            for _, vehNetID in ipairs(groundKeys) do
+                local vehicleData = spawnedVehicles[vehNetID]
+                if vehicleData then
+                    local pedKeys = {}
+                    for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
+                    for _, pedNetID in ipairs(pedKeys) do
+                        deleteNetworkedEntity(pedFromNet(pedNetID))
+                        TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                        if Config.isDebug then print('Cleaned up police officer ' .. pedNetID) end
+                    end
+                    deleteUnitVehicle(vehNetID)
+                    if Config.isDebug then print('Cleaned up police vehicle ' .. vehNetID) end
+                    spawnedVehicles[vehNetID] = nil
+                end
+            end
+
+            -- Heli units
+            local heliKeys = {}
+            for k in pairs(spawnedHeliUnits) do table.insert(heliKeys, k) end
+            for _, vehNetID in ipairs(heliKeys) do
+                local vehicleData = spawnedHeliUnits[vehNetID]
+                if vehicleData then
+                    local pedKeys = {}
+                    for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
+                    for _, pedNetID in ipairs(pedKeys) do
+                        deleteNetworkedEntity(pedFromNet(pedNetID))
+                        TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                        if Config.isDebug then print('Cleaned up heli officer ' .. pedNetID) end
+                    end
+                    deleteUnitVehicle(vehNetID)
+                    if Config.isDebug then print('Cleaned up heli unit ' .. vehNetID) end
+                    spawnedHeliUnits[vehNetID] = nil
+                end
+            end
+
+            -- Air units
+            local airKeys = {}
+            for k in pairs(spawnedAirUnits) do table.insert(airKeys, k) end
+            for _, vehNetID in ipairs(airKeys) do
+                local vehicleData = spawnedAirUnits[vehNetID]
+                if vehicleData then
+                    local pedKeys = {}
+                    for k in pairs(vehicleData.officers) do table.insert(pedKeys, k) end
+                    for _, pedNetID in ipairs(pedKeys) do
+                        deleteNetworkedEntity(pedFromNet(pedNetID))
+                        TriggerServerEvent('deleteSpawnedPed', pedNetID)
+                        if Config.isDebug then print('Cleaned up air officer ' .. pedNetID) end
+                    end
+                    deleteUnitVehicle(vehNetID)
+                    if Config.isDebug then print('Cleaned up air unit ' .. vehNetID) end
+                    spawnedAirUnits[vehNetID] = nil
+                end
+            end
+        end
+
+        -- Reset pending spawn counters so the next chase starts clean
+        pendingGroundSpawns = 0
+        pendingHeliSpawns   = 0
+        pendingAirSpawns    = 0
+
+        -- Per-net-id bookkeeping goes with the units it describes. OneSync reuses
+        -- network ids, so anything left here attaches itself to whatever entity
+        -- gets the id next: a dead/far timer from this pursuit resumed in the next
+        -- one and sent deleteSpawnedPed for a live officer that now held the id,
+        -- and a unit whose stuck counter had hit its limit left the next unit with
+        -- that id never monitored at all. A unit sent away keeps none of it: its
+        -- own ticker removes it.
+        stuckAttempts = {}
+        deadPeds = {}
+        farOfficers = {}
+        deadHeliPeds = {}
+        farHeliPeds = {}
+        deadAirPeds = {}
+        farAirPeds = {}
+
+        -- The escalation tier belongs to the pursuit that earned it.
+        breachResistance = 0
+        lastBreachResistanceAt = 0
+
+        -- Close the spawn gate so any in-flight server responses that arrive AFTER this
+        -- cleanup are discarded rather than re-populating the tracking tables with cops
+        -- that will never be cleaned up again.
+        spawnGate = false
+
+        if Config.isDebug then print(sendAway and 'All Units Sent Away' or 'All Units Cleaned Up') end
+    end
+
+    -- The departing units' own ticker. Independent of the main loop and of the
+    -- wanted level: a unit carries on leaving through whatever pursuit comes
+    -- next, and is removed on its own rule whatever the main loop is doing.
+    CreateThread(function()
+        while true do
+            Wait(500)
+            if next(departingUnits) then
+                local playerCoords = GetEntityCoords(PlayerPedId())
+                local now = GetGameTimer()
+                for record in pairs(departingUnits) do safeTickDeparture(record, playerCoords, now) end
+            end
+        end
+    end)
 end
 
 RegisterNetEvent('fenix-police:cleanupAllPolice')
@@ -3875,6 +4181,10 @@ AddEventHandler('fenix-police:cleanupAllPolice', function()
     -- broadcast landing just as the wanted level goes up deleted the first
     -- units of the new pursuit as they arrived. This client knows better.
     if GetPlayerWantedLevel(PlayerId()) > 0 or isSurrendering or isBeingArrested then return end
+    -- Not forced: units this client still has are sent away like at any other
+    -- end of a pursuit, and units already leaving carry on leaving. A client
+    -- that was never wanted has nothing to send, and gets the same reset it
+    -- always did.
     handleEndWantedDelete()
 end)
 
@@ -3884,7 +4194,9 @@ end)
 -- nothing was left to call handleEndWantedDelete(), and it guards on
 -- aftermath.active which has no meaning once the resource is gone anyway.
 -- Force the gate open and run the same cleanup one last time before the
--- tables holding the entity references disappear.
+-- tables holding the entity references disappear. Forced, so the units still
+-- leaving go with the rest rather than being left to a ticker that is about
+-- to stop with everything else.
 AddEventHandler('onClientResourceStop', function(res)
     if res ~= GetCurrentResourceName() then return end
     aftermath.active = false
@@ -3898,6 +4210,11 @@ end)
 -- seconds regardless of wantedTimer state, pcall health, or in-flight spawns.
 -- This is completely separate from the main loop so nothing in that loop's
 -- error handling or timing can prevent cleanup from firing.
+--
+-- With Config.Departure on, each pass sends away whatever has registered
+-- since the one before and never touches a unit already leaving: those are
+-- removed by their own ticker, or all at once by a forced cleanup (the
+-- arrest, the resource stopping) -- never early by a pass of this.
 --
 -- [Upstate Mafia] Held off while aftermath.active. This ran unconditionally
 -- within 500ms of the wanted level clearing -- which happens the instant the
@@ -3930,7 +4247,7 @@ CreateThread(function()
             -- Wanted level dropped and nothing is holding the scene — run
             -- cleanup five times over five seconds. Five passes ensures
             -- in-flight server-side spawn responses that arrive up to ~4
-            -- seconds after cleanup still get caught and deleted. A new
+            -- seconds after cleanup still get caught and sent away. A new
             -- wanted level inside those five seconds ends them: the later
             -- passes deleted the new pursuit's first units as they arrived.
             for i = 1, 5 do
@@ -7280,7 +7597,8 @@ Citizen.CreateThread(function()
                 -- whatever cycle it was on instead of finding it already past
                 -- 3 and never running once this ends.
             else
-                -- Wanted level just cleared — delete all spawned units.
+                -- Wanted level just cleared — send every spawned unit away
+                -- (Config.Departure), or delete them all with that off.
                 --
                 -- We run for 3 cycles (wantedTimer < 3) instead of just once so that any
                 -- in-flight server responses that arrive late still get cleaned up.  The
@@ -7470,6 +7788,8 @@ RegisterCommand('fenix:diag', function()
     for _ in pairs(spawnedHeliUnits) do heliCount = heliCount + 1 end
     local airCount = 0
     for _ in pairs(spawnedAirUnits) do airCount = airCount + 1 end
+    local departing = {}
+    for record in pairs(departingUnits) do departing[#departing + 1] = record end
 
     local wl = GetPlayerWantedLevel(PlayerId())
     local maxWl = GetMaxWantedLevel()
@@ -7484,6 +7804,13 @@ RegisterCommand('fenix:diag', function()
     print(('  groundUnits        = %d'):format(groundCount))
     print(('  heliUnits          = %d'):format(heliCount))
     print(('  airUnits           = %d'):format(airCount))
+    print(('  departingUnits     = %d'):format(#departing))
+    for _, record in ipairs(departing) do
+        local crew = 0
+        for _ in pairs(record.officers) do crew = crew + 1 end
+        print(('    %s %s: %s, %s, %d crew left, %.0fs'):format(record.kind, tostring(record.vehNetID), record.phase,
+            record.vehicle ~= 0 and 'vehicle tracked' or 'vehicle gone', crew, (GetGameTimer() - record.since) / 1000.0))
+    end
     print(('  playerHasShot      = %s'):format(tostring(playerHasShot)))
     print(('  isSurrendering     = %s'):format(tostring(isSurrendering)))
     print(('  isBeingArrested    = %s'):format(tostring(isBeingArrested)))
