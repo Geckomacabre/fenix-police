@@ -2550,11 +2550,25 @@ local function handleChaseBehavior(vehicleData, playerPed, vehNetID, playerHasSh
                                 -- only if the chase has actually stopped running.
                                 if not chasing or taskLapsed(vehicleData, pedNetID, officer, TASK_VEHICLE_CHASE) then
                                     TaskVehicleChase(officer, playerPed)
-                                    SetTaskVehicleChaseBehaviorFlag(officer, 8, true)
+                                    -- Following, boxing in or ramming, by wanted
+                                    -- level (Config.Driving.chaseTactics) -- not
+                                    -- the same box-in and PIT for a one-star
+                                    -- speeder as for a five-star cop killer.
+                                    ApplyChaseTactics(officer, wantedLevel)
+                                    profile.chaseTacticsLevel = wantedLevel
                                     SetTaskVehicleChaseIdealPursuitDistance(officer, profile.pursuitDistance)
                                     tasks[pedNetID] = 'VehicleChase'
                                     markTaskIssued(vehicleData, pedNetID)
                                     if taskStatus == 'Sweep' then vehicleData.sweep = nil end
+                                elseif profile.chaseTacticsLevel ~= wantedLevel then
+                                    -- The wanted level moved mid-chase. The
+                                    -- flags act on the running chase task, so
+                                    -- they're swapped in place: re-issuing
+                                    -- TaskVehicleChase would have the driver
+                                    -- re-plan its approach, the stutter the
+                                    -- transition gate above exists to stop.
+                                    ApplyChaseTactics(officer, wantedLevel)
+                                    profile.chaseTacticsLevel = wantedLevel
                                 end
                             else
                                 -- [Upstate Mafia] Was re-issued every single cycle for every

@@ -5,6 +5,76 @@
 -- environment, so the server builds a profile table and fires this event
 -- instead of calling them directly. Broadcast to every client; whichever one
 -- has the ped streamed in applies it, the rest just no-op.
+--
+-- Also home to ApplyChaseTactics, the wanted-level chase tactics both that
+-- profile and client.lua's own chase loop put on a TaskVehicleChase driver.
+
+-- Every behaviour SET_TASK_VEHICLE_CHASE_BEHAVIOR_FLAG documents: 1 aggressive
+-- ramming, 2 ram attempts, 8 boxing in with a bit of PIT, 16 ramming (a little
+-- gentler than 1 and 2), 32 stay back with no tactical contact, convoy-like.
+local CHASE_FLAGS = { 1, 2, 8, 16, 32 }
+
+-- Config.Driving.chaseTactics as shipped, for a config that doesn't have it.
+local DEFAULT_CHASE_TACTICS = {
+    [1] = { 32 },
+    [2] = { 32 },
+    [3] = { 8 },
+    [4] = { 8, 16 },
+    [5] = { 8, 2 },
+}
+
+--- The tactics entry for this wanted level: its own, else the nearest level
+--- below it that has one, else boxing (8), the one tactic every chase used to
+--- get. Searched by key rather than by counting down, so a wanted level of any
+--- size costs one pass over the table.
+local function chaseTacticsFor(tactics, wantedLevel)
+    local level = tonumber(wantedLevel) or 0
+    local best
+    for key in pairs(tactics) do
+        if type(key) == 'number' and key <= level and (not best or key > best) then
+            best = key
+        end
+    end
+
+    local entry = best and tactics[best]
+    if type(entry) == 'number' then return { entry } end
+    if type(entry) == 'table' then return entry end
+    return { 8 }
+end
+
+--- How hard a TaskVehicleChase driver may make contact, by wanted level
+--- (Config.Driving.chaseTactics). Every chase used to get flag 8 -- boxing in
+--- and PIT -- whatever the wanted level, so a one-star speeder was boxed in at
+--- point blank exactly like a five-star cop killer. Every known flag is set
+--- explicitly on or off, not just the wanted ones switched on: this runs
+--- again on a chase already under way when the wanted level moves, and a
+--- flag left over from the old level would otherwise stay set.
+---
+--- Acts on the ped's running chase task, so call it straight after
+--- TaskVehicleChase. Defined here because this file loads before client.lua
+--- and has a chase of its own to set up (the server's vehicleChase profile).
+--- @param ped number the chasing driver
+--- @param wantedLevel number the suspect's wanted level
+function ApplyChaseTactics(ped, wantedLevel)
+    if not ped or ped == 0 or not DoesEntityExist(ped) then return end
+
+    local tactics = (Config.Driving or {}).chaseTactics
+    if tactics == false or (type(tactics) == 'table' and tactics.enabled == false) then
+        -- The old fixed tactic at every level.
+        SetTaskVehicleChaseBehaviorFlag(ped, 8, true)
+        return
+    end
+    if type(tactics) ~= 'table' then tactics = DEFAULT_CHASE_TACTICS end
+
+    local wanted = {}
+    for _, flag in ipairs(chaseTacticsFor(tactics, wantedLevel)) do
+        flag = tonumber(flag)
+        if flag then wanted[flag] = true end
+    end
+    for _, flag in ipairs(CHASE_FLAGS) do
+        SetTaskVehicleChaseBehaviorFlag(ped, flag, wanted[flag] == true)
+    end
+end
 
 --- The ped of the player with this server id, or 0 when that player isn't in
 --- this client's scope. GetPlayerFromServerId answers -1 for an out-of-scope
@@ -90,7 +160,9 @@ RegisterNetEvent('fenix-police:client:applyCombatProfile', function(pedNetID, pr
         local targetPed = targetPedOf(profile.vehicleChase)
         if vehicle ~= 0 and targetPed ~= 0 and DoesEntityExist(targetPed) then
             TaskVehicleChase(ped, targetPed)
-            SetTaskVehicleChaseBehaviorFlag(ped, 8, true)
+            -- The server says which wanted level it is chasing for when it
+            -- knows; a middling three otherwise.
+            ApplyChaseTactics(ped, tonumber(profile.wantedLevel) or 3)
         end
     end
 end)

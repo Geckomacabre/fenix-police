@@ -1714,6 +1714,29 @@ Config.Driving = {
         [4] = 8.0,
         [5] = 6.0,
     },
+
+    -- CHASE TACTICS --
+    -- What a unit in the close-range TaskVehicleChase state is allowed to do
+    -- to the suspect's car, by wanted level. Every chase used to box in and
+    -- PIT at every level, so a one-star speeder got the same point-blank
+    -- box-in as a five-star cop killer. Each level lists the native's chase
+    -- behaviour flags to switch on; every other one is switched off:
+    --   1   aggressive ramming
+    --   2   ram attempts
+    --   8   boxing in, with the occasional PIT
+    --   16  ramming, a little gentler than 1 and 2
+    --   32  stay back, no contact at all -- following, convoy-style
+    -- A level with no entry uses the nearest level below it that has one
+    -- (boxing in, 8, if none does). Re-applied mid-chase when the wanted level
+    -- changes. enabled = false: flag 8 at every level, the old behaviour.
+    chaseTactics = {
+        enabled = true,
+        [1] = { 32 },       -- follow; no contact for a minor offence
+        [2] = { 32 },
+        [3] = { 8 },        -- boxing in, occasional PIT
+        [4] = { 8, 16 },    -- boxing in and ramming
+        [5] = { 8, 2 },     -- end it now
+    },
 }
 
 
