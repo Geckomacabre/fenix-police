@@ -6984,9 +6984,10 @@ do
     end
 
     --- Sirens off, back to an ordinary patrol drive. Used to send the response away
-    --- at the end of a stop, before the wanted level clears — the cleanup sweep
-    --- deletes every spawned unit the instant you stop being wanted, and a car that
-    --- is already driving is far less jarring to lose than one at your bumper.
+    --- at the end of a stop, before the wanted level clears — once you stop being
+    --- wanted every unit is sent off (or, with Config.Departure off, deleted on
+    --- the spot), and a car that is already driving away reads far better than
+    --- one parked at your bumper.
     local function dismissUnit(vehNetID)
         local veh = NetToVeh(vehNetID)
         if not veh or veh == 0 or not DoesEntityExist(veh) then return end
