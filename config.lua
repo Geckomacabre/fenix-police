@@ -990,6 +990,36 @@ Config.ArrestSystem = {
     surrenderTimeoutMs = 90000,
     surrenderTimeoutMessage = 'Nobody came to take you in. Your hands are down.',
 
+    -- The felony stop. While one officer walks over, the units holding back
+    -- pull up and their officers get out and cover you from beside their
+    -- cars -- weapons on you, nobody firing -- until the arrest starts, or
+    -- the surrender ends and they get back in. A unit gets out once its car
+    -- has stopped within `distance` metres of you; an officer already on foot
+    -- that close covers from where they are. enabled = false keeps everyone
+    -- seated and holding, as before.
+    cover = {
+        enabled = true,
+        distance = 45.0,
+    },
+
+    -- A police helicopter overhead circles you with its searchlight on while
+    -- your hands are up, then goes back to the chase or the search when the
+    -- surrender ends. radius and height/minHeight (the height it flies at,
+    -- and the lowest it will go) in metres, speed in m/s. enabled = false
+    -- leaves it on whatever it was doing.
+    heliOrbit = {
+        enabled = true,
+        radius = 30.0,
+        height = 45.0,
+        minHeight = 30.0,
+        speed = 12.0,
+    },
+
+    -- On-screen help while your hands are up. {key} is replaced with the key
+    -- the surrender command is bound to in your settings (H unless rebound).
+    -- Unset, this built-in text is used; '' shows no help text at all.
+    -- surrenderHint = 'Hands up. Officers are moving in — [{key}] to cancel',
+
     -- How long the BUSTED screen holds, in REAL milliseconds. This is measured
     -- with GetNetworkTime rather than GetGameTimer, because the cinematic runs at
     -- SetTimeScale(0.15) and game time would stretch 6s into roughly 40s.

@@ -2927,12 +2927,14 @@ local surrenderArrestUnit = nil
 local SURRENDER_TASKS = {
     HoldFire = true, Halted = true, SurrenderDrive = true, SurrenderBoard = true,
     SurrenderWalk = true, ExitForArrest = true, ApproachArrest = true,
+    SurrenderExit = true, SurrenderCover = true, SurrenderOrbit = true,
 }
 
 -- handleFootChase's markers for a unit's committed foot chaser.
 local FOOT_CHASE_TASKS = { Exiting = true, FootChase = true, FootCombat = true, Staging = true }
 
-local TASK_ENTER_VEHICLE = GetHashKey('SCRIPT_TASK_ENTER_VEHICLE')
+local TASK_ENTER_VEHICLE      = GetHashKey('SCRIPT_TASK_ENTER_VEHICLE')
+local TASK_AIM_GUN_AT_ENTITY  = GetHashKey('SCRIPT_TASK_AIM_GUN_AT_ENTITY')
 
 --- Takes one officer off the trigger for the current surrender, once: the
 --- same stand-down the aftermath uses (passive group, no always-fight), so
@@ -3010,8 +3012,48 @@ local function releaseSurrenderHold()
             end
             vehicleData.surrenderHeld = nil
             vehicleData.surrenderArrived = nil
+            vehicleData.surrenderCover = nil
             vehicleData.arrestExit = nil
             vehicleData.arresterNetID = nil
+        end
+    end
+end
+
+--- A helicopter over a surrender circles the suspect with its nightsun on
+--- them -- the shot the whole stop is staged for -- instead of carrying on
+--- with a chase, or a search orbit centred wherever contact was last lost.
+--- Its marker is a hold marker, so releaseSurrenderHold hands the pilot back
+--- and the chase loop gives it its normal task again the moment the
+--- surrender is over. With Config.ArrestSystem.heliOrbit off the pilot just
+--- keeps whatever it was doing, as before.
+local function handleHeliSurrenderHover(vehicleData, crew, vehicle, playerPed)
+    local orbit = Config.ArrestSystem.heliOrbit
+    if type(orbit) ~= 'table' then orbit = {} end
+    if orbit.enabled == false then return end
+    if updateAircraftDowned(vehicleData, vehicle, crew) then return end
+
+    if DoesVehicleHaveSearchlight(vehicle) and not IsVehicleSearchlightOn(vehicle)
+        and NetworkHasControlOfEntity(vehicle) then
+        SetVehicleSearchlight(vehicle, true, true)
+    end
+
+    local tasks = vehicleData.officerTasks
+    for _, member in ipairs(crew) do
+        local pedNetID, pilot = member.pedNetID, member.ped
+        if GetVehiclePedIsIn(pilot, false) == vehicle and GetPedInVehicleSeat(vehicle, -1) == pilot then
+            if tasks[pedNetID] ~= 'SurrenderOrbit' or taskLapsed(vehicleData, pedNetID, pilot, TASK_HELI_MISSION) then
+                -- Mission type 9 = Circle, as the search orbit uses, but on
+                -- the suspect themselves (the ped target) rather than a point.
+                -- A suspect with their hands up isn't going anywhere, so it's
+                -- issued once and only again if the orbit stops.
+                local at = GetEntityCoords(playerPed)
+                TaskHeliMission(pilot, vehicle, 0, playerPed, at.x, at.y, at.z, 9,
+                    tonumber(orbit.speed) or 12.0, tonumber(orbit.radius) or 30.0, -1.0,
+                    tonumber(orbit.height) or 45.0, tonumber(orbit.minHeight) or 30.0, -1.0, 0)
+                tasks[pedNetID] = 'SurrenderOrbit'
+                markTaskIssued(vehicleData, pedNetID)
+            end
+            return
         end
     end
 end
@@ -3029,12 +3071,14 @@ local function handleHeliChaseBehavior(vehicleData, playerPed, vehNetID, playerH
     -- neither stops while the unit is holding off.
     local crew = resolveAirCrew(vehicleData, farHeliPeds, 'heli')
 
-    -- [Upstate Mafia] Hold fire on a surrendering player. The pilot keeps the
-    -- task it has, so the heli keeps circling overhead rather than engaging --
-    -- which is the shot you want during the arrest cinematic anyway -- but a
-    -- gunner's TaskCombatPed kept running through an early return on its own.
+    -- [Upstate Mafia] Hold fire on a surrendering player: a gunner's
+    -- TaskCombatPed kept running through an early return on its own. The
+    -- pilot circles the suspect with the searchlight on them rather than
+    -- engaging -- which is the shot you want during the arrest cinematic
+    -- anyway.
     if Config.ArrestSystem.enabled and (isSurrendering or isBeingArrested) then
         holdAirCrewForSurrender(vehicleData, crew, playerPed)
+        handleHeliSurrenderHover(vehicleData, crew, vehFromNet(vehNetID), playerPed)
         return
     end
 
@@ -4142,6 +4186,47 @@ local beginPullOver, cancelPullOver
 local surrenderStartedAt = 0
 local surrenderSeq = 0
 
+-- The help text shown while the current surrender's hands are up, or nil for
+-- none. Built once when they go up, not every frame it's drawn.
+local surrenderHintText = nil
+
+--- The key the surrender command is bound to, as the player sees it in their
+--- own settings. A RegisterKeyMapping binding reads back through
+--- GetControlInstructionalButton under joaat(command) with the top bit set:
+--- 't_' and the key's name for a keyboard key. A mouse button or pad comes
+--- back as a glyph id ('b_...') that means nothing in plain text, and an
+--- unbound mapping as nothing usable at all; both read as the default.
+local function surrenderKeyName()
+    local ok, button = pcall(function()
+        return GetControlInstructionalButton(0, GetHashKey('surrendertopolice') | 0x80000000, true)
+    end)
+    if ok and type(button) == 'string' and button:sub(1, 2) == 't_' and #button > 2 then
+        return button:sub(3)
+    end
+    return 'H'
+end
+
+--- Config.ArrestSystem.surrenderHint with {key} filled in, the built-in text
+--- when it isn't set, or nil when it's '' (no help text).
+local function surrenderHint()
+    local hint = Config.ArrestSystem.surrenderHint
+    if hint == nil then hint = 'Hands up. Officers are moving in — [{key}] to cancel' end
+    if type(hint) ~= 'string' or hint == '' then return nil end
+    if hint:find('{key}', 1, true) then
+        local key = surrenderKeyName()
+        hint = hint:gsub('{key}', function() return key end)
+    end
+    return hint
+end
+
+--- Instructional help box for the surrender, redrawn every frame it's wanted.
+local function drawSurrenderHint()
+    if not surrenderHintText then return end
+    BeginTextCommandDisplayHelp('STRING')
+    AddTextComponentSubstringPlayerName(surrenderHintText)
+    EndTextCommandDisplayHelp(0, false, false, -1)
+end
+
 -- Toggle surrender when player presses H
 -- [Upstate Mafia] Command name deliberately unchanged — renaming it would drop
 -- every existing player's rebind. Only the label reflects the second outcome.
@@ -4204,6 +4289,7 @@ RegisterCommand('surrendertopolice', function()
     isSurrendering = true
     surrenderStartedAt = GetGameTimer()
     surrenderSeq = surrenderSeq + 1
+    surrenderHintText = surrenderHint()
     local seq = surrenderSeq
 
     CreateThread(function()
@@ -4279,6 +4365,9 @@ end, false)
 -- RegisterKeyMapping command, fired by FiveM's own key bindings rather than a
 -- GTA control action, and DisableAllControlActions doesn't reach those. That is
 -- what lets H cancel a surrender with every control disabled.
+--
+-- The surrender's help text is drawn here too: it needs a frame-rate loop,
+-- and this is the one already running for exactly as long as the hands are up.
 Citizen.CreateThread(function()
     while true do
         if isSurrendering or isBeingArrested or isBeingTicketed then
@@ -4287,6 +4376,7 @@ Citizen.CreateThread(function()
             EnableControlAction(0, 2, true)   -- Look U/D
             EnableControlAction(0, 245, true) -- Chat / T
             EnableControlAction(0, 249, true) -- N (push to talk)
+            if isSurrendering and not isBeingArrested then drawSurrenderHint() end
             Wait(0)
         else
             Wait(500)
@@ -4377,6 +4467,68 @@ local function haltForSurrender(vehicleData, pedNetID, driver, vehicle)
     end
 end
 
+--- How close (metres) a unit holding back for a surrender has to be to get
+--- out and cover the suspect (Config.ArrestSystem.cover), or nil with that
+--- switched off. A config written before it existed gets the default.
+local function surrenderCoverRange()
+    local cover = Config.ArrestSystem.cover
+    if type(cover) ~= 'table' then return 45.0 end
+    if cover.enabled == false then return nil end
+    return tonumber(cover.distance) or 45.0
+end
+
+--- Out of the car to cover the suspect from beside it, the door left open
+--- (256) -- it's what they're covering from. Once, and once more straight
+--- outside if that exit was interrupted, the same as the arresting officer's.
+local function exitToCover(vehicleData, member)
+    local tasks = vehicleData.officerTasks
+    local pedNetID = member.pedNetID
+    if tasks[pedNetID] ~= 'SurrenderExit' then
+        TaskLeaveVehicle(member.ped, member.seatVehicle, 256)
+        tasks[pedNetID] = 'SurrenderExit'
+        markTaskIssued(vehicleData, pedNetID)
+    elseif GetGameTimer() - (vehicleData.taskIssuedAt and vehicleData.taskIssuedAt[pedNetID] or 0) > ARREST_EXIT_RETRY_MS then
+        TaskLeaveVehicle(member.ped, member.seatVehicle, 16)
+        markTaskIssued(vehicleData, pedNetID)
+    end
+end
+
+--- Guns on the suspect, nobody firing. holdSurrenderFire has already put the
+--- officer in the passive group with AlwaysFight off, and nothing going on
+--- around them turns them off the aim meanwhile. Issued once, and again only
+--- if it stops. releaseSurrenderHold drops the marker, and the chase loop
+--- walks them back to the car.
+local function coverSuspect(vehicleData, pedNetID, officer, playerPed)
+    local tasks = vehicleData.officerTasks
+    local covering = tasks[pedNetID] == 'SurrenderCover'
+    if covering and not taskLapsed(vehicleData, pedNetID, officer, TASK_AIM_GUN_AT_ENTITY) then return end
+    if not covering then
+        -- Weapon out first: an aim task with an empty hand is a pointed finger.
+        local weapon = GetBestPedWeapon(officer, false)
+        if weapon ~= 0 and weapon ~= WEAPON_UNARMED then SetCurrentPedWeapon(officer, weapon, true) end
+        SetBlockingOfNonTemporaryEvents(officer, true)
+    end
+    TaskAimGunAtEntity(officer, playerPed, -1, false)
+    tasks[pedNetID] = 'SurrenderCover'
+    markTaskIssued(vehicleData, pedNetID)
+end
+
+--- The suspect is under control: everyone covering lowers their weapon and
+--- stands by. They're still held, so an arrest that falls through hands them
+--- back to the chase loop with everyone else.
+local function lowerSurrenderCover()
+    for _, vehicleData in pairs(spawnedVehicles) do
+        local tasks = vehicleData.officerTasks
+        for pedNetID, task in pairs(tasks) do
+            if task == 'SurrenderCover' then
+                local ped = pedFromNet(pedNetID)
+                if ped ~= 0 and DoesEntityExist(ped) then ClearPedTasks(ped) end
+                tasks[pedNetID] = 'HoldFire'
+            end
+        end
+    end
+end
+
 --- Officers respond to a surrendering player instead of shooting.
 ---
 --- Rewritten after the original was disabled. That version told EVERY officer in
@@ -4418,6 +4570,9 @@ function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
     -- the arresting unit drops out.
     local holdDistance = math.min(cfg.holdDistance or 25.0, (cfg.approachDistance or 35.0) - 5.0)
     local isArrestingUnit = arrestingUnitFor(playerCoords) == vehNetID
+    -- Officers on foot this close cover the suspect instead of standing
+    -- about; nil when the felony-stop cover is switched off.
+    local coverRange = surrenderCoverRange()
 
     -- The living crew, each stood down once.
     local crew, byNetID, driver, anyOnFoot = {}, {}, nil, false
@@ -4509,6 +4664,9 @@ function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
                 -- Climbing out; the arrester from next cycle.
             elseif m == driver then
                 haltForSurrender(vehicleData, m.pedNetID, m.ped, vehicle)
+            elseif not m.seated and coverRange and m.dist <= coverRange then
+                -- A partner already out of the car covers the arrest.
+                coverSuspect(vehicleData, m.pedNetID, m.ped, playerPed)
             else
                 holdInPlace(vehicleData, m.pedNetID, m.ped)
             end
@@ -4528,9 +4686,22 @@ function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
         return true
     end
 
+    -- The felony stop: pulled up and stopped within coverRange, the whole
+    -- crew gets out and covers the suspect from beside the car. Kept for the
+    -- rest of the surrender once it happens, so nobody climbs back in
+    -- because the player shuffled a step.
+    if coverRange and carUsable and not vehicleData.surrenderCover
+        and GetEntitySpeed(vehicle) < 1.0
+        and #(GetEntityCoords(vehicle) - playerCoords) <= coverRange
+        and (not driver or tasks[driver.pedNetID] == 'Halted') then
+        vehicleData.surrenderCover = true
+    end
+
     for _, m in ipairs(crew) do
         local pedNetID, officer = m.pedNetID, m.ped
-        if m == driver then
+        if vehicleData.surrenderCover and m.seated and m.seatVehicle == vehicle then
+            exitToCover(vehicleData, m)
+        elseif m == driver then
             -- Pull up within holdDistance and wait there -- or wait where it
             -- is while any of the crew is still on foot, so nobody is left
             -- behind.
@@ -4551,6 +4722,11 @@ function handleSurrenderApproach(vehicleData, playerPed, vehNetID)
             end
         elseif m.seated then
             holdInPlace(vehicleData, pedNetID, officer)
+        elseif coverRange and (m.dist <= coverRange or vehicleData.surrenderCover) then
+            -- Already out and close, or the unit is out covering anyway:
+            -- covers from where they are rather than walking back to the car
+            -- only to get out again.
+            coverSuspect(vehicleData, pedNetID, officer, playerPed)
         elseif carUsable then
             -- Back to the car, so the unit pulls up together.
             local seat = freeSeat(vehicle)
@@ -5347,40 +5523,6 @@ RegisterCommand('fenixk9test', function()
     print('[FENIX-K9-TEST] spawned -- run /fenixk9test again to remove it')
 end, false)
 
--- Helis hover overhead during surrender (stop shooting, keep circling)
---- Superseded and never called. Air units now hold fire via an early return in
---- handleHeliChaseBehavior / handleAirChaseBehavior, which leaves them on their
---- existing circling task instead of re-tasking them mid-surrender. Kept only so
---- the diff against upstream stays legible.
-local function handleHeliSurrenderHover(vehicleData, playerPed, vehNetID)
-    do return end
-    for pedNetID, _ in pairs(vehicleData.officers) do
-        local officer = NetToPed(pedNetID)
-        if not DoesEntityExist(officer) or officer == 0 or IsPedDeadOrDying(officer, true) then
-            goto nextCrew
-        end
-
-        local taskStatus = spawnedHeliUnits[vehNetID].officerTasks[pedNetID]
-
-        if IsPedInAnyVehicle(officer, false) then
-            if GetPedInVehicleSeat(GetVehiclePedIsIn(officer, false), -1) == officer then
-                -- Pilot: circle at low altitude
-                if taskStatus ~= 'SurrenderHover' then
-                    TaskHeliChase(officer, playerPed, 0, 0, 50)
-                    spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'SurrenderHover'
-                end
-            else
-                -- Crew: just aim, don't shoot
-                if taskStatus ~= 'AimCover' then
-                    TaskAimGunAtEntity(officer, playerPed, -1, false)
-                    spawnedHeliUnits[vehNetID].officerTasks[pedNetID] = 'AimCover'
-                end
-            end
-        end
-        ::nextCrew::
-    end
-end
-
 -- ============================
 -- BUSTED SCREEN & ARREST FLOW
 -- ============================
@@ -5515,6 +5657,10 @@ local function runArrest(arrest, arrestingCop)
 
     Wait(800)
     if not live() then return end
+
+    -- The suspect is under control: the officers covering them from beside
+    -- their cars lower their weapons, and the escort below takes over.
+    lowerSurrenderCover()
 
     -- ---- ESCORT TO VEHICLE ----
     --
