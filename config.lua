@@ -15,8 +15,9 @@ Config.Toggles = {
     -- Wanted level system: if false, players never become wanted
     wantedLevels            = true,
 
-    -- Arrest / BUSTED screen system (requires Config.ArrestSystem.enabled too)
-    arrestSystem            = false,
+    -- Surrender / arrest / BUSTED screen system (requires Config.ArrestSystem.enabled
+    -- too). Off leaves the H key to traffic stops only.
+    arrestSystem            = true,
 
     -- AI helicopter units
     heliUnits               = true,

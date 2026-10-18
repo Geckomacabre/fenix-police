@@ -4147,12 +4147,14 @@ local surrenderSeq = 0
 -- every existing player's rebind. Only the label reflects the second outcome.
 RegisterKeyMapping('surrendertopolice', 'Surrender / Pull Over for Police', 'keyboard', 'H')
 RegisterCommand('surrendertopolice', function()
-    if isBeingArrested or isBeingTicketed then return end
+    -- ticketWrapUp too: hands up while the stop is still being wound down
+    -- would re-pin the wanted level the citation is about to clear.
+    if isBeingArrested or isBeingTicketed or ticketWrapUp then return end
 
     -- [Upstate Mafia] Either system can be turned off independently, so this can
     -- no longer gate on the arrest system alone — that would leave the key dead
     -- on a server running tickets only.
-    local arrestEnabled = Config.ArrestSystem and Config.ArrestSystem.enabled
+    local arrestEnabled = Config.ArrestSystem and Config.ArrestSystem.enabled and toggleOn('arrestSystem')
     local ticketEnabled = Config.TicketSystem and Config.TicketSystem.enabled
     if not (arrestEnabled or ticketEnabled) then return end
 
@@ -5445,6 +5447,9 @@ local function releaseArrest(arrest, clearTasks)
     if IsScreenFadedOut() or IsScreenFadingOut() then DoScreenFadeIn(500) end
 
     isBeingArrested = false
+    -- An arrest that never finished leaves the units it held for the
+    -- surrender with their hold markers and the arrester ignoring events.
+    releaseSurrenderHold()
 end
 
 --- Rear seat to put a cuffed suspect in, or nil when there isn't one: a bike or
