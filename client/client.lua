@@ -7247,7 +7247,9 @@ function standDownOfficer(ped)
 end
 
 -- Task markers under which an officer is shooting at the player.
-local COMBAT_TASKS = { CombatPed = true, FootCombat = true, OnFootCombat = true }
+-- Taser too: a stun-gun shot still in flight when the player goes down is
+-- ended here like any other; the foot-chase sweep holsters it afterwards.
+local COMBAT_TASKS = { CombatPed = true, FootCombat = true, OnFootCombat = true, Taser = true }
 
 --- Stands one officer down and ends a firefight they're in. A combat task
 --- keeps running whatever relationship group the ped is moved to, so
