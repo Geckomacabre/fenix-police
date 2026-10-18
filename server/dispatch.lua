@@ -178,6 +178,9 @@ local function offer(incident, role)
         -- Lets a responder tell whether police are coming at all (EMS
         -- staging waits on them otherwise).
         agencies = incident.agencies,
+        -- Who the investigating unit is looking for (server ids). Nobody
+        -- else needs to know.
+        suspects = role == 'investigating' and incident.suspects or nil,
     })
     return true
 end
@@ -218,6 +221,66 @@ CreateThread(function()
         end
     end
 end)
+
+-------------------------------------------------------------------------------
+-- Suspects
+-------------------------------------------------------------------------------
+
+local function invCfg()
+    return Config.Investigate or {}
+end
+
+--- Is "find the shooter" switched on (Config.Investigate.findSuspects)? It
+--- only means anything while there's an investigating unit to do the
+--- finding.
+local function findingSuspects()
+    return invCfg().enabled == true and invCfg().findSuspects ~= false
+end
+
+-- A suspect list is a handful of players near one scene; the cap only
+-- bounds what one call can accumulate over its lifetime.
+local MAX_SUSPECTS = 16
+
+local function listed(list, value)
+    for _, v in ipairs(list) do
+        if v == value then return true end
+    end
+    return false
+end
+
+--- Is `pos` inside one of Config.Investigate.exemptZones (the Ammu-Nation
+--- shooting ranges, by default)? The client checks the same list
+--- (client/investigate.lua's FenixInvestigate.inExemptZone); this is the
+--- server's own answer, not the client's word for it.
+local function inExemptZone(pos)
+    local zones = invCfg().exemptZones
+    if type(zones) ~= 'table' or type(pos) ~= 'vector3' then return false end
+    for _, zone in ipairs(zones) do
+        if type(zone) == 'table' and type(zone.coords) == 'vector3'
+            and #(pos - zone.coords) <= (tonumber(zone.radius) or 25.0)
+        then
+            return true
+        end
+    end
+    return false
+end
+
+--- A suspect added to a call after its investigating unit was asked for has
+--- to reach that unit too, or it goes looking with the list it was first
+--- sent. Everyone the role was offered to, plus whoever actually holds a
+--- unit on it; a client with no unit on the call ignores it.
+local function tellInvestigators(incident)
+    local hosts = {}
+    local o = incident.offers and incident.offers.investigating
+    for host in pairs(o and o.tried or {}) do hosts[host] = true end
+    for unitId, role in pairs(incident.assignedUnits) do
+        local by = incident.assignedBy[unitId]
+        if role == 'investigating' and by then hosts[by] = true end
+    end
+    for host in pairs(hosts) do
+        TriggerClientEvent('fenix-police:client:investigationSuspects', host, incident.id, incident.suspects)
+    end
+end
 
 -------------------------------------------------------------------------------
 -- Incidents
@@ -280,12 +343,20 @@ function FenixDispatch.createIncident(incidentType, coords, severity, opts)
         if existing then
             existing.lastReportAt = GetGameTimer()
             for _, witness in ipairs((opts.witnesses or {})) do
-                local known = false
-                for _, w in ipairs(existing.witnesses) do
-                    if w == witness then known = true break end
-                end
-                if not known then table.insert(existing.witnesses, witness) end
+                if not listed(existing.witnesses, witness) then table.insert(existing.witnesses, witness) end
             end
+
+            -- The shooter's own report often lands a moment after somebody
+            -- else's has already put the call on the board.
+            local newSuspect = false
+            for _, suspect in ipairs(opts.suspects or {}) do
+                if not listed(existing.suspects, suspect) and #existing.suspects < MAX_SUSPECTS then
+                    table.insert(existing.suspects, suspect)
+                    newSuspect = true
+                end
+            end
+            if newSuspect then tellInvestigators(existing) end
+
             dbg(('#%d reused for a duplicate %s report'):format(existing.id, incidentType))
             return existing, true
         end
@@ -372,12 +443,20 @@ end
 -- client/witness.lua polls IS_ANY_PED_SHOOTING_IN_AREA around the local
 -- player and reports here. The report identifies WHERE gunfire was heard,
 -- not WHO fired it -- there is no suspect to pin a wanted level on, so this
--- never touches SetWantedLevel (applyWanted = false). It exists purely to
--- get a SHOOTING incident onto the board so a (future) investigation AI has
--- a scene to respond to, matching the design spec's "believable information
--- flow" requirement (section 19) instead of granting omniscient knowledge.
+-- never touches SetWantedLevel (applyWanted = false). It exists to get a
+-- SHOOTING incident onto the board so an investigation unit
+-- (client/investigate.lua) has a scene to respond to, matching the design
+-- spec's "believable information flow" requirement (section 19) instead of
+-- granting omniscient knowledge.
+--
+-- `selfFired` is the caller's own client saying its player fired a gun in
+-- the moments before. That lists the caller -- and only ever the caller --
+-- as a suspect: a cheating client can leave the flag off, which is where
+-- things stood before, but can't name anybody else. Being listed stars
+-- nobody; investigationSpotted below does that, once an officer has seen
+-- the suspect armed at the scene.
 RegisterNetEvent('fenix-police:server:reportGunshot')
-AddEventHandler('fenix-police:server:reportGunshot', function(coords)
+AddEventHandler('fenix-police:server:reportGunshot', function(coords, selfFired)
     local src = source
     if not src or src == 0 then return end
     if not (Config.Dispatch or {}).enabled then return end
@@ -396,13 +475,95 @@ AddEventHandler('fenix-police:server:reportGunshot', function(coords)
 
     if wantedPlayerNear(coords, cfg().wantedSuppressRadius or 80.0) then return end
 
+    -- A shooting range is not a crime scene. The honest client never sends
+    -- this from one; checked here too, against where the server sees them.
+    if inExemptZone(coords) or inExemptZone(GetEntityCoords(ped)) then return end
+
     FenixDispatch.createIncident('SHOOTING', coords, nil, {
         applyWanted = false,
         witnesses = { src },
+        suspects = (selfFired == true and findingSuspects()) and { src } or nil,
         dedupeRadius = (Config.Witness or {}).dedupeRadius or 60.0,
         dedupeWindowMs = (Config.Witness or {}).dedupeWindowMs or 30000,
         bucket = GetPlayerRoutingBucket(src),
     })
+end)
+
+-- How far past spotRange a sighting still holds up: the suspect and the
+-- officer both keep moving between the client's look and this check, a
+-- tick and a network trip apart.
+local SPOT_SLACK = 15.0
+
+-- An investigating unit parks up to 60 m short of a scene off the road
+-- (client/investigate.lua's ROAD_END_ARRIVE_DISTANCE) and starts watching
+-- from watchFromDistance out on its way in; this much again covers it
+-- moving in the meantime.
+local SCENE_SLACK = 30.0
+
+-- client/investigate.lua: an investigating unit has seen one of the call's
+-- suspects armed. The server's own view has to agree before anybody is
+-- starred -- the unit is this player's and is on this call, the suspect is
+-- listed on it, one of this player's officers really is close to the
+-- suspect, and the unit really is at the scene -- and it happens once per
+-- call. The stars go to the suspect's own client through the same
+-- SetWantedLevel event every other path uses, which only ever raises.
+RegisterNetEvent('fenix-police:server:investigationSpotted')
+AddEventHandler('fenix-police:server:investigationSpotted', function(incidentId, unitId, suspect)
+    local src = source
+    if not cfg().enabled or not findingSuspects() then return end
+    if not FenixGuard.allow(src, 'incident_assign', 60) then return end
+
+    incidentId, unitId, suspect = tonumber(incidentId), tonumber(unitId), tonumber(suspect)
+    if not incidentId or not unitId or not suspect then return end
+
+    local incident = FenixIncident.get(incidentId)
+    if not incident or incident.status == 'RESOLVED' or incident.status == 'CANCELLED' then return end
+    if incident.outcome == 'SUSPECT_SPOTTED' then return end
+
+    if incident.assignedUnits[unitId] ~= 'investigating' or incident.assignedBy[unitId] ~= src then
+        FenixGuard.refuse(src, 'investigation sighting', 'unit is not investigating this call for them')
+        return
+    end
+    local vehicle = FenixGuard.resolve(src, unitId, 'vehicle', 'investigation sighting')
+    if not vehicle then return end
+
+    if not listed(incident.suspects, suspect) then
+        FenixGuard.refuse(src, 'investigation sighting', 'player is not a suspect on this call')
+        return
+    end
+
+    -- Gone, or in another world than the call: nothing to star.
+    if not GetPlayerName(suspect) then return end
+    local suspectPed = GetPlayerPed(suspect)
+    if not suspectPed or suspectPed == 0 then return end
+    if incident.bucket ~= nil and GetPlayerRoutingBucket(suspect) ~= incident.bucket then return end
+
+    local suspectPos = GetEntityCoords(suspectPed)
+    local sceneReach = math.max(invCfg().watchFromDistance or 80.0, 60.0) + SCENE_SLACK
+    if #(GetEntityCoords(vehicle) - incident.location) > sceneReach then
+        FenixGuard.refuse(src, 'investigation sighting', 'unit is not at the scene')
+        return
+    end
+    if not FenixGuard.officerNear(src, suspectPos, (invCfg().spotRange or 40.0) + SPOT_SLACK) then
+        FenixGuard.refuse(src, 'investigation sighting', 'none of their officers is near the suspect')
+        return
+    end
+
+    -- Stepped onto a range since the client looked: not a sighting.
+    if inExemptZone(suspectPos) then return end
+
+    FenixIncident.setOutcome(incidentId, 'SUSPECT_SPOTTED')
+
+    -- Already wanted: a pursuit (or a stop, a surrender, an arrest) already
+    -- has them, and stars from here would only cut across it.
+    if FenixDispatch.isPlayerWanted and FenixDispatch.isPlayerWanted(suspect) then
+        dbg(('#%d suspect %d spotted, already wanted'):format(incidentId, suspect))
+        return
+    end
+
+    local wanted = severityToWanted(incident.severity)
+    dbg(('#%d suspect %d spotted armed by unit %d, wanted %d'):format(incidentId, suspect, unitId, wanted))
+    TriggerClientEvent('fenix-police:client:SetWantedLevel', suspect, wanted)
 end)
 
 -------------------------------------------------------------------------------
@@ -473,8 +634,11 @@ AddEventHandler('fenix-police:server:assignIncidentUnit', function(incidentId, u
     end
 end)
 
+-- `outcome` is optional: 'NO_SUSPECT' from an investigating unit that
+-- looked and found nobody. Bookkeeping only (/fenixincidents), and never
+-- over a sighting.
 RegisterNetEvent('fenix-police:server:releaseIncidentUnit')
-AddEventHandler('fenix-police:server:releaseIncidentUnit', function(incidentId, unitId)
+AddEventHandler('fenix-police:server:releaseIncidentUnit', function(incidentId, unitId, outcome)
     local src = source
     if not FenixGuard.allow(src, 'incident_assign', 60) then return end
 
@@ -482,6 +646,10 @@ AddEventHandler('fenix-police:server:releaseIncidentUnit', function(incidentId, 
     local incident = incidentId and FenixIncident.get(incidentId)
     if not incident or not unitId then return end
     if incident.assignedBy[unitId] ~= src then return end
+
+    if outcome == 'NO_SUSPECT' and incident.assignedUnits[unitId] == 'investigating' and not incident.outcome then
+        FenixIncident.setOutcome(incidentId, 'NO_SUSPECT')
+    end
 
     FenixIncident.releaseUnit(incidentId, unitId)
 
@@ -501,6 +669,9 @@ end)
 -- they owned), so their assignments come off and those roles go back out to
 -- somebody else on the next re-offer pass, instead of the call sitting on
 -- units that no longer exist until incidentMaxAgeMs.
+--
+-- A departing suspect comes off every call too: there's nobody left to
+-- find, and the server id is free for whoever connects next.
 AddEventHandler('playerDropped', function()
     local src = source
     for id, incident in pairs(FenixIncident.all()) do
@@ -513,6 +684,14 @@ AddEventHandler('playerDropped', function()
                     o.answered = false
                     o.at = 0
                 end
+            end
+        end
+
+        local suspects = incident.suspects or {}
+        for i = #suspects, 1, -1 do
+            if suspects[i] == src then
+                table.remove(suspects, i)
+                tellInvestigators(incident)
             end
         end
     end
