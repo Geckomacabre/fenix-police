@@ -1130,6 +1130,9 @@ Config.TicketSystem = {
         warning  = 'Verbal warning issued. You are free to go.',
         serious  = 'Too serious for a citation — they want you out of the car.',
         fled     = 'You pulled away from the stop.',
+        -- timeoutSeconds ran out with no officer ever sent to the window. One
+        -- already walking up when it runs out lets you go with the warning.
+        timeout  = 'No unit reached the stop. You are still wanted.',
     },
 }
 
